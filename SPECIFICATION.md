@@ -154,7 +154,7 @@ Before making changes, the installer MUST check:
 * Docker availability;
 * Docker Compose availability;
 * Docker daemon status;
-* availability of required network ports;
+* availability of required TCP port 443;
 * existing `/opt/vaultwarden` installation;
 * relevant network configuration.
 

@@ -191,17 +191,15 @@ port_is_in_use() {
 }
 
 check_ports() {
-    local port
+    local port=443
 
     section "Network ports"
 
-    for port in 80 443; do
-        if port_is_in_use "${port}"; then
-            error "TCP port ${port} is already in use."
-        else
-            ok "TCP port ${port} appears available."
-        fi
-    done
+    if port_is_in_use "${port}"; then
+        error "TCP port ${port} is already in use."
+    else
+        ok "TCP port ${port} appears available."
+    fi
 }
 
 detect_ipv4_address() {
