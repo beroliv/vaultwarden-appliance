@@ -195,13 +195,6 @@ load_access_state() {
         [[ "${lines[0]}" == mode=* && "${lines[1]}" == address=* ]] || return 1
         mode=${lines[0]#mode=}
         address=${lines[1]#address=}
-
-        if [[ -e "${LEGACY_HOSTNAME_FILE}" ]]; then
-            [[ -f "${LEGACY_HOSTNAME_FILE}" && ! -L "${LEGACY_HOSTNAME_FILE}" ]] || return 1
-            mapfile -t lines < "${LEGACY_HOSTNAME_FILE}"
-            (( ${#lines[@]} == 1 )) || return 1
-            [[ "${mode}" == "hostname" && "${address}" == "${lines[0]}" ]] || return 1
-        fi
     elif [[ -f "${LEGACY_HOSTNAME_FILE}" && ! -L "${LEGACY_HOSTNAME_FILE}" ]]; then
         mapfile -t lines < "${LEGACY_HOSTNAME_FILE}"
         (( ${#lines[@]} == 1 )) || return 1
@@ -236,22 +229,20 @@ write_access_state_to() {
     chmod 0644 "${destination}"
 }
 
-write_caddyfile_with_address_to() {
+write_caddyfile_to() {
     local destination=$1
-    local old_address=$2
-    local new_address=$3
+    local address=$2
 
-    awk \
-        -v old_line="https://${old_address} {" \
-        -v new_line="https://${new_address} {" '
-            $0 == old_line {
-                matches++
-                print new_line
-                next
-            }
-            { print }
-            END { if (matches != 1) exit 1 }
-        ' "${CADDYFILE}" > "${destination}"
+    cat > "${destination}" <<CADDY
+{
+	auto_https disable_redirects
+}
+
+https://${address} {
+	tls internal
+	reverse_proxy vaultwarden:80
+}
+CADDY
     chmod 0644 "${destination}"
 }
 
@@ -398,6 +389,44 @@ verify_https() {
     return 1
 }
 
+root_ca_hash() {
+    [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]] || return 1
+    sha256sum -- "${CADDY_ROOT_CA}" | awk 'NR == 1 {print $1}'
+}
+
+root_ca_matches_hash() {
+    local expected_hash=$1
+    local current_hash
+
+    current_hash=$(root_ca_hash) || return 1
+    [[ "${current_hash}" == "${expected_hash}" ]]
+}
+
+refresh_root_ca_export() {
+    local cert_dir="${INSTALL_DIR}/certs"
+    local candidate
+
+    [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]] || return 1
+    if [[ -e "${cert_dir}" && ( ! -d "${cert_dir}" || -L "${cert_dir}" ) ]]; then
+        return 1
+    fi
+    if [[ -e "${EXPORTED_ROOT_CA}" && \
+          ( ! -f "${EXPORTED_ROOT_CA}" || -L "${EXPORTED_ROOT_CA}" ) ]]; then
+        return 1
+    fi
+
+    install -d -m 0755 "${cert_dir}" || return 1
+    candidate=$(mktemp "${cert_dir}/.caddy-root-ca.XXXXXXXX") || return 1
+    if ! install -m 0644 "${CADDY_ROOT_CA}" "${candidate}" ||
+       ! cmp -s "${CADDY_ROOT_CA}" "${candidate}" ||
+       ! mv -f -- "${candidate}" "${EXPORTED_ROOT_CA}"; then
+        rm -f -- "${candidate}"
+        return 1
+    fi
+    chmod 0644 "${EXPORTED_ROOT_CA}" || return 1
+    cmp -s "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}"
+}
+
 show_caddy_failure_context() {
     printf 'Caddy container state:\n' >&2
     docker inspect --format '{{json .State}}' caddy >&2 || true
@@ -407,7 +436,7 @@ show_caddy_failure_context() {
 
 verify_access_change() {
     local address=$1
-    local saved_root=$2
+    local expected_root_hash=$2
 
     if ! wait_for_container caddy; then
         printf '[FAIL] Caddy container did not become ready.\n' >&2
@@ -427,6 +456,17 @@ verify_access_change() {
         return 1
     fi
 
+    if ! wait_for_container vaultwarden; then
+        printf '[FAIL] Vaultwarden is not running after the Caddy rebuild.\n' >&2
+        return 1
+    fi
+
+    if [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' vaultwarden 2>/dev/null)" != "0" ]]; then
+        printf '[FAIL] Vaultwarden unexpectedly publishes a host port.\n' >&2
+        docker inspect --format '{{json .HostConfig.PortBindings}}' vaultwarden >&2 || true
+        return 1
+    fi
+
     if ! wait_for_port \
         443 \
         "${ACCESS_HTTPS_TIMEOUT}" \
@@ -435,8 +475,14 @@ verify_access_change() {
         return 1
     fi
 
-    if ! verify_root_ca_unchanged "${saved_root}"; then
+    if ! root_ca_matches_hash "${expected_root_hash}"; then
         printf '[FAIL] Caddy root CA changed unexpectedly.\n' >&2
+        return 1
+    fi
+
+    if ! refresh_root_ca_export ||
+       ! cmp -s "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}"; then
+        printf '[FAIL] The public Caddy root CA export could not be refreshed and verified.\n' >&2
         return 1
     fi
 
@@ -453,8 +499,7 @@ verify_access_change() {
         return 1
     fi
 
-    # Check again after HTTPS succeeds so a concurrent CA change cannot pass unnoticed.
-    if ! verify_root_ca_unchanged "${saved_root}"; then
+    if ! root_ca_matches_hash "${expected_root_hash}"; then
         printf '[FAIL] Caddy root CA changed unexpectedly.\n' >&2
         return 1
     fi
@@ -530,9 +575,6 @@ cleanup_operation_directory() {
     [[ "${directory}" == /tmp/vwctl.* && -d "${directory}" ]] || return 1
     rm -f -- \
         "${directory}/root-ca" \
-        "${directory}/Caddyfile" \
-        "${directory}/access" \
-        "${directory}/legacy-hostname" \
         "${directory}/signup-compose"
     rmdir -- "${directory}"
 }
@@ -671,102 +713,60 @@ command_restart() {
     info "Appliance containers restarted and verified."
 }
 
-validate_caddy_candidate() {
-    local candidate=$1
-    local container_path="/tmp/vwctl-Caddyfile"
+validate_caddy_configuration() {
     local command_output=""
 
-    wait_for_container caddy || return 1
-    docker cp "${candidate}" "caddy:${container_path}" >/dev/null || return 1
-
-    if ! command_output=$(docker exec caddy caddy fmt \
-        --overwrite "${container_path}" 2>&1 >/dev/null); then
-        printf '[FAIL] Caddy could not format the candidate Caddyfile.\n' >&2
+    if ! command_output=$(compose run --rm --no-deps --entrypoint caddy \
+        caddy fmt --diff /etc/caddy/Caddyfile 2>&1); then
+        printf '[FAIL] The generated Caddyfile is not correctly formatted.\n' >&2
         [[ -z "${command_output}" ]] || printf '%s\n' "${command_output}" >&2
-        docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
         return 1
     fi
 
-    if ! command_output=$(docker exec caddy caddy adapt \
-        --config "${container_path}" \
-        --adapter caddyfile \
-        --validate 2>&1 >/dev/null); then
-        printf '[FAIL] Caddy rejected the candidate Caddyfile.\n' >&2
+    if ! command_output=$(compose run --rm --no-deps --entrypoint caddy \
+        caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1); then
+        printf '[FAIL] Caddy rejected the generated Caddyfile.\n' >&2
         [[ -z "${command_output}" ]] || printf '%s\n' "${command_output}" >&2
-        docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
         return 1
     fi
-
-    if ! docker cp "caddy:${container_path}" "${candidate}" >/dev/null; then
-        docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
-        return 1
-    fi
-    chmod 0644 "${candidate}"
-    docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
 }
 
-restore_access_configuration() {
-    local backup_dir=$1
-    local had_access_file=$2
-    local had_legacy_file=$3
-    local old_address=$4
-    local restored=0
-
-    info "Restoring the previous access configuration..."
-    install -m 0644 "${backup_dir}/Caddyfile" "${CADDYFILE}"
-
-    if (( had_access_file == 1 )); then
-        install -m 0644 "${backup_dir}/access" "${ACCESS_FILE}"
-    else
-        rm -f -- "${ACCESS_FILE}"
+report_access_change_failure() {
+    printf 'The new access configuration was not rolled back.\n' >&2
+    printf 'Vaultwarden was not stopped or recreated.\n' >&2
+    printf 'Generated Caddyfile: %s\n' "${CADDYFILE}" >&2
+    printf 'Access state: %s\n' "${ACCESS_FILE}" >&2
+    printf 'Correct the reported problem, then rerun vwctl access.\n' >&2
+    docker ps -a --filter name='^/caddy$' >&2 || true
+    if docker inspect caddy >/dev/null 2>&1; then
+        docker logs --tail 30 caddy >&2 || true
     fi
-    if (( had_legacy_file == 1 )); then
-        install -m 0644 "${backup_dir}/legacy-hostname" "${LEGACY_HOSTNAME_FILE}"
-    else
-        rm -f -- "${LEGACY_HOSTNAME_FILE}"
-    fi
-
-    if compose up -d --force-recreate caddy &&
-       wait_for_container caddy &&
-       verify_https "${old_address}" &&
-       verify_root_ca_unchanged "${backup_dir}/root-ca"; then
-        restored=1
-    fi
-
-    if (( restored == 1 )); then
-        info "The requested access change failed; the previous configuration was restored and verified."
-    else
-        printf 'CRITICAL: The requested access change failed and rollback verification also failed.\n' >&2
-        printf 'Inspect: docker logs caddy\n' >&2
-    fi
-    return 1
 }
 
 apply_access_change() {
     local new_mode=$1
     local new_address=$2
-    local backup_dir
     local caddy_candidate
-    local had_access_file=0
-    local had_legacy_file=0
-    local old_address
+    local root_hash_before
     local state_candidate
 
-    load_access_state || die "The current access state is missing or invalid."
-    old_address=${ACCESS_ADDRESS}
-
-    if [[ "${ACCESS_MODE}" == "${new_mode}" && "${ACCESS_ADDRESS}" == "${new_address}" ]]; then
-        info "Access is already configured as https://${new_address}; no change is needed."
-        return 0
-    fi
+    case "${new_mode}" in
+        ip)
+            validate_ipv4_address "${new_address}" || die "The requested IPv4 address is invalid."
+            ;;
+        hostname)
+            validate_local_hostname "${new_address}" || die "The requested hostname is invalid."
+            ;;
+        *)
+            die "The requested access mode is invalid."
+            ;;
+    esac
 
     require_https_verification_ready
+    command_exists sha256sum || die "sha256sum is required to verify Caddy's root CA."
     compose config --quiet || die "The appliance Compose configuration is invalid."
-    wait_for_container caddy || die "Caddy is not currently running; access configuration will not be changed."
-    verify_https "${old_address}" || \
-        die "The current HTTPS endpoint is not healthy; access configuration will not be changed."
+    root_hash_before=$(root_ca_hash) || die "Unable to record Caddy's persistent root CA hash."
 
-    backup_dir=$(create_operation_directory)
     caddy_candidate=$(mktemp "${INSTALL_DIR}/.Caddyfile.vwctl.XXXXXXXX") || \
         die "Unable to create a temporary Caddyfile."
     state_candidate=$(mktemp "${INSTALL_DIR}/.caddy-access.vwctl.XXXXXXXX") || {
@@ -774,78 +774,76 @@ apply_access_change() {
         die "Unable to create a temporary access state file."
     }
 
-    install -m 0600 "${CADDYFILE}" "${backup_dir}/Caddyfile"
-    install -m 0600 "${CADDY_ROOT_CA}" "${backup_dir}/root-ca"
-    if [[ -f "${ACCESS_FILE}" && ! -L "${ACCESS_FILE}" ]]; then
-        install -m 0600 "${ACCESS_FILE}" "${backup_dir}/access"
-        had_access_file=1
-    fi
-    if [[ -f "${LEGACY_HOSTNAME_FILE}" && ! -L "${LEGACY_HOSTNAME_FILE}" ]]; then
-        install -m 0600 "${LEGACY_HOSTNAME_FILE}" "${backup_dir}/legacy-hostname"
-        had_legacy_file=1
-    fi
-
-    if ! write_caddyfile_with_address_to "${caddy_candidate}" "${old_address}" "${new_address}" ||
+    if ! write_caddyfile_to "${caddy_candidate}" "${new_address}" ||
        ! write_access_state_to "${state_candidate}" "${new_mode}" "${new_address}"; then
         rm -f -- "${caddy_candidate}" "${state_candidate}"
-        cleanup_operation_directory "${backup_dir}"
-        die "Unable to create candidate access configuration; the current configuration was not changed."
+        die "Unable to generate the new access configuration."
     fi
 
-    if ! validate_caddy_candidate "${caddy_candidate}"; then
+    info "Stopping and removing only the Caddy container..."
+    if ! compose rm --stop --force caddy; then
         rm -f -- "${caddy_candidate}" "${state_candidate}"
-        cleanup_operation_directory "${backup_dir}"
-        die "The proposed Caddy configuration is invalid; the current configuration was not changed."
+        die "Docker Compose could not stop and remove Caddy."
     fi
 
     if ! mv -f -- "${caddy_candidate}" "${CADDYFILE}" ||
        ! mv -f -- "${state_candidate}" "${ACCESS_FILE}" ||
        ! rm -f -- "${LEGACY_HOSTNAME_FILE}"; then
         rm -f -- "${caddy_candidate}" "${state_candidate}"
-        restore_access_configuration \
-            "${backup_dir}" "${had_access_file}" "${had_legacy_file}" "${old_address}" || true
-        cleanup_operation_directory "${backup_dir}"
+        printf '[FAIL] The new Caddy access files could not be installed.\n' >&2
+        report_access_change_failure
         return 1
     fi
 
-    if ! compose up -d --force-recreate caddy; then
-        printf '[FAIL] Docker Compose could not recreate Caddy.\n' >&2
-        restore_access_configuration \
-            "${backup_dir}" "${had_access_file}" "${had_legacy_file}" "${old_address}" || true
-        cleanup_operation_directory "${backup_dir}"
+    if ! validate_caddy_configuration; then
+        report_access_change_failure
         return 1
     fi
 
-    if ! verify_access_change "${new_address}" "${backup_dir}/root-ca"; then
-        restore_access_configuration \
-            "${backup_dir}" "${had_access_file}" "${had_legacy_file}" "${old_address}" || true
-        cleanup_operation_directory "${backup_dir}"
+    info "Creating a clean Caddy container for https://${new_address}..."
+    if ! compose up -d --no-deps caddy; then
+        printf '[FAIL] Docker Compose could not create Caddy.\n' >&2
+        report_access_change_failure
         return 1
     fi
 
-    cleanup_operation_directory "${backup_dir}"
+    if ! verify_access_change "${new_address}" "${root_hash_before}"; then
+        report_access_change_failure
+        return 1
+    fi
+
     ACCESS_MODE=${new_mode}
     ACCESS_ADDRESS=${new_address}
     info "Access configuration changed successfully."
     info "URL: https://${new_address}"
 }
 
-access_ip() {
+confirm_access_change() {
+    local address=$1
     local answer=""
-    local current_ip
 
-    current_ip=$(detect_ipv4_address) || die "Unable to detect a usable LAN IPv4 address."
-    printf 'Detected LAN IPv4 address: %s\n' "${current_ip}"
-    if ! read -r -p "Use https://${current_ip} for Vaultwarden? [y/N] " answer </dev/tty; then
+    if ! read -r -p "Rebuild Caddy for https://${address}? [y/N] " answer </dev/tty; then
         die "Unable to read confirmation."
     fi
     case "${answer}" in
-        y|Y|yes|YES|Yes) ;;
-        *)
-            info "Access configuration was not changed."
+        y|Y|yes|YES|Yes)
             return 0
             ;;
+        *)
+            info "Access configuration was not changed."
+            return 1
+            ;;
     esac
+}
+
+access_ip() {
+    local current_ip
+
+    current_ip=$(detect_ipv4_address) || die "Unable to detect a usable LAN IPv4 address."
+    validate_ipv4_address "${current_ip}" || die "The detected LAN IPv4 address is invalid."
+    printf 'Detected LAN IPv4 address: %s\n' "${current_ip}"
+    printf 'New HTTPS URL: https://%s\n' "${current_ip}"
+    confirm_access_change "${current_ip}" || return 0
 
     apply_access_change ip "${current_ip}"
     printf '\nIMPORTANT:\nThis IP address should not change.\n\n'
@@ -869,6 +867,8 @@ access_hostname() {
 
     info "Required DNS mapping: ${hostname} -> ${current_ip}"
     info "The appliance will not modify DNS or hosts files."
+    info "New HTTPS URL: https://${hostname}"
+    confirm_access_change "${hostname}" || return 0
     apply_access_change hostname "${hostname}"
 }
 
@@ -1023,33 +1023,9 @@ command_signup() {
 }
 
 command_cert_export() {
-    local cert_dir="${INSTALL_DIR}/certs"
-    local candidate
-
     require_root "cert export"
     require_appliance
-    [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]] || \
-        die "Caddy's persistent public root CA certificate is missing or unsafe."
-    if [[ -e "${cert_dir}" && ( ! -d "${cert_dir}" || -L "${cert_dir}" ) ]]; then
-        die "The root CA export directory is not a safe directory."
-    fi
-    if [[ -e "${EXPORTED_ROOT_CA}" && ( ! -f "${EXPORTED_ROOT_CA}" || -L "${EXPORTED_ROOT_CA}" ) ]]; then
-        die "The root CA export path is not a safe regular file."
-    fi
-
-    install -d -m 0755 "${cert_dir}"
-    candidate=$(mktemp "${cert_dir}/.caddy-root-ca.XXXXXXXX") || die "Unable to create a temporary certificate export."
-    if ! install -m 0644 "${CADDY_ROOT_CA}" "${candidate}" ||
-       ! cmp -s "${CADDY_ROOT_CA}" "${candidate}"; then
-        rm -f -- "${candidate}"
-        die "The temporary root CA export verification failed."
-    fi
-    if ! mv -f -- "${candidate}" "${EXPORTED_ROOT_CA}"; then
-        rm -f -- "${candidate}"
-        die "Unable to replace the public root CA export."
-    fi
-    chmod 0644 "${EXPORTED_ROOT_CA}"
-    cmp -s "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}" || die "The root CA export verification failed."
+    refresh_root_ca_export || die "The public Caddy root CA export failed."
 
     info "Exported Caddy's public root CA certificate:"
     info "${EXPORTED_ROOT_CA}"

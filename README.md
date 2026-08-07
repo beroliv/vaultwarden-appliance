@@ -76,11 +76,17 @@ the operating system or prune unrelated images. `vwctl restart` recreates only
 the appliance containers. Both commands preserve bind-mounted application data
 and Caddy's persistent internal CA and verify HTTPS afterward.
 
-Access-address changes validate candidate configuration and are accepted only
-after Caddy and HTTPS verification succeeds with the existing root CA. On
-failure, `vwctl` restores and verifies the previous Caddyfile and access state.
-Only the matching Caddy site-address line is changed; other Caddyfile content
-is preserved.
+Access changes require explicit confirmation. `vwctl` removes only the Caddy
+container, generates a complete appliance-managed Caddyfile and authoritative
+`.caddy-access` state, validates the configuration and creates Caddy again
+without touching the Vaultwarden container. The persistent directories below
+`/opt/vaultwarden/data/caddy` are never removed, and the root CA hash must stay
+unchanged. The public root certificate export is refreshed after the rebuild.
+
+Access changes do not automatically roll back. If the new Caddy configuration
+or HTTPS verification fails, the generated configuration and diagnostics remain
+available and Vaultwarden continues running. Correct the reported problem and
+rerun `sudo vwctl access ip` or `sudo vwctl access hostname`.
 
 Signup changes are isolated in
 `/opt/vaultwarden/docker-compose.vwctl.yml`, which overrides only

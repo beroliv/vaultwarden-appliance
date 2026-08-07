@@ -324,10 +324,12 @@ On reruns, the installer reports and preserves the stored access mode, address,
 Caddy configuration, persistent data and internal CA. It does not silently
 switch modes, change an IP address or hostname, or regenerate the CA.
 
-The Phase 4 `vwctl access` command updates `.caddy-access` and the Caddyfile so
-Caddy obtains a new server certificate for the new IP address or hostname. It
-preserves `/opt/vaultwarden/data/caddy` so the existing internal root CA
-continues to be used.
+The Phase 4 `vwctl access` command replaces the complete appliance-managed
+Caddyfile and `.caddy-access` state, then rebuilds only the Caddy container so
+Caddy can obtain a server certificate for the selected IP address or hostname.
+It never removes `/opt/vaultwarden/data/caddy`, so the existing internal root
+CA continues to be used. Old Caddyfile content and container-local state are
+not migrated to the rebuilt configuration.
 
 Advanced users MUST be able to inspect and manually modify the Caddy configuration.
 
@@ -465,20 +467,31 @@ The `ip` and `hostname` arguments select a mode directly but still request the
 new address or confirmation. Address changes never modify host or external
 network configuration.
 
-Before an access change, `vwctl` saves the current Caddyfile, access state and
-public root certificate, creates and validates candidate configuration, then
-recreates only Caddy. The candidate changes exactly one matching site-address
-line and preserves the remainder of the Caddyfile; an unexpected Caddyfile
-shape fails safely. Success requires a running Caddy container, a valid HTTPS
-response using the exported root CA and an unchanged persistent root CA. If
-any check fails, the previous Caddyfile and access state are restored, Caddy
-is recreated again and the previous HTTPS endpoint is verified. The legacy
-`.caddy-hostname` file is included in the rollback backup. It is removed during
-an access change and restored automatically if verification fails, so it is
-absent only after a successful move to the authoritative `.caddy-access` state.
+After validating the requested address and receiving explicit confirmation,
+`vwctl` records the SHA-256 hash of Caddy's persistent public root CA. It stops
+and removes only the Caddy service container, generates a complete formatted
+appliance Caddyfile, rewrites `.caddy-access`, removes the obsolete
+`.caddy-hostname` state and validates the new configuration with a one-off
+Caddy Compose container. It then creates Caddy with `--no-deps`, leaving the
+Vaultwarden container untouched.
 
-Changing an IP address or hostname allows Caddy to issue a new leaf certificate
-while continuing to use the persistent internal root CA.
+Success requires Caddy and Vaultwarden to be running, Caddy to use the
+`vaultwarden-appliance` network and publish only TCP 443, Vaultwarden to publish
+no host ports, and the new HTTPS endpoint to validate using the exported root
+CA. The persistent root CA hash must remain unchanged. The public root
+certificate export is refreshed and checked against the persistent root.
+
+The access command never removes `/opt/vaultwarden/data/caddy/data` or
+`/opt/vaultwarden/data/caddy/config`. This preserves the internal root CA while
+the rebuilt Caddy configuration obtains the appropriate leaf certificate for
+the selected address.
+
+Access changes do not use automatic rollback. If formatting, validation,
+container creation or verification fails, `vwctl` reports the failing check and
+leaves the generated Caddyfile and authoritative access state in place for
+inspection. Vaultwarden remains running, and the administrator can correct the
+reported problem and rerun `sudo vwctl access ip` or
+`sudo vwctl access hostname`.
 
 ### 12.5 Signup Management
 
