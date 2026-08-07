@@ -187,6 +187,25 @@ The installer MUST detect an existing appliance installation.
 
 It MUST NOT silently overwrite an existing `/opt/vaultwarden` installation.
 
+Installations created by the appliance MUST contain the non-secret marker file:
+
+```text
+/opt/vaultwarden/.vaultwarden-appliance
+```
+
+If both the installation directory and marker exist, rerunning the installer
+MUST be treated as an existing appliance rather than an error. Non-destructive
+checks, including Docker user/group configuration, should continue, but the
+installer MUST NOT unnecessarily recreate configuration, overwrite data or
+redeploy a running Vaultwarden container.
+
+For backward compatibility, an unmarked Phase 2 installation may be adopted
+once only when it has `docker-compose.yml`, `data/vaultwarden`, the official
+`vaultwarden/server` image and the expected `vaultwarden-appliance` Docker
+network. After all checks pass, the installer creates the marker. Any other
+unmarked `/opt/vaultwarden` directory MUST be treated as unknown and left
+unchanged.
+
 Existing installations and future migration scenarios must be considered before destructive operations are implemented.
 
 ---

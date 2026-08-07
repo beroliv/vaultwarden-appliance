@@ -5,6 +5,7 @@ set -o nounset
 set -o pipefail
 
 readonly INSTALL_DIR="/opt/vaultwarden"
+readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
 readonly MIN_DISK_SPACE_MB=2048
 
 ERRORS=0
@@ -18,6 +19,7 @@ DOCKER_READY=0
 DOCKER_CODENAME=""
 DOCKER_USER=""
 DOCKER_GROUP_CHANGED=0
+APPLIANCE_STATE="fresh"
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -128,14 +130,53 @@ check_disk_space() {
     fi
 }
 
+legacy_phase2_structure_matches() {
+    local compose_config
+    local images
+    local networks
+    local services
+
+    [[ -f "${INSTALL_DIR}/docker-compose.yml" ]] || return 1
+    [[ -d "${INSTALL_DIR}/data/vaultwarden" ]] || return 1
+    command_exists docker || return 1
+    docker compose version >/dev/null 2>&1 || return 1
+
+    services=$(docker compose --project-directory "${INSTALL_DIR}" config --services 2>/dev/null) || return 1
+    images=$(docker compose --project-directory "${INSTALL_DIR}" config --images 2>/dev/null) || return 1
+    networks=$(docker compose --project-directory "${INSTALL_DIR}" config --networks 2>/dev/null) || return 1
+    compose_config=$(docker compose --project-directory "${INSTALL_DIR}" config 2>/dev/null) || return 1
+
+    [[ "${services}" == "vaultwarden" ]] || return 1
+    [[ "${images}" =~ ^vaultwarden/server(:[^[:space:]]+|@sha256:[[:xdigit:]]+)$ ]] || return 1
+    [[ "${networks}" == "appliance" ]] || return 1
+    grep -Eq '^[[:space:]]+name:[[:space:]]+vaultwarden-appliance[[:space:]]*$' <<<"${compose_config}"
+}
+
 check_existing_installation() {
     section "Installation path"
 
-    if [[ -e "${INSTALL_DIR}" ]]; then
-        error "${INSTALL_DIR} already exists; it will not be modified or overwritten."
-    else
+    if [[ ! -e "${INSTALL_DIR}" ]]; then
+        APPLIANCE_STATE="fresh"
         ok "${INSTALL_DIR} does not already exist."
+        return
     fi
+
+    if [[ -f "${APPLIANCE_MARKER}" && ! -L "${APPLIANCE_MARKER}" ]]; then
+        APPLIANCE_STATE="existing"
+        ok "Existing Vaultwarden Appliance installation detected."
+        return
+    fi
+
+    if legacy_phase2_structure_matches; then
+        APPLIANCE_STATE="legacy"
+        ok "Legacy Phase 2 appliance installation detected."
+        info "A marker will be added after the preflight without changing appliance data or configuration."
+        return
+    fi
+
+    APPLIANCE_STATE="unknown"
+    error "${INSTALL_DIR} exists without a valid appliance marker or recognized Phase 2 structure."
+    info "The existing directory will not be modified."
 }
 
 check_docker() {
@@ -430,6 +471,14 @@ verify_docker() {
     DOCKER_READY=1
 }
 
+create_appliance_marker() {
+    if ! (set -o noclobber; printf 'Vaultwarden Appliance\n' > "${APPLIANCE_MARKER}") 2>/dev/null; then
+        error "Refusing to overwrite existing marker path ${APPLIANCE_MARKER}."
+        return 1
+    fi
+    chmod 0644 "${APPLIANCE_MARKER}"
+}
+
 create_appliance_files() {
     section "Appliance files"
 
@@ -459,7 +508,8 @@ networks:
     name: vaultwarden-appliance
 COMPOSE
     chmod 0644 "${INSTALL_DIR}/docker-compose.yml"
-    ok "Created ${INSTALL_DIR}/docker-compose.yml and persistent data directory."
+    create_appliance_marker
+    ok "Created appliance files, persistent data directory, and marker."
 }
 
 deploy_vaultwarden() {
@@ -488,6 +538,9 @@ print_completion_summary() {
     info "Persistent data: ${INSTALL_DIR}/data/vaultwarden"
     info "Docker network: vaultwarden-appliance"
     info "Vaultwarden is internal-only; Caddy and HTTPS are not configured yet."
+    if [[ "${APPLIANCE_STATE}" == "existing" || "${APPLIANCE_STATE}" == "legacy" ]]; then
+        info "Existing appliance files and any existing Vaultwarden container were left unchanged."
+    fi
     if (( DOCKER_GROUP_CHANGED == 1 )); then
         info "User '${DOCKER_USER}' must start a new login session or reboot before using Docker without sudo."
     fi
@@ -499,8 +552,8 @@ main() {
     check_operating_system
     check_architecture
     check_disk_space
-    check_existing_installation
     check_docker
+    check_existing_installation
     check_ports
     detect_ipv4_address
     print_preflight_summary
@@ -515,8 +568,25 @@ main() {
     fi
 
     configure_docker_group
-    create_appliance_files
-    deploy_vaultwarden
+
+    case "${APPLIANCE_STATE}" in
+        fresh)
+            create_appliance_files
+            deploy_vaultwarden
+            ;;
+        legacy)
+            create_appliance_marker
+            ok "Legacy Phase 2 installation adopted as a Vaultwarden Appliance."
+            ;;
+        existing)
+            info "Skipping appliance file creation and Vaultwarden deployment on this rerun."
+            ;;
+        *)
+            error "Unexpected appliance state '${APPLIANCE_STATE}'."
+            return 1
+            ;;
+    esac
+
     print_completion_summary
 }
 

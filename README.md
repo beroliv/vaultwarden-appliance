@@ -11,7 +11,6 @@ deploys Vaultwarden under `/opt/vaultwarden`.
 On a Debian-based test system, including 64-bit Raspberry Pi OS, run:
 
 ```bash
-chmod +x install.sh
 sudo ./install.sh
 ```
 
@@ -31,4 +30,7 @@ sudo ./install.sh
 echo "$?"
 ```
 
-The installer refuses to overwrite an existing `/opt/vaultwarden` directory.
+The installer recognizes its own existing installations through
+`/opt/vaultwarden/.vaultwarden-appliance` and performs a non-destructive rerun.
+Unknown installations without a valid marker or recognized legacy Phase 2
+structure are left unchanged.
