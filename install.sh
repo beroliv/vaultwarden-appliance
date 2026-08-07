@@ -16,6 +16,8 @@ ARCH="unknown"
 IPV4_ADDRESS="not detected"
 DOCKER_READY=0
 DOCKER_CODENAME=""
+DOCKER_USER=""
+DOCKER_GROUP_CHANGED=0
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -241,6 +243,99 @@ require_root() {
     fi
 }
 
+detect_docker_user() {
+    local candidate=${SUDO_USER:-}
+    local candidate_uid
+    local canonical_user
+
+    section "Docker user access"
+
+    if [[ -z "${candidate}" ]]; then
+        info "No sudo-origin user was detected; Docker group configuration will be skipped."
+        return
+    fi
+
+    if [[ "${candidate}" == "root" ]]; then
+        info "The sudo-origin user is root; root will not be added to the docker group."
+        return
+    fi
+
+    if [[ -z "${SUDO_UID:-}" || ! "${SUDO_UID}" =~ ^[0-9]+$ ]]; then
+        warn "SUDO_UID is unavailable or invalid; Docker group configuration will be skipped."
+        return
+    fi
+
+    if ! command_exists id || ! command_exists getent; then
+        warn "Cannot validate SUDO_USER because id or getent is unavailable; Docker group configuration will be skipped."
+        return
+    fi
+
+    if ! candidate_uid=$(id -u -- "${candidate}" 2>/dev/null); then
+        warn "SUDO_USER '${candidate}' does not identify an existing user; Docker group configuration will be skipped."
+        return
+    fi
+
+    canonical_user=$(getent passwd "${candidate_uid}" | awk -F: 'NR == 1 {print $1}')
+    if [[ "${canonical_user}" != "${candidate}" ]]; then
+        warn "SUDO_USER '${candidate}' does not match the account name for UID ${candidate_uid}; Docker group configuration will be skipped."
+        return
+    fi
+
+    if [[ "${SUDO_UID}" != "${candidate_uid}" ]]; then
+        warn "SUDO_USER and SUDO_UID do not identify the same account; Docker group configuration will be skipped."
+        return
+    fi
+
+    DOCKER_USER=${candidate}
+    ok "Validated sudo-origin user: ${DOCKER_USER} (UID ${candidate_uid})."
+}
+
+configure_docker_group() {
+    local answer=""
+
+    if [[ -z "${DOCKER_USER}" ]]; then
+        return
+    fi
+
+    if ! getent group docker >/dev/null 2>&1; then
+        error "The standard docker group does not exist."
+        return 1
+    fi
+
+    info "Security note: membership in the docker group effectively grants root-level control of Docker."
+
+    if id -nG -- "${DOCKER_USER}" | tr ' ' '\n' | grep -Fxq docker; then
+        ok "User '${DOCKER_USER}' is already a member of the docker group; no change is needed."
+        return
+    fi
+
+    if [[ ! -r /dev/tty ]]; then
+        error "An interactive terminal is required to confirm Docker group membership."
+        return 1
+    fi
+
+    if ! read -r -p "Allow user \"${DOCKER_USER}\" to use Docker without sudo? [Y/n] " answer </dev/tty; then
+        error "Unable to read Docker group confirmation."
+        return 1
+    fi
+
+    case "${answer}" in
+        ""|y|Y|yes|YES|Yes)
+            if ! command_exists usermod; then
+                error "Cannot add '${DOCKER_USER}' to the docker group because usermod is unavailable."
+                return 1
+            fi
+            usermod -aG docker "${DOCKER_USER}"
+            DOCKER_GROUP_CHANGED=1
+            ok "Added user '${DOCKER_USER}' to the docker group."
+            info "A new login session or reboot is required before this group membership becomes active."
+            ;;
+        *)
+            info "Docker group access was declined; user '${DOCKER_USER}' was not changed."
+            ;;
+    esac
+}
+
 confirm_docker_installation() {
     local answer=""
 
@@ -393,6 +488,9 @@ print_completion_summary() {
     info "Persistent data: ${INSTALL_DIR}/data/vaultwarden"
     info "Docker network: vaultwarden-appliance"
     info "Vaultwarden is internal-only; Caddy and HTTPS are not configured yet."
+    if (( DOCKER_GROUP_CHANGED == 1 )); then
+        info "User '${DOCKER_USER}' must start a new login session or reboot before using Docker without sudo."
+    fi
 }
 
 main() {
@@ -408,6 +506,7 @@ main() {
     print_preflight_summary
 
     require_root
+    detect_docker_user
 
     if (( DOCKER_READY == 0 )); then
         confirm_docker_installation
@@ -415,6 +514,7 @@ main() {
         verify_docker
     fi
 
+    configure_docker_group
     create_appliance_files
     deploy_vaultwarden
     print_completion_summary

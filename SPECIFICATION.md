@@ -173,6 +173,14 @@ with Yes as the default. Phase 2 installs Docker Engine and Docker Compose v2
 from Docker's official Debian package repository. Docker Compose v2 MUST be
 available as `docker compose`; Docker Compose v1 is not supported.
 
+When the installer is run through `sudo`, it SHOULD validate `SUDO_USER` and
+offer to add that non-root user to Docker's standard `docker` Unix group, with
+Yes as the default. Existing group membership MUST be left unchanged. The
+installer MUST explain that docker-group membership effectively grants
+root-level control and that a new login session or reboot is required before a
+new membership becomes active. This does not use Rootless Docker and does not
+change the Docker daemon configuration.
+
 ### 6.3 Existing Appliance Installation
 
 The installer MUST detect an existing appliance installation.
