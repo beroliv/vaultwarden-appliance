@@ -305,6 +305,14 @@ caddy_owns_port_443() {
         grep -Fxq 443
 }
 
+container_is_connected_to_network() {
+    local container=$1
+    local network=$2
+
+    docker inspect --format '{{range $name, $settings := .NetworkSettings.Networks}}{{println $name}}{{end}}' "${container}" 2>/dev/null |
+        grep -Fxq "${network}"
+}
+
 check_ports() {
     local port=443
 
@@ -780,7 +788,7 @@ verify_phase3() {
         return 1
     fi
 
-    if [[ "$(docker inspect --format '{{with (index .NetworkSettings.Networks \"vaultwarden-appliance\")}}connected{{end}}' caddy 2>/dev/null)" != "connected" ]]; then
+    if ! container_is_connected_to_network caddy vaultwarden-appliance; then
         error "Caddy is not connected to the vaultwarden-appliance Docker network."
         return 1
     fi
