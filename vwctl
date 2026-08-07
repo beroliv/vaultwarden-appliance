@@ -17,9 +17,12 @@ readonly CADDY_ROOT_CA="${INSTALL_DIR}/data/caddy/data/caddy/pki/authorities/loc
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
 readonly APPLIANCE_NETWORK="vaultwarden-appliance"
 readonly LOG_LINES=100
+readonly ACCESS_HTTPS_TIMEOUT=60
+readonly ACCESS_HTTPS_RETRY_INTERVAL=2
 
 ACCESS_MODE=""
 ACCESS_ADDRESS=""
+HTTPS_LAST_ERROR=""
 
 info() {
     printf '%s\n' "$*"
@@ -282,6 +285,49 @@ caddy_publishes_only_https() {
         caddy 2>/dev/null | grep -Fxq 443
 }
 
+port_is_in_use() {
+    local port=$1
+    local port_hex
+
+    if command_exists ss; then
+        ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
+        return
+    fi
+
+    if command_exists netstat; then
+        netstat -ltn 2>/dev/null |
+            awk -v port=":${port}" '$4 ~ port "$" {found=1} END {exit !found}'
+        return
+    fi
+
+    printf -v port_hex '%04X' "${port}"
+    awk -v port_hex="${port_hex}" '
+        $4 == "0A" {
+            split($2, address, ":")
+            if (address[2] == port_hex) {
+                found=1
+            }
+        }
+        END {exit !found}
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+wait_for_port() {
+    local port=$1
+    local timeout_seconds=$2
+    local retry_interval=$3
+    local deadline=$((SECONDS + timeout_seconds))
+
+    while :; do
+        port_is_in_use "${port}" && return 0
+        if (( SECONDS >= deadline )); then
+            break
+        fi
+        sleep "${retry_interval}"
+    done
+    return 1
+}
+
 current_signup_value() {
     local value
 
@@ -321,22 +367,97 @@ wait_for_container() {
 
 verify_https() {
     local address=$1
-    local _attempt
+    local timeout_seconds=${2:-30}
+    local retry_interval=${3:-1}
+    local deadline
 
     command_exists curl || return 1
     [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || return 1
 
-    for _attempt in {1..30}; do
-        if curl --fail --silent --show-error \
+    HTTPS_LAST_ERROR=""
+    deadline=$((SECONDS + timeout_seconds))
+
+    while :; do
+        if HTTPS_LAST_ERROR=$(curl --fail --silent --show-error \
+            --connect-timeout 3 \
+            --max-time 5 \
             --noproxy '*' \
             --cacert "${EXPORTED_ROOT_CA}" \
             --connect-to "${address}:443:127.0.0.1:443" \
-            "https://${address}/alive" >/dev/null 2>&1; then
+            --output /dev/null \
+            "https://${address}/alive" 2>&1); then
+            HTTPS_LAST_ERROR=""
             return 0
         fi
-        sleep 1
+
+        if (( SECONDS >= deadline )); then
+            break
+        fi
+        sleep "${retry_interval}"
     done
     return 1
+}
+
+show_caddy_failure_context() {
+    printf 'Caddy container state:\n' >&2
+    docker inspect --format '{{json .State}}' caddy >&2 || true
+    printf 'Recent Caddy logs:\n' >&2
+    docker logs --tail 30 caddy >&2 || true
+}
+
+verify_access_change() {
+    local address=$1
+    local saved_root=$2
+
+    if ! wait_for_container caddy; then
+        printf '[FAIL] Caddy container did not become ready.\n' >&2
+        show_caddy_failure_context
+        return 1
+    fi
+
+    if ! container_is_connected_to_network caddy "${APPLIANCE_NETWORK}"; then
+        printf '[FAIL] Caddy is not attached to %s.\n' "${APPLIANCE_NETWORK}" >&2
+        docker inspect --format '{{json .NetworkSettings.Networks}}' caddy >&2 || true
+        return 1
+    fi
+
+    if ! caddy_publishes_only_https; then
+        printf '[FAIL] Caddy is not publishing only TCP port 443.\n' >&2
+        docker inspect --format '{{json .HostConfig.PortBindings}}' caddy >&2 || true
+        return 1
+    fi
+
+    if ! wait_for_port \
+        443 \
+        "${ACCESS_HTTPS_TIMEOUT}" \
+        "${ACCESS_HTTPS_RETRY_INTERVAL}"; then
+        printf '[FAIL] TCP port 443 is not listening.\n' >&2
+        return 1
+    fi
+
+    if ! verify_root_ca_unchanged "${saved_root}"; then
+        printf '[FAIL] Caddy root CA changed unexpectedly.\n' >&2
+        return 1
+    fi
+
+    if ! verify_https \
+        "${address}" \
+        "${ACCESS_HTTPS_TIMEOUT}" \
+        "${ACCESS_HTTPS_RETRY_INTERVAL}"; then
+        printf '[FAIL] HTTPS verification failed for https://%s/alive.\n' "${address}" >&2
+        if [[ -n "${HTTPS_LAST_ERROR}" ]]; then
+            printf 'Last curl error: %s\n' "${HTTPS_LAST_ERROR}" >&2
+        fi
+        printf 'Recent Caddy logs:\n' >&2
+        docker logs --tail 30 caddy >&2 || true
+        return 1
+    fi
+
+    # Check again after HTTPS succeeds so a concurrent CA change cannot pass unnoticed.
+    if ! verify_root_ca_unchanged "${saved_root}"; then
+        printf '[FAIL] Caddy root CA changed unexpectedly.\n' >&2
+        return 1
+    fi
 }
 
 require_https_verification_ready() {
@@ -553,16 +674,34 @@ command_restart() {
 validate_caddy_candidate() {
     local candidate=$1
     local container_path="/tmp/vwctl-Caddyfile"
+    local command_output=""
 
     wait_for_container caddy || return 1
     docker cp "${candidate}" "caddy:${container_path}" >/dev/null || return 1
-    if ! docker exec caddy caddy adapt \
-        --config "${container_path}" \
-        --adapter caddyfile \
-        --validate >/dev/null; then
+
+    if ! command_output=$(docker exec caddy caddy fmt \
+        --overwrite "${container_path}" 2>&1 >/dev/null); then
+        printf '[FAIL] Caddy could not format the candidate Caddyfile.\n' >&2
+        [[ -z "${command_output}" ]] || printf '%s\n' "${command_output}" >&2
         docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
         return 1
     fi
+
+    if ! command_output=$(docker exec caddy caddy adapt \
+        --config "${container_path}" \
+        --adapter caddyfile \
+        --validate 2>&1 >/dev/null); then
+        printf '[FAIL] Caddy rejected the candidate Caddyfile.\n' >&2
+        [[ -z "${command_output}" ]] || printf '%s\n' "${command_output}" >&2
+        docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if ! docker cp "caddy:${container_path}" "${candidate}" >/dev/null; then
+        docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
+        return 1
+    fi
+    chmod 0644 "${candidate}"
     docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
 }
 
@@ -669,10 +808,15 @@ apply_access_change() {
         return 1
     fi
 
-    if ! compose up -d --force-recreate caddy ||
-       ! wait_for_container caddy ||
-       ! verify_https "${new_address}" ||
-       ! verify_root_ca_unchanged "${backup_dir}/root-ca"; then
+    if ! compose up -d --force-recreate caddy; then
+        printf '[FAIL] Docker Compose could not recreate Caddy.\n' >&2
+        restore_access_configuration \
+            "${backup_dir}" "${had_access_file}" "${had_legacy_file}" "${old_address}" || true
+        cleanup_operation_directory "${backup_dir}"
+        return 1
+    fi
+
+    if ! verify_access_change "${new_address}" "${backup_dir}/root-ca"; then
         restore_access_configuration \
             "${backup_dir}" "${had_access_file}" "${had_legacy_file}" "${old_address}" || true
         cleanup_operation_directory "${backup_dir}"
