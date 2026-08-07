@@ -6,6 +6,13 @@ set -o pipefail
 
 readonly INSTALL_DIR="/opt/vaultwarden"
 readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
+readonly CADDY_HOSTNAME_FILE="${INSTALL_DIR}/.caddy-hostname"
+readonly CADDYFILE="${INSTALL_DIR}/Caddyfile"
+readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
+readonly CADDY_DATA_DIR="${INSTALL_DIR}/data/caddy/data"
+readonly CADDY_CONFIG_DIR="${INSTALL_DIR}/data/caddy/config"
+readonly CADDY_ROOT_CA="${CADDY_DATA_DIR}/caddy/pki/authorities/local/root.crt"
+readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
 readonly MIN_DISK_SPACE_MB=2048
 
 ERRORS=0
@@ -20,6 +27,8 @@ DOCKER_CODENAME=""
 DOCKER_USER=""
 DOCKER_GROUP_CHANGED=0
 APPLIANCE_STATE="fresh"
+CADDY_STATE="absent"
+CADDY_HOSTNAME=""
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -179,6 +188,66 @@ check_existing_installation() {
     info "The existing directory will not be modified."
 }
 
+validate_local_hostname() {
+    local hostname=$1
+    local label
+    local -a labels
+
+    (( ${#hostname} <= 253 )) || return 1
+    [[ "${hostname}" == *.* ]] || return 1
+    [[ "${hostname}" != .* && "${hostname}" != *. ]] || return 1
+    [[ ! "${hostname}" =~ ^[0-9.]+$ ]] || return 1
+
+    IFS='.' read -r -a labels <<<"${hostname}"
+    for label in "${labels[@]}"; do
+        (( ${#label} <= 63 )) || return 1
+        [[ "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+detect_caddy_configuration() {
+    local -a hostname_lines
+    local managed_files=0
+
+    section "Caddy configuration"
+
+    if [[ -e "${CADDY_HOSTNAME_FILE}" ]]; then
+        managed_files=$((managed_files + 1))
+    fi
+    if [[ -e "${CADDYFILE}" ]]; then
+        managed_files=$((managed_files + 1))
+    fi
+    if [[ -e "${CADDY_COMPOSE_FILE}" ]]; then
+        managed_files=$((managed_files + 1))
+    fi
+
+    if (( managed_files == 0 )); then
+        CADDY_STATE="absent"
+        info "Caddy is not configured yet."
+        return
+    fi
+
+    if (( managed_files != 3 )) || \
+       [[ ! -f "${CADDY_HOSTNAME_FILE}" || -L "${CADDY_HOSTNAME_FILE}" ]] || \
+       [[ ! -f "${CADDYFILE}" || -L "${CADDYFILE}" ]] || \
+       [[ ! -f "${CADDY_COMPOSE_FILE}" || -L "${CADDY_COMPOSE_FILE}" ]] || \
+       [[ ! -d "${CADDY_DATA_DIR}" || ! -d "${CADDY_CONFIG_DIR}" ]]; then
+        error "A partial or unrecognized Caddy configuration exists under ${INSTALL_DIR}; it will not be overwritten."
+        return
+    fi
+
+    mapfile -t hostname_lines < "${CADDY_HOSTNAME_FILE}"
+    if (( ${#hostname_lines[@]} != 1 )) || ! validate_local_hostname "${hostname_lines[0]}"; then
+        error "The stored Caddy hostname is missing or invalid; existing Caddy files will not be changed."
+        return
+    fi
+
+    CADDY_HOSTNAME=${hostname_lines[0]}
+    CADDY_STATE="configured"
+    ok "Existing Caddy configuration detected for ${CADDY_HOSTNAME}."
+    info "Hostname changes are not performed automatically; the existing hostname will be preserved."
+}
+
 check_docker() {
     section "Docker"
 
@@ -230,13 +299,23 @@ port_is_in_use() {
     ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
+caddy_owns_port_443() {
+    [[ "${CADDY_STATE}" == "configured" ]] || return 1
+    docker inspect --format '{{with (index .HostConfig.PortBindings "443/tcp")}}{{range .}}{{println .HostPort}}{{end}}{{end}}' caddy 2>/dev/null |
+        grep -Fxq 443
+}
+
 check_ports() {
     local port=443
 
     section "Network ports"
 
     if port_is_in_use "${port}"; then
-        error "TCP port ${port} is already in use."
+        if caddy_owns_port_443; then
+            ok "TCP port ${port} is already in use by this appliance's Caddy container."
+        else
+            error "TCP port ${port} is already in use."
+        fi
     else
         ok "TCP port ${port} appears available."
     fi
@@ -531,13 +610,229 @@ deploy_vaultwarden() {
     ok "Vaultwarden is running without a host-published HTTP port."
 }
 
+prompt_for_caddy_hostname() {
+    local answer=""
+
+    section "Local HTTPS hostname"
+    info "Detected LAN IPv4 address: ${IPV4_ADDRESS}"
+    info "The chosen hostname must resolve to this address on every client device."
+    info "The installer will not modify DNS servers, routers, Pi-hole, AdGuard Home, or hosts files."
+
+    if [[ ! -r /dev/tty ]]; then
+        error "An interactive terminal is required to choose the Vaultwarden hostname."
+        return 1
+    fi
+
+    while true; do
+        if ! read -r -p "Vaultwarden hostname [vaultwarden.local]: " answer </dev/tty; then
+            error "Unable to read the Vaultwarden hostname."
+            return 1
+        fi
+
+        CADDY_HOSTNAME=${answer:-vaultwarden.local}
+        if validate_local_hostname "${CADDY_HOSTNAME}"; then
+            break
+        fi
+        warn "Invalid hostname. Use dot-separated DNS labels without spaces or underscores."
+    done
+
+    info "Required DNS mapping: ${CADDY_HOSTNAME} -> ${IPV4_ADDRESS}"
+}
+
+create_caddy_configuration() {
+    section "Caddy configuration"
+
+    if [[ -e "${CADDY_HOSTNAME_FILE}" || -e "${CADDYFILE}" || -e "${CADDY_COMPOSE_FILE}" ]]; then
+        error "Caddy configuration paths appeared during installation; refusing to overwrite them."
+        return 1
+    fi
+
+    install -d -m 0700 "${CADDY_DATA_DIR}" "${CADDY_CONFIG_DIR}"
+
+    if ! (set -o noclobber; cat > "${CADDYFILE}" <<CADDY
+{
+    auto_https disable_redirects
+}
+
+https://${CADDY_HOSTNAME} {
+    tls internal
+    reverse_proxy vaultwarden:80
+}
+CADDY
+    ); then
+        error "Unable to create ${CADDYFILE}."
+        return 1
+    fi
+
+    if ! (set -o noclobber; cat > "${CADDY_COMPOSE_FILE}" <<'COMPOSE'
+services:
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "443:443/tcp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy/data:/data
+      - ./data/caddy/config:/config
+    networks:
+      - appliance
+COMPOSE
+    ); then
+        error "Unable to create ${CADDY_COMPOSE_FILE}."
+        return 1
+    fi
+
+    if ! (set -o noclobber; printf '%s\n' "${CADDY_HOSTNAME}" > "${CADDY_HOSTNAME_FILE}"); then
+        error "Unable to create ${CADDY_HOSTNAME_FILE}."
+        return 1
+    fi
+
+    chmod 0644 "${CADDYFILE}" "${CADDY_COMPOSE_FILE}" "${CADDY_HOSTNAME_FILE}"
+    CADDY_STATE="configured"
+    ok "Created Caddy configuration for ${CADDY_HOSTNAME}."
+}
+
+deploy_caddy() {
+    section "Caddy deployment"
+
+    if ! docker compose --project-directory "${INSTALL_DIR}" config --quiet; then
+        error "The combined Vaultwarden and Caddy Compose configuration is invalid."
+        return 1
+    fi
+
+    if ! docker compose --project-directory "${INSTALL_DIR}" config --services | grep -Fxq caddy; then
+        error "The combined Compose configuration does not contain the Caddy service."
+        return 1
+    fi
+
+    if ! docker image inspect caddy:2 >/dev/null 2>&1; then
+        docker compose --project-directory "${INSTALL_DIR}" pull caddy
+    fi
+
+    docker compose --project-directory "${INSTALL_DIR}" up -d caddy
+    ok "Caddy deployment requested without publishing TCP port 80."
+}
+
+export_caddy_root_ca() {
+    local _attempt
+
+    section "Caddy root CA export"
+
+    for _attempt in {1..30}; do
+        [[ -f "${CADDY_ROOT_CA}" ]] && break
+        sleep 1
+    done
+
+    if [[ ! -f "${CADDY_ROOT_CA}" ]]; then
+        error "Caddy did not create its internal root CA certificate at ${CADDY_ROOT_CA}."
+        return 1
+    fi
+
+    install -d -m 0755 "${INSTALL_DIR}/certs"
+
+    if [[ -e "${EXPORTED_ROOT_CA}" ]]; then
+        if [[ ! -f "${EXPORTED_ROOT_CA}" || -L "${EXPORTED_ROOT_CA}" ]]; then
+            error "The CA export path exists but is not a regular managed file; it will not be overwritten."
+            return 1
+        fi
+        if ! cmp -s "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}"; then
+            error "The exported root CA differs from Caddy's persistent CA; refusing to overwrite it silently."
+            return 1
+        fi
+        ok "Existing root CA export matches Caddy's persistent CA."
+    else
+        install -m 0644 "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}"
+        ok "Exported Caddy's public root CA certificate to ${EXPORTED_ROOT_CA}."
+    fi
+
+    info "Client devices must trust this root CA before ${CADDY_HOSTNAME} will be trusted."
+    info "Caddy's private CA key remains only in the persistent Caddy data directory and is not exported."
+}
+
+verify_phase3() {
+    local _attempt
+    local endpoint_ok=0
+
+    section "Phase 3 verification"
+
+    if [[ "$(docker inspect --format '{{.State.Running}}' vaultwarden 2>/dev/null)" != "true" ]]; then
+        error "Vaultwarden is not running."
+        return 1
+    fi
+    ok "Vaultwarden container is running."
+
+    if [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' vaultwarden 2>/dev/null)" != "0" ]]; then
+        error "Vaultwarden unexpectedly publishes a host port."
+        return 1
+    fi
+    ok "Vaultwarden has no host-published ports."
+
+    if [[ "$(docker inspect --format '{{.State.Running}}' caddy 2>/dev/null)" != "true" ]]; then
+        error "Caddy is not running. Inspect it with: docker logs caddy"
+        return 1
+    fi
+    ok "Caddy container is running."
+
+    if [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' caddy 2>/dev/null)" != "1" ]]; then
+        error "Caddy must publish exactly one host port (TCP 443)."
+        return 1
+    fi
+
+    if [[ "$(docker inspect --format '{{with (index .NetworkSettings.Networks \"vaultwarden-appliance\")}}connected{{end}}' caddy 2>/dev/null)" != "connected" ]]; then
+        error "Caddy is not connected to the vaultwarden-appliance Docker network."
+        return 1
+    fi
+    ok "Caddy is connected to the internal appliance network."
+
+    if ! caddy_owns_port_443 || ! port_is_in_use 443; then
+        error "Caddy is not listening on host TCP port 443."
+        return 1
+    fi
+    ok "Caddy is listening on host TCP port 443."
+
+    if [[ ! -f "${EXPORTED_ROOT_CA}" ]]; then
+        error "The exported Caddy root CA certificate is missing."
+        return 1
+    fi
+
+    if ! command_exists curl; then
+        error "curl is required to verify the local HTTPS endpoint."
+        return 1
+    fi
+
+    for _attempt in {1..30}; do
+        if curl --fail --silent --show-error \
+            --noproxy '*' \
+            --cacert "${EXPORTED_ROOT_CA}" \
+            --resolve "${CADDY_HOSTNAME}:443:127.0.0.1" \
+            "https://${CADDY_HOSTNAME}/alive" >/dev/null 2>&1; then
+            endpoint_ok=1
+            break
+        fi
+        sleep 1
+    done
+
+    if (( endpoint_ok == 0 )); then
+        error "The HTTPS health endpoint failed with explicit trust in the exported Caddy root CA."
+        return 1
+    fi
+
+    ok "Caddy reached Vaultwarden over the internal Docker network."
+    ok "The HTTPS endpoint responded with the exported root CA explicitly trusted."
+}
+
 print_completion_summary() {
-    section "Phase 2 complete"
+    section "Phase 3 complete"
     info "Installation directory: ${INSTALL_DIR}"
     info "Compose file: ${INSTALL_DIR}/docker-compose.yml"
     info "Persistent data: ${INSTALL_DIR}/data/vaultwarden"
     info "Docker network: vaultwarden-appliance"
-    info "Vaultwarden is internal-only; Caddy and HTTPS are not configured yet."
+    info "HTTPS endpoint: https://${CADDY_HOSTNAME}"
+    info "Required DNS mapping: ${CADDY_HOSTNAME} -> ${IPV4_ADDRESS}"
+    info "Exported root CA: ${EXPORTED_ROOT_CA}"
+    info "Vaultwarden remains internal-only; only Caddy publishes host TCP port 443."
     if [[ "${APPLIANCE_STATE}" == "existing" || "${APPLIANCE_STATE}" == "legacy" ]]; then
         info "Existing appliance files and any existing Vaultwarden container were left unchanged."
     fi
@@ -547,13 +842,14 @@ print_completion_summary() {
 }
 
 main() {
-    printf 'Vaultwarden Appliance - Phase 2 installer\n'
+    printf 'Vaultwarden Appliance - Phase 3 installer\n'
 
     check_operating_system
     check_architecture
     check_disk_space
     check_docker
     check_existing_installation
+    detect_caddy_configuration
     check_ports
     detect_ipv4_address
     print_preflight_summary
@@ -586,6 +882,17 @@ main() {
             return 1
             ;;
     esac
+
+    if [[ "${CADDY_STATE}" == "absent" ]]; then
+        prompt_for_caddy_hostname
+        create_caddy_configuration
+    else
+        info "Required DNS mapping: ${CADDY_HOSTNAME} -> ${IPV4_ADDRESS}"
+    fi
+
+    deploy_caddy
+    export_caddy_root_ca
+    verify_phase3
 
     print_completion_summary
 }
