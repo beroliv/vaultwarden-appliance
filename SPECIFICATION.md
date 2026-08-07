@@ -1,1 +1,818 @@
+# Vaultwarden Appliance — Specification
+
+## 1. Project Goal
+
+Vaultwarden Appliance provides a simple, reproducible way to deploy and operate a LAN-first Vaultwarden server on a Raspberry Pi or compatible Debian-based Linux system.
+
+The appliance combines existing, trusted components rather than modifying or forking Vaultwarden itself.
+
+Core components:
+
+* Vaultwarden
+* Caddy
+* Docker
+* Docker Compose
+* `vwctl` management utility
+* Automated USB backups
+
+The intended installation experience is:
+
+```text
+Fresh Debian / Raspberry Pi OS
+        ↓
+Run one installer command
+        ↓
+Answer a few simple questions
+        ↓
+Vaultwarden + HTTPS + Backup
+        ↓
+Ready-to-use LAN appliance
+```
+
+The project should favor simplicity, understandable code, safe defaults and predictable behavior over a large feature set.
+
+---
+
+## 2. Target Users
+
+The appliance is intended for users who:
+
+* can install and access a Raspberry Pi or Debian server;
+* have basic Linux and networking knowledge;
+* want to self-host Vaultwarden;
+* do not want to manually configure Docker Compose, Caddy, certificates, backups and routine maintenance.
+
+The appliance is **not intended to completely hide Linux or networking concepts**.
+
+Users who expose the appliance to the Internet are expected to understand DNS, DynDNS, firewalls, port forwarding and the associated security implications.
+
+---
+
+## 3. Scope of Version 1
+
+Version 1 MUST provide:
+
+* automated installation;
+* Docker and Docker Compose prerequisite checks;
+* Vaultwarden deployment;
+* Caddy reverse proxy;
+* HTTPS using Caddy's internal CA;
+* LAN-first configuration;
+* simple account registration;
+* `vwctl` management utility;
+* automatic USB backups;
+* backup retention and storage overflow protection;
+* backup restore;
+* export of the Caddy root CA certificate;
+* understandable status and error messages.
+
+Version 1 MUST remain intentionally small.
+
+---
+
+## 4. Out of Scope
+
+Version 1 will NOT automatically configure:
+
+* public Internet access;
+* public TLS certificates;
+* Let's Encrypt;
+* DynDNS;
+* public DNS providers;
+* Cloudflare;
+* router port forwarding;
+* VPN services;
+* NAS backup targets;
+* cloud backup services;
+* S3;
+* Synology integration;
+* Google Drive;
+* OneDrive;
+* Dropbox;
+* email servers;
+* monitoring platforms.
+
+Advanced users may extend the standard Caddy and Docker Compose configuration themselves.
+
+The appliance MUST NOT intentionally prevent such modifications.
+
+---
+
+## 5. Installation Path
+
+The appliance MUST use:
+
+```text
+/opt/vaultwarden
+```
+
+as its installation directory.
+
+This path is intentionally compatible with common existing Vaultwarden installations and should simplify future migration of existing deployments.
+
+The project should avoid unnecessary directory restructuring that would make migration more difficult.
+
+A possible layout is:
+
+```text
+/opt/vaultwarden/
+├── docker-compose.yml
+├── .env
+├── Caddyfile
+├── data/
+│   ├── vaultwarden/
+│   └── caddy/
+└── bin/
+    └── vwctl
+```
+
+The final directory structure may evolve during implementation, but `/opt/vaultwarden` MUST remain the root directory.
+
+---
+
+## 6. Installer
+
+Installation should be launchable with a single command similar to:
+
+```bash
+curl -fsSL https://example/install.sh | sudo bash
+```
+
+The final URL will be determined when the project is published.
+
+The initial `install.sh` SHOULD act primarily as a bootstrap installer.
+
+It SHOULD download/install the required appliance files into `/opt/vaultwarden`.
+
+### 6.1 System Checks
+
+Before making changes, the installer MUST check:
+
+* supported operating system;
+* CPU architecture;
+* available disk space;
+* Docker availability;
+* Docker Compose availability;
+* Docker daemon status;
+* availability of required network ports;
+* existing `/opt/vaultwarden` installation;
+* relevant network configuration.
+
+ARM64 Raspberry Pi systems MUST be supported.
+
+Standard Debian-compatible x86-64 systems SHOULD be supported where possible without adding significant complexity.
+
+### 6.2 Existing Docker Installation
+
+If Docker is already installed and functional, the installer MUST use the existing installation.
+
+It MUST NOT reinstall, replace or unnecessarily modify a working Docker installation.
+
+If Docker is missing, the installer may offer to install it.
+
+### 6.3 Existing Appliance Installation
+
+The installer MUST detect an existing appliance installation.
+
+It MUST NOT silently overwrite an existing `/opt/vaultwarden` installation.
+
+Existing installations and future migration scenarios must be considered before destructive operations are implemented.
+
+---
+
+## 7. Interactive Configuration
+
+The installer SHOULD provide sensible recommended defaults.
+
+A user should normally be able to accept the defaults by pressing Enter.
+
+Example:
+
+```text
+Hostname [vault.local]:
+IP address [automatically detected]:
+HTTPS [Caddy internal]:
+Account registration [Enabled]:
+Automatic USB backup [Enabled]:
+```
+
+The installer should avoid asking questions whose answer can safely and reliably be detected automatically.
+
+Advanced users may change configurable values.
+
+---
+
+## 8. Network Model
+
+Version 1 is designed primarily for trusted local networks.
+
+The default deployment MUST NOT require:
+
+* a public domain;
+* public DNS;
+* Internet-facing ports;
+* Let's Encrypt.
+
+Caddy MUST provide HTTPS using its internal certificate authority.
+
+A typical architecture is:
+
+```text
+Client
+  ↓ HTTPS
+Caddy
+  ↓
+Vaultwarden
+```
+
+The exact hostname handling must be determined during implementation and tested on common client platforms.
+
+---
+
+## 9. Caddy
+
+Caddy will provide the HTTPS reverse proxy.
+
+The default configuration MUST use Caddy's internal CA.
+
+Example concept:
+
+```caddy
+vault.local {
+    tls internal
+    reverse_proxy vaultwarden:80
+}
+```
+
+The final Caddy configuration must be generated by the installer based on the appliance configuration.
+
+Advanced users MUST be able to inspect and manually modify the Caddy configuration.
+
+The project will not automatically configure public certificates in Version 1.
+
+---
+
+## 10. Vaultwarden Account Registration
+
+The default installation SHOULD prioritize a simple first-run experience.
+
+Default state:
+
+```text
+Account registration: ENABLED
+Admin panel:          DISABLED
+Admin token:          NOT CONFIGURED
+```
+
+Users can therefore open the Vaultwarden web interface and create an account directly.
+
+Open registration does NOT provide access to existing user vaults.
+
+For a LAN-only appliance, registration may remain enabled if the administrator accepts that any device able to reach the service can create an account.
+
+Registration MUST be controllable through `vwctl`.
+
+Required commands:
+
+```bash
+vwctl signup on
+vwctl signup off
+```
+
+---
+
+## 11. Vaultwarden Admin Panel
+
+The Vaultwarden Admin Panel is not required for normal appliance operation.
+
+It SHOULD therefore be disabled by default.
+
+No Admin Token should be required during normal initial installation.
+
+A future or optional command may provide:
+
+```bash
+vwctl admin enable
+```
+
+If implemented, the appliance SHOULD securely generate and configure the required Admin Token automatically.
+
+Admin functionality is secondary to the Version 1 core requirements.
+
+---
+
+## 12. vwctl
+
+The appliance MUST provide a management command named:
+
+```bash
+vwctl
+```
+
+`vwctl` should hide routine Docker Compose implementation details while keeping the underlying system transparent and accessible to advanced users.
+
+Version 1 SHOULD provide:
+
+```bash
+vwctl status
+vwctl update
+vwctl backup
+vwctl restore
+vwctl logs
+vwctl signup on
+vwctl signup off
+vwctl cert export
+vwctl reload
+```
+
+### 12.1 Update
+
+`vwctl update` SHOULD perform the equivalent of:
+
+```bash
+docker compose pull
+docker compose up -d
+docker image prune -a -f
+```
+
+The exact implementation must include appropriate error handling.
+
+An update MUST NOT silently destroy existing data or configuration.
+
+### 12.2 Status
+
+`vwctl status` SHOULD present human-readable information such as:
+
+```text
+Vaultwarden:       Running
+Caddy:             Running
+HTTPS:             OK
+Registration:      Enabled
+Backup target:     USB connected
+Last backup:       2026-08-07 03:00
+Backup storage:    12 %
+```
+
+### 12.3 Doctor
+
+A diagnostic command is desirable:
+
+```bash
+vwctl doctor
+```
+
+Possible checks:
+
+```text
+Docker                 ✓
+Docker Compose         ✓
+Vaultwarden            ✓
+Caddy                  ✓
+HTTPS                  ✓
+Database               ✓
+Disk space             ✓
+USB backup target      ✓
+Last backup            ✓
+Backup integrity       ✓
+```
+
+`vwctl doctor` is a SHOULD requirement rather than a mandatory first implementation milestone.
+
+---
+
+## 13. USB Backup
+
+Automatic external backup is part of Version 1.
+
+A backup stored only on the same SD card or system disk as Vaultwarden MUST NOT be considered sufficient as the appliance's backup solution.
+
+USB mass-storage devices will be the supported external backup target.
+
+Other backup targets are outside Version 1 scope.
+
+---
+
+## 14. USB Device Detection
+
+During installation, the appliance SHOULD detect suitable attached USB storage devices.
+
+Example:
+
+```text
+Configure external USB backup? [Yes]
+
+Detected devices:
+
+1) SanDisk Ultra
+   /dev/sda
+   29.8 GB
+   Filesystem: exFAT
+
+2) Kingston
+   /dev/sdb
+   57.7 GB
+   Filesystem: FAT32
+
+Backup device [1]:
+```
+
+The installer MUST provide enough information to minimize the risk of selecting the wrong disk.
+
+The appliance MUST NOT assume a fixed USB device name such as `/dev/sda`.
+
+Persistent identification SHOULD use filesystem UUIDs or an equivalent stable identifier.
+
+---
+
+## 15. USB Filesystem
+
+The recommended USB backup filesystem is:
+
+```text
+exFAT
+```
+
+The main reasons are portability and easy access from Windows, macOS and Linux systems.
+
+Existing suitable filesystems may be retained if supported by the implementation.
+
+The installer SHOULD offer to format the selected USB storage device as exFAT.
+
+---
+
+## 16. USB Formatting Safety
+
+Formatting a storage device is destructive.
+
+The installer MUST NOT format any device without explicit confirmation.
+
+A simple Enter or default `Yes` MUST NOT be sufficient for the final destructive confirmation.
+
+Example:
+
+```text
+WARNING
+
+All data on the following device will be permanently deleted:
+
+Device: SanDisk Ultra
+Path:   /dev/sda
+Size:   29.8 GB
+
+Type YES to continue:
+```
+
+The installer MUST abort formatting if the expected confirmation is not entered.
+
+Where practical, additional safeguards SHOULD prevent formatting the system disk.
+
+---
+
+## 17. USB Capacity
+
+The appliance MUST NOT depend on one specific USB-stick capacity.
+
+Common USB storage sizes should work without configuration changes.
+
+Examples include:
+
+```text
+8 GB
+16 GB
+32 GB
+64 GB
+128 GB
+256 GB
+```
+
+Smaller or larger devices may also work if sufficient free capacity exists.
+
+The implementation SHOULD use available capacity rather than hard-coded assumptions.
+
+---
+
+## 18. Backup Format
+
+Backups SHOULD be stored as portable archives.
+
+Example:
+
+```text
+vaultwarden-2026-08-07_0300.tar.gz
+```
+
+This avoids relying on Unix ownership and permission metadata provided directly by exFAT.
+
+The backup process must preserve all information required for a reliable restore.
+
+The restore process MUST explicitly restore appropriate ownership and permissions on the Linux system.
+
+The exact archive format may change if testing demonstrates a technically superior solution, but portability must remain a goal.
+
+---
+
+## 19. Backup Contents
+
+The backup MUST contain all data required to restore the Vaultwarden service.
+
+This includes at minimum the relevant Vaultwarden persistent data.
+
+Configuration required for appliance recovery SHOULD also be backed up where appropriate.
+
+The implementation must determine the correct procedure for safely backing up the Vaultwarden database.
+
+A backup MUST NOT simply assume that copying a live database file always produces a valid backup.
+
+---
+
+## 20. Backup Retention
+
+Automatic backups MUST include retention management.
+
+Users should not need to design their own backup rotation strategy.
+
+Recommended initial defaults:
+
+```text
+Automatic backup:      Enabled
+Backup time:           03:00
+
+Daily backups:         7
+Weekly backups:        4
+Monthly backups:       6
+```
+
+These values should remain configurable.
+
+The exact implementation of daily/weekly/monthly retention must avoid unnecessary duplicate archives where possible.
+
+---
+
+## 21. Backup Overflow Protection
+
+The backup system MUST protect the USB storage device from filling completely.
+
+Protection SHOULD be based primarily on the actual capacity of the selected storage device rather than a fixed number of gigabytes.
+
+Initial proposed defaults:
+
+```text
+Maximum backup usage: 80 %
+Reserve free space:   10 %
+```
+
+The final values may be refined during testing.
+
+Before creating a backup, the system MUST check available storage.
+
+Old backups should be removed according to the configured retention policy when appropriate.
+
+If sufficient safe storage cannot be made available, the backup MUST fail cleanly rather than fill the filesystem.
+
+---
+
+## 22. Missing USB Protection
+
+The appliance MUST verify that the configured USB filesystem is actually mounted before writing a backup.
+
+If the USB device is missing or not mounted, the backup MUST NOT write into an empty mount directory on the Raspberry Pi's system disk.
+
+Instead, the backup must abort and clearly report the problem.
+
+This is a critical safety requirement.
+
+---
+
+## 23. Backup Directory Structure
+
+A possible USB layout is:
+
+```text
+VW-BACKUP/
+├── backups/
+│   ├── daily/
+│   ├── weekly/
+│   └── monthly/
+├── certificate/
+│   └── vaultwarden-root-ca.crt
+└── README.txt
+```
+
+The exact layout may be adjusted during implementation if this improves retention handling or restore reliability.
+
+It should remain understandable when the USB device is connected to another computer.
+
+---
+
+## 24. Caddy Root CA Export
+
+The Caddy internal root CA certificate MUST be easily exportable.
+
+When USB backup is configured, the appliance SHOULD automatically place a copy on the USB storage device.
+
+Example:
+
+```text
+VW-BACKUP/certificate/vaultwarden-root-ca.crt
+```
+
+The USB device SHOULD also contain a short README explaining that this certificate must be installed as a trusted root certificate on client devices that connect to the appliance.
+
+The appliance MUST also provide:
+
+```bash
+vwctl cert export
+```
+
+to export the certificate again when required.
+
+Private CA keys MUST NOT be exported together with the public root certificate.
+
+---
+
+## 25. Restore
+
+Version 1 MUST provide a usable restore procedure.
+
+The primary interface should be:
+
+```bash
+vwctl restore
+```
+
+Example interaction:
+
+```text
+Available backups:
+
+1) 2026-08-07 03:00
+2) 2026-08-06 03:00
+3) 2026-08-05 03:00
+
+Select backup [1]:
+```
+
+Before restoring, the appliance MUST:
+
+* verify that the selected backup exists;
+* perform reasonable integrity checks;
+* stop or isolate services when required;
+* avoid restoring into an actively changing database;
+* restore required ownership and permissions;
+* restart the required services;
+* verify service health after restoration.
+
+A failed restore SHOULD leave enough diagnostic information for recovery.
+
+---
+
+## 26. Error Handling
+
+The project should fail safely and provide understandable errors.
+
+Scripts MUST NOT silently continue after critical failures.
+
+Important operations should use appropriate exit codes.
+
+Particular care is required for:
+
+* disk formatting;
+* restore operations;
+* existing installations;
+* Docker failures;
+* missing USB backup targets;
+* insufficient storage;
+* invalid configuration;
+* port conflicts.
+
+---
+
+## 27. Transparency
+
+The appliance should simplify administration without hiding the underlying system unnecessarily.
+
+Advanced users should still be able to:
+
+* inspect Docker Compose configuration;
+* inspect `.env`;
+* inspect Caddy configuration;
+* use normal Docker commands;
+* modify Caddy manually;
+* implement their own external backup solution.
+
+The appliance MUST NOT require proprietary services, accounts or telemetry.
+
+---
+
+## 28. Security Philosophy
+
+The project should avoid implementing security-critical functionality that is already provided by established upstream projects.
+
+Vaultwarden remains responsible for Vaultwarden functionality.
+
+Caddy remains responsible for HTTPS and certificate handling.
+
+Docker remains responsible for container execution.
+
+The appliance primarily provides:
+
+* installation;
+* configuration;
+* lifecycle management;
+* backup;
+* restore;
+* diagnostics.
+
+Secure defaults should be preferred where they do not create unnecessary complexity for the LAN-first use case.
+
+---
+
+## 29. Development and Testing
+
+Development should be incremental.
+
+Large one-shot implementations should be avoided.
+
+Recommended implementation phases:
+
+```text
+Phase 1  System detection and installer framework
+Phase 2  Docker Compose + Vaultwarden
+Phase 3  Caddy + internal HTTPS
+Phase 4  vwctl basic management
+Phase 5  USB detection and formatting
+Phase 6  Backup + retention + overflow protection
+Phase 7  Restore
+Phase 8  Diagnostics and polish
+```
+
+Each phase should be tested before beginning the next.
+
+---
+
+## 30. Reference Installation Test
+
+A clean reference machine should be used for repeated installation testing.
+
+The minimum end-to-end acceptance scenario is:
+
+```text
+Fresh supported OS
+        ↓
+Run installer
+        ↓
+Accept recommended defaults
+        ↓
+Vaultwarden starts
+        ↓
+HTTPS works
+        ↓
+Create Vaultwarden account
+        ↓
+USB backup succeeds
+        ↓
+vwctl status works
+        ↓
+Update succeeds
+        ↓
+Restore succeeds
+        ↓
+Vaultwarden data remains intact
+```
+
+The process should be repeatable from a clean installation.
+
+---
+
+## 31. Migration
+
+The use of `/opt/vaultwarden` is intended to simplify future migration from existing Vaultwarden installations.
+
+Migration support does not need to be fully automated in the first implementation.
+
+However, Version 1 development MUST avoid design choices that unnecessarily prevent later migration.
+
+A migration procedure can be added after clean installation, backup and restore functionality have been proven reliable.
+
+---
+
+## 32. Project Principles
+
+Development decisions should follow these priorities, in order:
+
+1. Data safety
+2. Predictable behavior
+3. Simple installation
+4. Simple maintenance
+5. Understandable implementation
+6. Compatibility with upstream Vaultwarden and Caddy
+7. Additional features
+
+When a proposed feature significantly increases complexity without being essential to running a local Vaultwarden appliance, it should remain outside the project.
+
+The goal is not to build a general-purpose server management platform.
+
+The goal is:
+
+> A small, reliable, LAN-first Vaultwarden appliance that is easy to install, update, back up and restore.
 
