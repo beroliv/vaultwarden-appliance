@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+set -o errexit
 set -o nounset
 set -o pipefail
 
@@ -13,6 +14,8 @@ OS_ID="unknown"
 OS_VERSION="unknown"
 ARCH="unknown"
 IPV4_ADDRESS="not detected"
+DOCKER_READY=0
+DOCKER_CODENAME=""
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -61,6 +64,7 @@ check_operating_system() {
     OS_NAME=${PRETTY_NAME:-${NAME:-unknown}}
     OS_ID=${ID:-unknown}
     OS_VERSION=${VERSION_ID:-unknown}
+    DOCKER_CODENAME=${VERSION_CODENAME:-}
     id_like=${ID_LIKE:-}
 
     info "Detected: ${OS_NAME}"
@@ -133,32 +137,25 @@ check_existing_installation() {
 }
 
 check_docker() {
-    local compose_found=0
-
     section "Docker"
 
     if ! command_exists docker; then
-        error "Docker is not installed. Phase 1 only reports this and will not install it."
-        info "Docker Compose and daemon checks cannot run without Docker."
+        info "Docker is not installed."
+        info "The installer can install Docker Engine and Docker Compose v2 after the preflight."
         return
     fi
 
     ok "Docker is installed: $(docker --version 2>/dev/null || printf 'version unknown')"
 
-    if docker compose version >/dev/null 2>&1; then
-        ok "Docker Compose plugin is available: $(docker compose version --short 2>/dev/null || docker compose version 2>/dev/null)"
-        compose_found=1
-    elif command_exists docker-compose && docker-compose version >/dev/null 2>&1; then
-        ok "Legacy docker-compose is available: $(docker-compose version --short 2>/dev/null || docker-compose version 2>/dev/null)"
-        compose_found=1
+    if ! docker compose version >/dev/null 2>&1; then
+        error "Docker Compose v2 is not available as 'docker compose'. The existing Docker installation will not be modified."
+        return
     fi
-
-    if (( compose_found == 0 )); then
-        error "Docker Compose is not available ('docker compose' or 'docker-compose')."
-    fi
+    ok "Docker Compose v2 is available: $(docker compose version --short 2>/dev/null || docker compose version 2>/dev/null)"
 
     if docker info >/dev/null 2>&1; then
         ok "Docker daemon is running and accessible; the installer will not modify Docker."
+        DOCKER_READY=1
     else
         error "Docker is installed, but the daemon is not running or is not accessible to this user."
     fi
@@ -223,24 +220,183 @@ detect_ipv4_address() {
     fi
 }
 
-print_summary() {
-    section "Phase 1 summary"
+print_preflight_summary() {
+    section "Preflight summary"
     info "Installation target: ${INSTALL_DIR}"
     info "System: ${OS_NAME} (${OS_ID} ${OS_VERSION}), ${ARCH}"
     info "IPv4 address: ${IPV4_ADDRESS}"
-    info "No system changes were made."
 
     if (( ERRORS > 0 )); then
         printf '\nPreflight failed with %d error(s) and %d warning(s).\n' "${ERRORS}" "${WARNINGS}" >&2
         return 1
     fi
 
-    printf '\nPreflight passed with %d warning(s). Phase 1 is complete.\n' "${WARNINGS}"
+    printf '\nPreflight passed with %d warning(s).\n' "${WARNINGS}"
+}
+
+require_root() {
+    if (( EUID != 0 )); then
+        error "Phase 2 installation must run as root. Re-run with sudo."
+        return 1
+    fi
+}
+
+confirm_docker_installation() {
+    local answer=""
+
+    printf '\nDocker is required but is not installed.\n'
+    if [[ ! -r /dev/tty ]]; then
+        error "Docker installation requires an interactive terminal for confirmation."
+        return 1
+    fi
+
+    if ! read -r -p "Install Docker Engine and Docker Compose v2 now? [Y/n] " answer </dev/tty; then
+        error "Unable to read Docker installation confirmation."
+        return 1
+    fi
+
+    case "${answer}" in
+        ""|y|Y|yes|YES|Yes)
+            return 0
+            ;;
+        *)
+            error "Docker installation was declined; no appliance files were created."
+            return 1
+            ;;
+    esac
+}
+
+install_docker() {
+    local dpkg_arch
+
+    section "Docker installation"
+
+    if [[ -z "${DOCKER_CODENAME}" || ! "${DOCKER_CODENAME}" =~ ^[a-z0-9.-]+$ ]]; then
+        error "Cannot determine a valid Debian codename for the Docker repository."
+        return 1
+    fi
+
+    if ! command_exists apt-get || ! command_exists dpkg; then
+        error "Docker installation requires apt-get and dpkg on this Debian-based system."
+        return 1
+    fi
+
+    dpkg_arch=$(dpkg --print-architecture)
+    info "Configuring Docker's official Debian repository for ${DOCKER_CODENAME}/${dpkg_arch}."
+
+    DEBIAN_FRONTEND=noninteractive apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://download.docker.com/linux/debian' \
+        "Suites: ${DOCKER_CODENAME}" \
+        'Components: stable' \
+        "Architectures: ${dpkg_arch}" \
+        'Signed-By: /etc/apt/keyrings/docker.asc' \
+        > /etc/apt/sources.list.d/docker.sources
+
+    DEBIAN_FRONTEND=noninteractive apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin
+
+    systemctl enable --now docker
+    hash -r
+    ok "Docker packages were installed."
+}
+
+verify_docker() {
+    section "Docker verification"
+
+    if ! command_exists docker; then
+        error "Docker installation completed, but the docker command is unavailable."
+        return 1
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        error "Docker is installed, but the daemon verification failed."
+        return 1
+    fi
+
+    if ! docker compose version >/dev/null 2>&1; then
+        error "Docker Compose v2 verification failed; 'docker compose' is unavailable."
+        return 1
+    fi
+
+    ok "Docker daemon is running: $(docker --version)"
+    ok "Docker Compose v2 works: $(docker compose version --short 2>/dev/null || docker compose version)"
+    DOCKER_READY=1
+}
+
+create_appliance_files() {
+    section "Appliance files"
+
+    if [[ -e "${INSTALL_DIR}" ]]; then
+        error "${INSTALL_DIR} appeared during installation; refusing to overwrite it."
+        return 1
+    fi
+
+    install -d -m 0755 "${INSTALL_DIR}"
+    install -d -m 0700 "${INSTALL_DIR}/data/vaultwarden"
+
+    cat > "${INSTALL_DIR}/docker-compose.yml" <<'COMPOSE'
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: unless-stopped
+    environment:
+      SIGNUPS_ALLOWED: "true"
+    volumes:
+      - ./data/vaultwarden:/data
+    networks:
+      - appliance
+
+networks:
+  appliance:
+    name: vaultwarden-appliance
+COMPOSE
+    chmod 0644 "${INSTALL_DIR}/docker-compose.yml"
+    ok "Created ${INSTALL_DIR}/docker-compose.yml and persistent data directory."
+}
+
+deploy_vaultwarden() {
+    section "Vaultwarden deployment"
+
+    if ! docker compose --project-directory "${INSTALL_DIR}" config --quiet; then
+        error "The generated Docker Compose configuration is invalid."
+        return 1
+    fi
+
+    docker compose --project-directory "${INSTALL_DIR}" pull vaultwarden
+    docker compose --project-directory "${INSTALL_DIR}" up -d vaultwarden
+
+    if [[ "$(docker inspect --format '{{.State.Running}}' vaultwarden 2>/dev/null)" != "true" ]]; then
+        error "Vaultwarden was created but is not running. Inspect it with: docker logs vaultwarden"
+        return 1
+    fi
+
+    ok "Vaultwarden is running without a host-published HTTP port."
+}
+
+print_completion_summary() {
+    section "Phase 2 complete"
+    info "Installation directory: ${INSTALL_DIR}"
+    info "Compose file: ${INSTALL_DIR}/docker-compose.yml"
+    info "Persistent data: ${INSTALL_DIR}/data/vaultwarden"
+    info "Docker network: vaultwarden-appliance"
+    info "Vaultwarden is internal-only; Caddy and HTTPS are not configured yet."
 }
 
 main() {
-    printf 'Vaultwarden Appliance - Phase 1 preflight\n'
-    printf 'This version performs read-only checks and does not install anything.\n'
+    printf 'Vaultwarden Appliance - Phase 2 installer\n'
 
     check_operating_system
     check_architecture
@@ -249,7 +405,19 @@ main() {
     check_docker
     check_ports
     detect_ipv4_address
-    print_summary
+    print_preflight_summary
+
+    require_root
+
+    if (( DOCKER_READY == 0 )); then
+        confirm_docker_installation
+        install_docker
+        verify_docker
+    fi
+
+    create_appliance_files
+    deploy_vaultwarden
+    print_completion_summary
 }
 
 main "$@"

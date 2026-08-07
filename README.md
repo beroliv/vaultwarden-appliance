@@ -2,30 +2,33 @@
 
 Simple LAN-first Vaultwarden appliance with Caddy, `vwctl`, and USB backups.
 
-## Phase 1: system preflight
+## Phase 2: Vaultwarden deployment
 
-The current installer implements system detection only. It makes no system
-changes and does not install Docker or Vaultwarden.
+The installer performs the Phase 1 system checks, optionally installs Docker
+Engine and Docker Compose v2 from Docker's official Debian repository, and
+deploys Vaultwarden under `/opt/vaultwarden`.
 
 On a Debian-based test system, including 64-bit Raspberry Pi OS, run:
 
 ```bash
 chmod +x install.sh
-./install.sh
+sudo ./install.sh
 ```
 
-The script checks the operating system, CPU architecture, free disk space,
-Docker, Docker Compose, Docker daemon access, TCP ports 80 and 443, the
-`/opt/vaultwarden` installation path, and the current IPv4 address. A failed
-preflight exits with a non-zero status.
+If Docker is missing, pressing Enter at the installation prompt accepts the
+default of Yes. If Docker is already installed, its daemon must be running and
+Docker Compose v2 must work as `docker compose`; a working installation is used
+without modification.
+
+Vaultwarden data is stored in `/opt/vaultwarden/data/vaultwarden`. Vaultwarden
+has no host-published port in Phase 2, so it is not directly accessible from the
+LAN. Caddy and HTTPS will be added in Phase 3.
 
 To inspect the exit status:
 
 ```bash
-./install.sh
+sudo ./install.sh
 echo "$?"
 ```
 
-Running the Phase 1 script with `sudo` is not necessary. If Docker is installed
-but your user cannot access its daemon, the script reports that condition; you
-may rerun the check with `sudo` to distinguish permissions from daemon failure.
+The installer refuses to overwrite an existing `/opt/vaultwarden` directory.

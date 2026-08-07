@@ -168,7 +168,10 @@ If Docker is already installed and functional, the installer MUST use the existi
 
 It MUST NOT reinstall, replace or unnecessarily modify a working Docker installation.
 
-If Docker is missing, the installer may offer to install it.
+If Docker is missing, the installer MUST ask whether it should install Docker,
+with Yes as the default. Phase 2 installs Docker Engine and Docker Compose v2
+from Docker's official Debian package repository. Docker Compose v2 MUST be
+available as `docker compose`; Docker Compose v1 is not supported.
 
 ### 6.3 Existing Appliance Installation
 
@@ -224,6 +227,9 @@ Caddy
   ↓
 Vaultwarden
 ```
+
+Vaultwarden MUST NOT publish its HTTP port on the host. It must be attached to a
+Docker network that Caddy can join in Phase 3.
 
 The exact hostname handling must be determined during implementation and tested on common client platforms.
 
