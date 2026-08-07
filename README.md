@@ -1,8 +1,9 @@
 # vaultwarden-appliance
 
-Simple LAN-first Vaultwarden appliance with Caddy, `vwctl`, and USB backups.
+Simple LAN-first Vaultwarden appliance with Caddy and `vwctl`; USB backups are
+planned for a later phase.
 
-## Phase 3: local HTTPS with Caddy
+## Phase 4: appliance management with vwctl
 
 The installer performs the Phase 1 system checks, optionally installs Docker
 Engine and Docker Compose v2 from Docker's official Debian repository, and
@@ -11,7 +12,7 @@ deploys Vaultwarden and Caddy under `/opt/vaultwarden`.
 On a Debian-based test system, including 64-bit Raspberry Pi OS, run:
 
 ```bash
-sudo ./install.sh
+sudo bash ./install.sh
 ```
 
 If Docker is missing, pressing Enter at the installation prompt accepts the
@@ -51,6 +52,40 @@ public root CA certificate is exported to:
 Install this certificate as a trusted root CA on every client that accesses the
 appliance. The private CA key is never exported.
 
+The installer copies the repository's `vwctl` script to
+`/usr/local/bin/vwctl` with executable permissions. Basic usage:
+
+```bash
+vwctl help
+vwctl status
+vwctl logs
+vwctl logs caddy
+sudo vwctl update
+sudo vwctl restart
+sudo vwctl access
+sudo vwctl access ip
+sudo vwctl access hostname
+vwctl signup status
+sudo vwctl signup on
+sudo vwctl signup off
+sudo vwctl cert export
+```
+
+`vwctl update` pulls only the Vaultwarden and Caddy images; it does not update
+the operating system or prune unrelated images. `vwctl restart` recreates only
+the appliance containers. Both commands preserve bind-mounted application data
+and Caddy's persistent internal CA and verify HTTPS afterward.
+
+Access-address changes validate candidate configuration and are accepted only
+after Caddy and HTTPS verification succeeds with the existing root CA. On
+failure, `vwctl` restores and verifies the previous Caddyfile and access state.
+Only the matching Caddy site-address line is changed; other Caddyfile content
+is preserved.
+
+Signup changes are isolated in
+`/opt/vaultwarden/docker-compose.vwctl.yml`, which overrides only
+`SIGNUPS_ALLOWED`. Other Compose settings remain unchanged.
+
 To inspect the exit status:
 
 ```bash
@@ -63,5 +98,5 @@ The installer recognizes its own existing installations through
 Unknown installations without a valid marker or recognized legacy Phase 2
 structure are left unchanged.
 
-Phase 4 and later functionality (`vwctl`, USB backup, and restore) is not
+Phase 5 and later functionality (USB handling, backup, and restore) is not
 implemented yet.

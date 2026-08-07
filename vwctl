@@ -1,0 +1,957 @@
+#!/usr/bin/env bash
+# Vaultwarden Appliance vwctl
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly INSTALL_DIR="/opt/vaultwarden"
+readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
+readonly BASE_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
+readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
+readonly VWCTL_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.vwctl.yml"
+readonly CADDYFILE="${INSTALL_DIR}/Caddyfile"
+readonly ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
+readonly LEGACY_HOSTNAME_FILE="${INSTALL_DIR}/.caddy-hostname"
+readonly CADDY_ROOT_CA="${INSTALL_DIR}/data/caddy/data/caddy/pki/authorities/local/root.crt"
+readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
+readonly APPLIANCE_NETWORK="vaultwarden-appliance"
+readonly LOG_LINES=100
+
+ACCESS_MODE=""
+ACCESS_ADDRESS=""
+
+info() {
+    printf '%s\n' "$*"
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+show_help() {
+    cat <<'HELP'
+Vaultwarden Appliance management
+
+Usage:
+  vwctl help
+  vwctl status
+  vwctl logs [vaultwarden|caddy]
+  sudo vwctl update
+  sudo vwctl restart
+  sudo vwctl access [ip|hostname]
+  vwctl signup status
+  sudo vwctl signup on
+  sudo vwctl signup off
+  sudo vwctl cert export
+
+Commands:
+  status             Show appliance and access information
+  logs               Show the last 100 log lines; optionally select one service
+  update             Pull and apply appliance container image updates
+  restart            Safely recreate the appliance containers
+  access             Change between IP address and local hostname HTTPS access
+  signup             Show, enable, or disable account registration
+  cert export        Refresh the public Caddy root CA export
+HELP
+}
+
+require_appliance() {
+    [[ -d "${INSTALL_DIR}" ]] || die "Vaultwarden Appliance is not installed at ${INSTALL_DIR}."
+    [[ -f "${APPLIANCE_MARKER}" && ! -L "${APPLIANCE_MARKER}" ]] || \
+        die "${INSTALL_DIR} is not a recognized Vaultwarden Appliance installation."
+    [[ -f "${BASE_COMPOSE_FILE}" && ! -L "${BASE_COMPOSE_FILE}" ]] || \
+        die "The appliance Compose file is missing or unsafe."
+    [[ -f "${CADDY_COMPOSE_FILE}" && ! -L "${CADDY_COMPOSE_FILE}" ]] || \
+        die "The appliance Caddy Compose file is missing or unsafe."
+    [[ -f "${CADDYFILE}" && ! -L "${CADDYFILE}" ]] || \
+        die "The appliance Caddyfile is missing or unsafe."
+}
+
+require_root() {
+    local command_text=$1
+
+    if (( EUID != 0 )); then
+        printf 'This operation requires root privileges.\n' >&2
+        printf 'Run:\n' >&2
+        printf 'sudo vwctl %s\n' "${command_text}" >&2
+        exit 1
+    fi
+}
+
+require_docker() {
+    command_exists docker || die "Docker is not installed."
+    docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is unavailable as 'docker compose'."
+    docker info >/dev/null 2>&1 || \
+        die "The Docker daemon is unavailable. Use sudo or a user with Docker access."
+}
+
+compose() {
+    local -a compose_args
+
+    compose_args=(
+        --project-directory "${INSTALL_DIR}"
+        -f "${BASE_COMPOSE_FILE}"
+        -f "${CADDY_COMPOSE_FILE}"
+    )
+    if [[ -e "${VWCTL_COMPOSE_FILE}" ]]; then
+        [[ -f "${VWCTL_COMPOSE_FILE}" && ! -L "${VWCTL_COMPOSE_FILE}" ]] || \
+            die "The managed signup Compose path is not a safe regular file."
+        compose_args+=(-f "${VWCTL_COMPOSE_FILE}")
+    fi
+
+    docker compose "${compose_args[@]}" "$@"
+}
+
+compose_with_signup_candidate() {
+    local candidate=$1
+    shift
+
+    docker compose \
+        --project-directory "${INSTALL_DIR}" \
+        -f "${BASE_COMPOSE_FILE}" \
+        -f "${CADDY_COMPOSE_FILE}" \
+        -f "${candidate}" \
+        "$@"
+}
+
+validate_local_hostname() {
+    local hostname=$1
+    local label
+    local -a labels
+
+    (( ${#hostname} <= 253 )) || return 1
+    [[ "${hostname}" == *.* ]] || return 1
+    [[ "${hostname}" != .* && "${hostname}" != *. ]] || return 1
+    [[ ! "${hostname}" =~ ^[0-9.]+$ ]] || return 1
+
+    IFS='.' read -r -a labels <<<"${hostname}"
+    for label in "${labels[@]}"; do
+        (( ${#label} <= 63 )) || return 1
+        [[ "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+validate_ipv4_address() {
+    local address=$1
+    local octet
+    local -a octets
+
+    [[ "${address}" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+    IFS='.' read -r -a octets <<<"${address}"
+    (( ${#octets[@]} == 4 )) || return 1
+
+    for octet in "${octets[@]}"; do
+        (( ${#octet} <= 3 )) || return 1
+        (( 10#${octet} <= 255 )) || return 1
+    done
+
+    [[ "${address}" != "0.0.0.0" && "${address}" != "255.255.255.255" ]]
+}
+
+detect_ipv4_address() {
+    local candidate=""
+
+    if command_exists ip; then
+        candidate=$(ip -4 route get 1.1.1.1 2>/dev/null |
+            awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
+    fi
+    if [[ -z "${candidate}" ]] && command_exists hostname; then
+        candidate=$(hostname -I 2>/dev/null |
+            awk '{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\./) {print $i; exit}}')
+    fi
+
+    if validate_ipv4_address "${candidate}"; then
+        printf '%s\n' "${candidate}"
+        return 0
+    fi
+    return 1
+}
+
+load_access_state() {
+    local address
+    local mode
+    local -a lines
+
+    if [[ -e "${ACCESS_FILE}" && ( ! -f "${ACCESS_FILE}" || -L "${ACCESS_FILE}" ) ]]; then
+        return 1
+    fi
+    if [[ -e "${LEGACY_HOSTNAME_FILE}" && \
+          ( ! -f "${LEGACY_HOSTNAME_FILE}" || -L "${LEGACY_HOSTNAME_FILE}" ) ]]; then
+        return 1
+    fi
+
+    if [[ -f "${ACCESS_FILE}" && ! -L "${ACCESS_FILE}" ]]; then
+        mapfile -t lines < "${ACCESS_FILE}"
+        (( ${#lines[@]} == 2 )) || return 1
+        [[ "${lines[0]}" == mode=* && "${lines[1]}" == address=* ]] || return 1
+        mode=${lines[0]#mode=}
+        address=${lines[1]#address=}
+
+        if [[ -e "${LEGACY_HOSTNAME_FILE}" ]]; then
+            [[ -f "${LEGACY_HOSTNAME_FILE}" && ! -L "${LEGACY_HOSTNAME_FILE}" ]] || return 1
+            mapfile -t lines < "${LEGACY_HOSTNAME_FILE}"
+            (( ${#lines[@]} == 1 )) || return 1
+            [[ "${mode}" == "hostname" && "${address}" == "${lines[0]}" ]] || return 1
+        fi
+    elif [[ -f "${LEGACY_HOSTNAME_FILE}" && ! -L "${LEGACY_HOSTNAME_FILE}" ]]; then
+        mapfile -t lines < "${LEGACY_HOSTNAME_FILE}"
+        (( ${#lines[@]} == 1 )) || return 1
+        mode="hostname"
+        address=${lines[0]}
+    else
+        return 1
+    fi
+
+    case "${mode}" in
+        ip)
+            validate_ipv4_address "${address}" || return 1
+            ;;
+        hostname)
+            validate_local_hostname "${address}" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    ACCESS_MODE=${mode}
+    ACCESS_ADDRESS=${address}
+}
+
+write_access_state_to() {
+    local destination=$1
+    local mode=$2
+    local address=$3
+
+    printf 'mode=%s\naddress=%s\n' "${mode}" "${address}" > "${destination}"
+    chmod 0644 "${destination}"
+}
+
+write_caddyfile_with_address_to() {
+    local destination=$1
+    local old_address=$2
+    local new_address=$3
+
+    awk \
+        -v old_line="https://${old_address} {" \
+        -v new_line="https://${new_address} {" '
+            $0 == old_line {
+                matches++
+                print new_line
+                next
+            }
+            { print }
+            END { if (matches != 1) exit 1 }
+        ' "${CADDYFILE}" > "${destination}"
+    chmod 0644 "${destination}"
+}
+
+container_state() {
+    local container=$1
+    local state
+
+    state=$(docker inspect --format '{{.State.Status}}' "${container}" 2>/dev/null) || state="not found"
+    printf '%s\n' "${state}"
+}
+
+container_image() {
+    local container=$1
+    local image
+
+    image=$(docker inspect --format '{{.Config.Image}}' "${container}" 2>/dev/null) || image="unavailable"
+    printf '%s\n' "${image}"
+}
+
+container_is_connected_to_network() {
+    local container=$1
+    local network=$2
+
+    docker inspect --format '{{range $name, $settings := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
+        "${container}" 2>/dev/null | grep -Fxq "${network}"
+}
+
+caddy_publishes_only_https() {
+    [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' caddy 2>/dev/null)" == "1" ]] || return 1
+    docker inspect --format '{{with (index .HostConfig.PortBindings "443/tcp")}}{{range .}}{{println .HostPort}}{{end}}{{end}}' \
+        caddy 2>/dev/null | grep -Fxq 443
+}
+
+current_signup_value() {
+    local value
+
+    value=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' vaultwarden 2>/dev/null |
+        awk -F= '$1 == "SIGNUPS_ALLOWED" {print tolower(substr($0, index($0, "=") + 1)); exit}') || true
+
+    if [[ -z "${value}" ]]; then
+        value=$(compose config 2>/dev/null |
+            awk '$1 == "SIGNUPS_ALLOWED:" {gsub(/"/, "", $2); print tolower($2); exit}') || true
+    fi
+
+    case "${value}" in
+        true|1|yes)
+            printf 'true\n'
+            ;;
+        false|0|no)
+            printf 'false\n'
+            ;;
+        *)
+            printf 'unknown\n'
+            ;;
+    esac
+}
+
+wait_for_container() {
+    local container=$1
+    local _attempt
+
+    for _attempt in {1..30}; do
+        if [[ "$(docker inspect --format '{{.State.Running}}' "${container}" 2>/dev/null)" == "true" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+verify_https() {
+    local address=$1
+    local _attempt
+
+    command_exists curl || return 1
+    [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || return 1
+
+    for _attempt in {1..30}; do
+        if curl --fail --silent --show-error \
+            --noproxy '*' \
+            --cacert "${EXPORTED_ROOT_CA}" \
+            --connect-to "${address}:443:127.0.0.1:443" \
+            "https://${address}/alive" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+require_https_verification_ready() {
+    command_exists curl || die "curl is required for HTTPS verification."
+    [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]] || \
+        die "Caddy's public root CA is missing."
+    [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || \
+        die "The exported root CA is missing. Run: sudo vwctl cert export"
+    cmp -s "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}" || \
+        die "The root CA export does not match Caddy's persistent public root certificate."
+}
+
+verify_root_ca_unchanged() {
+    local saved_root=$1
+
+    [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]] || return 1
+    [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || return 1
+    cmp -s "${saved_root}" "${CADDY_ROOT_CA}" &&
+        cmp -s "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}"
+}
+
+verify_appliance() {
+    if ! load_access_state; then
+        printf 'Error: The appliance access state is invalid.\n' >&2
+        return 1
+    fi
+    if ! wait_for_container vaultwarden; then
+        printf 'Error: Vaultwarden is not running after the operation.\n' >&2
+        return 1
+    fi
+    if ! wait_for_container caddy; then
+        printf 'Error: Caddy is not running after the operation.\n' >&2
+        return 1
+    fi
+
+    if [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' vaultwarden 2>/dev/null)" != "0" ]]; then
+        printf 'Error: Vaultwarden unexpectedly publishes a host port.\n' >&2
+        return 1
+    fi
+    if ! caddy_publishes_only_https; then
+        printf 'Error: Caddy must publish only host TCP port 443.\n' >&2
+        return 1
+    fi
+    if ! container_is_connected_to_network vaultwarden "${APPLIANCE_NETWORK}"; then
+        printf 'Error: Vaultwarden is not connected to %s.\n' "${APPLIANCE_NETWORK}" >&2
+        return 1
+    fi
+    if ! container_is_connected_to_network caddy "${APPLIANCE_NETWORK}"; then
+        printf 'Error: Caddy is not connected to %s.\n' "${APPLIANCE_NETWORK}" >&2
+        return 1
+    fi
+    if ! verify_https "${ACCESS_ADDRESS}"; then
+        printf 'Error: HTTPS verification failed for https://%s.\n' "${ACCESS_ADDRESS}" >&2
+        return 1
+    fi
+}
+
+create_operation_directory() {
+    local directory
+
+    directory=$(mktemp -d /tmp/vwctl.XXXXXXXX) || die "Unable to create a temporary operation directory."
+    [[ "${directory}" == /tmp/vwctl.* && -d "${directory}" ]] || \
+        die "Temporary operation directory validation failed."
+    printf '%s\n' "${directory}"
+}
+
+cleanup_operation_directory() {
+    local directory=$1
+
+    [[ "${directory}" == /tmp/vwctl.* && -d "${directory}" ]] || return 1
+    rm -f -- \
+        "${directory}/root-ca" \
+        "${directory}/Caddyfile" \
+        "${directory}/access" \
+        "${directory}/legacy-hostname" \
+        "${directory}/signup-compose"
+    rmdir -- "${directory}"
+}
+
+command_status() {
+    local caddy_state
+    local current_ip="not detected"
+    local ip_note=""
+    local mode_label
+    local network_state="incomplete"
+    local root_state="missing"
+    local signup_label
+    local vaultwarden_state
+
+    require_appliance
+    require_docker
+    load_access_state || die "The appliance access state is missing or invalid."
+
+    vaultwarden_state=$(container_state vaultwarden)
+    caddy_state=$(container_state caddy)
+    current_ip=$(detect_ipv4_address || printf 'not detected')
+
+    if container_is_connected_to_network vaultwarden "${APPLIANCE_NETWORK}" &&
+       container_is_connected_to_network caddy "${APPLIANCE_NETWORK}"; then
+        network_state="connected"
+    fi
+
+    if [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]]; then
+        root_state="present"
+    fi
+
+    if [[ "${ACCESS_MODE}" == "ip" ]]; then
+        mode_label="IP"
+        if validate_ipv4_address "${current_ip}" && [[ "${current_ip}" != "${ACCESS_ADDRESS}" ]]; then
+            ip_note=" (DIFFERS from configured IP)"
+        fi
+    else
+        mode_label="hostname"
+    fi
+
+    case "$(current_signup_value)" in
+        true) signup_label="enabled" ;;
+        false) signup_label="disabled" ;;
+        *) signup_label="unknown" ;;
+    esac
+
+    printf 'Vaultwarden Appliance status\n\n'
+    printf '%-15s %s\n' 'Vaultwarden:' "${vaultwarden_state}"
+    printf '%-15s %s\n' 'Caddy:' "${caddy_state}"
+    printf '%-15s %s\n' 'Access:' "${mode_label}"
+    printf '%-15s https://%s\n' 'URL:' "${ACCESS_ADDRESS}"
+    printf '%-15s %s%s\n' 'Current IP:' "${current_ip}" "${ip_note}"
+    printf '%-15s %s\n' 'Network:' "${network_state} (${APPLIANCE_NETWORK})"
+    printf '%-15s %s\n' 'VW image:' "$(container_image vaultwarden)"
+    printf '%-15s %s\n' 'Caddy image:' "$(container_image caddy)"
+    printf '%-15s %s\n' 'Signup:' "${signup_label}"
+    printf '%-15s %s\n' 'Root CA:' "${EXPORTED_ROOT_CA}"
+    printf '%-15s %s\n' 'CA export:' "${root_state}"
+}
+
+command_logs() {
+    local service=${1:-}
+
+    require_appliance
+    require_docker
+
+    case "${service}" in
+        "")
+            compose logs --tail "${LOG_LINES}" vaultwarden caddy
+            ;;
+        vaultwarden|caddy)
+            compose logs --tail "${LOG_LINES}" "${service}"
+            ;;
+        *)
+            die "Usage: vwctl logs [vaultwarden|caddy]"
+            ;;
+    esac
+}
+
+command_update() {
+    local operation_dir
+
+    require_root "update"
+    require_appliance
+    require_docker
+    load_access_state || die "The appliance access state is missing or invalid."
+    require_https_verification_ready
+    compose config --quiet || die "The appliance Compose configuration is invalid."
+
+    operation_dir=$(create_operation_directory)
+    install -m 0600 "${CADDY_ROOT_CA}" "${operation_dir}/root-ca"
+
+    info "Pulling Vaultwarden and Caddy images..."
+    if ! compose pull vaultwarden caddy; then
+        cleanup_operation_directory "${operation_dir}"
+        die "Container image update failed while pulling images."
+    fi
+    info "Applying image updates..."
+    if ! compose up -d vaultwarden caddy || ! verify_appliance; then
+        cleanup_operation_directory "${operation_dir}"
+        die "Updated appliance container verification failed."
+    fi
+    if ! verify_root_ca_unchanged "${operation_dir}/root-ca"; then
+        cleanup_operation_directory "${operation_dir}"
+        die "The Caddy root CA changed unexpectedly."
+    fi
+
+    cleanup_operation_directory "${operation_dir}"
+    info "Appliance containers updated and verified."
+}
+
+command_restart() {
+    local operation_dir
+
+    require_root "restart"
+    require_appliance
+    require_docker
+    load_access_state || die "The appliance access state is missing or invalid."
+    require_https_verification_ready
+    compose config --quiet || die "The appliance Compose configuration is invalid."
+
+    operation_dir=$(create_operation_directory)
+    install -m 0600 "${CADDY_ROOT_CA}" "${operation_dir}/root-ca"
+
+    info "Recreating Vaultwarden and Caddy containers with persistent data preserved..."
+    if ! compose up -d --force-recreate vaultwarden caddy || ! verify_appliance; then
+        cleanup_operation_directory "${operation_dir}"
+        die "Restarted appliance container verification failed."
+    fi
+    if ! verify_root_ca_unchanged "${operation_dir}/root-ca"; then
+        cleanup_operation_directory "${operation_dir}"
+        die "The Caddy root CA changed unexpectedly."
+    fi
+
+    cleanup_operation_directory "${operation_dir}"
+    info "Appliance containers restarted and verified."
+}
+
+validate_caddy_candidate() {
+    local candidate=$1
+    local container_path="/tmp/vwctl-Caddyfile"
+
+    wait_for_container caddy || return 1
+    docker cp "${candidate}" "caddy:${container_path}" >/dev/null || return 1
+    if ! docker exec caddy caddy adapt \
+        --config "${container_path}" \
+        --adapter caddyfile \
+        --validate >/dev/null; then
+        docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
+        return 1
+    fi
+    docker exec caddy rm -f "${container_path}" >/dev/null 2>&1 || true
+}
+
+restore_access_configuration() {
+    local backup_dir=$1
+    local had_access_file=$2
+    local had_legacy_file=$3
+    local old_address=$4
+    local restored=0
+
+    info "Restoring the previous access configuration..."
+    install -m 0644 "${backup_dir}/Caddyfile" "${CADDYFILE}"
+
+    if (( had_access_file == 1 )); then
+        install -m 0644 "${backup_dir}/access" "${ACCESS_FILE}"
+    else
+        rm -f -- "${ACCESS_FILE}"
+    fi
+    if (( had_legacy_file == 1 )); then
+        install -m 0644 "${backup_dir}/legacy-hostname" "${LEGACY_HOSTNAME_FILE}"
+    else
+        rm -f -- "${LEGACY_HOSTNAME_FILE}"
+    fi
+
+    if compose up -d --force-recreate caddy &&
+       wait_for_container caddy &&
+       verify_https "${old_address}" &&
+       verify_root_ca_unchanged "${backup_dir}/root-ca"; then
+        restored=1
+    fi
+
+    if (( restored == 1 )); then
+        info "The requested access change failed; the previous configuration was restored and verified."
+    else
+        printf 'CRITICAL: The requested access change failed and rollback verification also failed.\n' >&2
+        printf 'Inspect: docker logs caddy\n' >&2
+    fi
+    return 1
+}
+
+apply_access_change() {
+    local new_mode=$1
+    local new_address=$2
+    local backup_dir
+    local caddy_candidate
+    local had_access_file=0
+    local had_legacy_file=0
+    local old_address
+    local state_candidate
+
+    load_access_state || die "The current access state is missing or invalid."
+    old_address=${ACCESS_ADDRESS}
+
+    if [[ "${ACCESS_MODE}" == "${new_mode}" && "${ACCESS_ADDRESS}" == "${new_address}" ]]; then
+        info "Access is already configured as https://${new_address}; no change is needed."
+        return 0
+    fi
+
+    require_https_verification_ready
+    compose config --quiet || die "The appliance Compose configuration is invalid."
+    wait_for_container caddy || die "Caddy is not currently running; access configuration will not be changed."
+    verify_https "${old_address}" || \
+        die "The current HTTPS endpoint is not healthy; access configuration will not be changed."
+
+    backup_dir=$(create_operation_directory)
+    caddy_candidate=$(mktemp "${INSTALL_DIR}/.Caddyfile.vwctl.XXXXXXXX") || \
+        die "Unable to create a temporary Caddyfile."
+    state_candidate=$(mktemp "${INSTALL_DIR}/.caddy-access.vwctl.XXXXXXXX") || {
+        rm -f -- "${caddy_candidate}"
+        die "Unable to create a temporary access state file."
+    }
+
+    install -m 0600 "${CADDYFILE}" "${backup_dir}/Caddyfile"
+    install -m 0600 "${CADDY_ROOT_CA}" "${backup_dir}/root-ca"
+    if [[ -f "${ACCESS_FILE}" && ! -L "${ACCESS_FILE}" ]]; then
+        install -m 0600 "${ACCESS_FILE}" "${backup_dir}/access"
+        had_access_file=1
+    fi
+    if [[ -f "${LEGACY_HOSTNAME_FILE}" && ! -L "${LEGACY_HOSTNAME_FILE}" ]]; then
+        install -m 0600 "${LEGACY_HOSTNAME_FILE}" "${backup_dir}/legacy-hostname"
+        had_legacy_file=1
+    fi
+
+    if ! write_caddyfile_with_address_to "${caddy_candidate}" "${old_address}" "${new_address}" ||
+       ! write_access_state_to "${state_candidate}" "${new_mode}" "${new_address}"; then
+        rm -f -- "${caddy_candidate}" "${state_candidate}"
+        cleanup_operation_directory "${backup_dir}"
+        die "Unable to create candidate access configuration; the current configuration was not changed."
+    fi
+
+    if ! validate_caddy_candidate "${caddy_candidate}"; then
+        rm -f -- "${caddy_candidate}" "${state_candidate}"
+        cleanup_operation_directory "${backup_dir}"
+        die "The proposed Caddy configuration is invalid; the current configuration was not changed."
+    fi
+
+    if ! mv -f -- "${caddy_candidate}" "${CADDYFILE}" ||
+       ! mv -f -- "${state_candidate}" "${ACCESS_FILE}" ||
+       ! rm -f -- "${LEGACY_HOSTNAME_FILE}"; then
+        rm -f -- "${caddy_candidate}" "${state_candidate}"
+        restore_access_configuration \
+            "${backup_dir}" "${had_access_file}" "${had_legacy_file}" "${old_address}" || true
+        cleanup_operation_directory "${backup_dir}"
+        return 1
+    fi
+
+    if ! compose up -d --force-recreate caddy ||
+       ! wait_for_container caddy ||
+       ! verify_https "${new_address}" ||
+       ! verify_root_ca_unchanged "${backup_dir}/root-ca"; then
+        restore_access_configuration \
+            "${backup_dir}" "${had_access_file}" "${had_legacy_file}" "${old_address}" || true
+        cleanup_operation_directory "${backup_dir}"
+        return 1
+    fi
+
+    cleanup_operation_directory "${backup_dir}"
+    ACCESS_MODE=${new_mode}
+    ACCESS_ADDRESS=${new_address}
+    info "Access configuration changed successfully."
+    info "URL: https://${new_address}"
+}
+
+access_ip() {
+    local answer=""
+    local current_ip
+
+    current_ip=$(detect_ipv4_address) || die "Unable to detect a usable LAN IPv4 address."
+    printf 'Detected LAN IPv4 address: %s\n' "${current_ip}"
+    if ! read -r -p "Use https://${current_ip} for Vaultwarden? [y/N] " answer </dev/tty; then
+        die "Unable to read confirmation."
+    fi
+    case "${answer}" in
+        y|Y|yes|YES|Yes) ;;
+        *)
+            info "Access configuration was not changed."
+            return 0
+            ;;
+    esac
+
+    apply_access_change ip "${current_ip}"
+    printf '\nIMPORTANT:\nThis IP address should not change.\n\n'
+    printf 'Recommended:\nCreate a DHCP reservation for %s in your router/DHCP server.\n\n' "${current_ip}"
+    printf 'The appliance did not modify your network configuration.\n'
+}
+
+access_hostname() {
+    local hostname=""
+    local current_ip
+
+    current_ip=$(detect_ipv4_address) || die "Unable to detect a usable LAN IPv4 address for the DNS mapping."
+    while true; do
+        if ! read -r -p "Vaultwarden hostname [vaultwarden.local]: " hostname </dev/tty; then
+            die "Unable to read the hostname."
+        fi
+        hostname=${hostname:-vaultwarden.local}
+        validate_local_hostname "${hostname}" && break
+        printf 'Invalid hostname. Use dot-separated DNS labels without spaces or underscores.\n' >&2
+    done
+
+    info "Required DNS mapping: ${hostname} -> ${current_ip}"
+    info "The appliance will not modify DNS or hosts files."
+    apply_access_change hostname "${hostname}"
+}
+
+command_access() {
+    local choice=""
+    local requested_mode=${1:-}
+
+    require_root "access${requested_mode:+ ${requested_mode}}"
+    require_appliance
+    require_docker
+    [[ -r /dev/tty ]] || die "An interactive terminal is required for access changes."
+    load_access_state || die "The current access state is missing or invalid."
+
+    if [[ -z "${requested_mode}" ]]; then
+        printf 'Current access: %s\n' "${ACCESS_MODE}"
+        printf 'Current URL:    https://%s\n\n' "${ACCESS_ADDRESS}"
+        printf '1) IP address\n2) Local hostname\n3) Cancel\n\n'
+        if ! read -r -p "Choice [3]: " choice </dev/tty; then
+            die "Unable to read the access choice."
+        fi
+        case "${choice:-3}" in
+            1) requested_mode="ip" ;;
+            2) requested_mode="hostname" ;;
+            3) info "Access configuration was not changed."; return 0 ;;
+            *) die "Invalid choice."
+        esac
+    fi
+
+    case "${requested_mode}" in
+        ip) access_ip ;;
+        hostname) access_hostname ;;
+        *) die "Usage: sudo vwctl access [ip|hostname]" ;;
+    esac
+}
+
+write_signup_override_to() {
+    local destination=$1
+    local value=$2
+
+    printf '%s\n' \
+        'services:' \
+        '  vaultwarden:' \
+        '    environment:' \
+        "      SIGNUPS_ALLOWED: \"${value}\"" > "${destination}"
+    chmod 0644 "${destination}"
+}
+
+restore_signup_configuration() {
+    local backup_dir=$1
+    local had_override=$2
+    local old_value=$3
+
+    info "Restoring the previous signup configuration..."
+    if (( had_override == 1 )); then
+        install -m 0644 "${backup_dir}/signup-compose" "${VWCTL_COMPOSE_FILE}"
+    else
+        rm -f -- "${VWCTL_COMPOSE_FILE}"
+    fi
+
+    if compose up -d vaultwarden &&
+       wait_for_container vaultwarden &&
+       [[ "$(current_signup_value)" == "${old_value}" ]]; then
+        info "The signup change failed; the previous configuration was restored and verified."
+    else
+        printf 'CRITICAL: Signup rollback verification failed. Inspect: docker logs vaultwarden\n' >&2
+    fi
+    return 1
+}
+
+change_signup() {
+    local new_value=$1
+    local backup_dir
+    local candidate
+    local had_override=0
+    local old_value
+
+    old_value=$(current_signup_value)
+    [[ "${old_value}" == "true" || "${old_value}" == "false" ]] || \
+        die "Unable to determine the current signup state."
+    if [[ "${old_value}" == "${new_value}" ]]; then
+        info "Signup is already $([[ "${new_value}" == "true" ]] && printf enabled || printf disabled)."
+        return 0
+    fi
+
+    backup_dir=$(create_operation_directory)
+    candidate=$(mktemp "${INSTALL_DIR}/.docker-compose.vwctl.XXXXXXXX") || \
+        die "Unable to create a temporary signup configuration."
+
+    if [[ -f "${VWCTL_COMPOSE_FILE}" && ! -L "${VWCTL_COMPOSE_FILE}" ]]; then
+        install -m 0600 "${VWCTL_COMPOSE_FILE}" "${backup_dir}/signup-compose"
+        had_override=1
+    elif [[ -e "${VWCTL_COMPOSE_FILE}" ]]; then
+        cleanup_operation_directory "${backup_dir}"
+        die "The managed signup Compose path is not a safe regular file."
+    fi
+
+    write_signup_override_to "${candidate}" "${new_value}"
+    if ! compose_with_signup_candidate "${candidate}" config --quiet; then
+        rm -f -- "${candidate}"
+        cleanup_operation_directory "${backup_dir}"
+        die "The proposed signup Compose configuration is invalid."
+    fi
+
+    mv -f -- "${candidate}" "${VWCTL_COMPOSE_FILE}"
+    if ! compose up -d vaultwarden ||
+       ! wait_for_container vaultwarden ||
+       [[ "$(current_signup_value)" != "${new_value}" ]]; then
+        restore_signup_configuration "${backup_dir}" "${had_override}" "${old_value}" || true
+        cleanup_operation_directory "${backup_dir}"
+        return 1
+    fi
+
+    cleanup_operation_directory "${backup_dir}"
+    if [[ "${new_value}" == "true" ]]; then
+        info "Signup is enabled."
+    else
+        info "Signup is disabled."
+    fi
+}
+
+command_signup() {
+    local action=${1:-}
+    local state
+
+    case "${action}" in
+        status)
+            require_appliance
+            require_docker
+            state=$(current_signup_value)
+            case "${state}" in
+                true) info "Signup is enabled." ;;
+                false) info "Signup is disabled." ;;
+                *) die "Unable to determine the signup state." ;;
+            esac
+            ;;
+        on)
+            require_root "signup on"
+            require_appliance
+            require_docker
+            change_signup true
+            ;;
+        off)
+            require_root "signup off"
+            require_appliance
+            require_docker
+            change_signup false
+            ;;
+        *)
+            die "Usage: vwctl signup status | sudo vwctl signup on|off"
+            ;;
+    esac
+}
+
+command_cert_export() {
+    local cert_dir="${INSTALL_DIR}/certs"
+    local candidate
+
+    require_root "cert export"
+    require_appliance
+    [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]] || \
+        die "Caddy's persistent public root CA certificate is missing or unsafe."
+    if [[ -e "${cert_dir}" && ( ! -d "${cert_dir}" || -L "${cert_dir}" ) ]]; then
+        die "The root CA export directory is not a safe directory."
+    fi
+    if [[ -e "${EXPORTED_ROOT_CA}" && ( ! -f "${EXPORTED_ROOT_CA}" || -L "${EXPORTED_ROOT_CA}" ) ]]; then
+        die "The root CA export path is not a safe regular file."
+    fi
+
+    install -d -m 0755 "${cert_dir}"
+    candidate=$(mktemp "${cert_dir}/.caddy-root-ca.XXXXXXXX") || die "Unable to create a temporary certificate export."
+    if ! install -m 0644 "${CADDY_ROOT_CA}" "${candidate}" ||
+       ! cmp -s "${CADDY_ROOT_CA}" "${candidate}"; then
+        rm -f -- "${candidate}"
+        die "The temporary root CA export verification failed."
+    fi
+    if ! mv -f -- "${candidate}" "${EXPORTED_ROOT_CA}"; then
+        rm -f -- "${candidate}"
+        die "Unable to replace the public root CA export."
+    fi
+    chmod 0644 "${EXPORTED_ROOT_CA}"
+    cmp -s "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}" || die "The root CA export verification failed."
+
+    info "Exported Caddy's public root CA certificate:"
+    info "${EXPORTED_ROOT_CA}"
+    info "No private CA key was copied."
+}
+
+main() {
+    local command=${1:-help}
+
+    case "${command}" in
+        help|--help)
+            (( $# <= 1 )) || die "Usage: vwctl help"
+            show_help
+            ;;
+        status)
+            (( $# == 1 )) || die "Usage: vwctl status"
+            command_status
+            ;;
+        logs)
+            (( $# <= 2 )) || die "Usage: vwctl logs [vaultwarden|caddy]"
+            command_logs "${2:-}"
+            ;;
+        update)
+            (( $# == 1 )) || die "Usage: sudo vwctl update"
+            command_update
+            ;;
+        restart)
+            (( $# == 1 )) || die "Usage: sudo vwctl restart"
+            command_restart
+            ;;
+        access)
+            (( $# <= 2 )) || die "Usage: sudo vwctl access [ip|hostname]"
+            command_access "${2:-}"
+            ;;
+        signup)
+            (( $# == 2 )) || die "Usage: vwctl signup status | sudo vwctl signup on|off"
+            command_signup "${2}"
+            ;;
+        cert)
+            [[ "${2:-}" == "export" && $# == 2 ]] || die "Usage: sudo vwctl cert export"
+            command_cert_export
+            ;;
+        *)
+            die "Unknown command '${command}'. Run 'vwctl help'."
+            ;;
+    esac
+}
+
+main "$@"

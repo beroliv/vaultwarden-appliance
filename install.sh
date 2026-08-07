@@ -4,6 +4,8 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIR
 readonly INSTALL_DIR="/opt/vaultwarden"
 readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
 readonly CADDY_ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
@@ -14,6 +16,8 @@ readonly CADDY_DATA_DIR="${INSTALL_DIR}/data/caddy/data"
 readonly CADDY_CONFIG_DIR="${INSTALL_DIR}/data/caddy/config"
 readonly CADDY_ROOT_CA="${CADDY_DATA_DIR}/caddy/pki/authorities/local/root.crt"
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
+readonly VWCTL_SOURCE="${SCRIPT_DIR}/vwctl"
+readonly VWCTL_TARGET="/usr/local/bin/vwctl"
 readonly MIN_DISK_SPACE_MB=2048
 
 ERRORS=0
@@ -453,7 +457,7 @@ print_preflight_summary() {
 
 require_root() {
     if (( EUID != 0 )); then
-        error "Phase 2 installation must run as root. Re-run with sudo."
+        error "Appliance installation must run as root. Re-run with sudo."
         return 1
     fi
 }
@@ -983,8 +987,40 @@ verify_phase3() {
     ok "The HTTPS endpoint responded with the exported root CA explicitly trusted."
 }
 
+install_vwctl() {
+    section "vwctl installation"
+
+    if [[ ! -f "${VWCTL_SOURCE}" || -L "${VWCTL_SOURCE}" ]]; then
+        error "The vwctl source script is missing or unsafe at ${VWCTL_SOURCE}."
+        info "Run install.sh from a complete repository checkout containing vwctl."
+        return 1
+    fi
+
+    if ! grep -Fxq '# Vaultwarden Appliance vwctl' "${VWCTL_SOURCE}"; then
+        error "The vwctl source script does not contain the expected appliance identifier."
+        return 1
+    fi
+
+    if [[ -e "${VWCTL_TARGET}" ]]; then
+        if [[ ! -f "${VWCTL_TARGET}" || -L "${VWCTL_TARGET}" ]] || \
+           ! grep -Fxq '# Vaultwarden Appliance vwctl' "${VWCTL_TARGET}"; then
+            error "${VWCTL_TARGET} already exists but is not recognized as appliance-managed; it will not be overwritten."
+            return 1
+        fi
+    fi
+
+    install -d -m 0755 /usr/local/bin
+    install -m 0755 "${VWCTL_SOURCE}" "${VWCTL_TARGET}"
+    if [[ ! -x "${VWCTL_TARGET}" ]]; then
+        error "vwctl was copied but is not executable at ${VWCTL_TARGET}."
+        return 1
+    fi
+
+    ok "Installed the appliance management command at ${VWCTL_TARGET}."
+}
+
 print_completion_summary() {
-    section "Phase 3 complete"
+    section "Phase 4 complete"
     info "Installation directory: ${INSTALL_DIR}"
     info "Compose file: ${INSTALL_DIR}/docker-compose.yml"
     info "Persistent data: ${INSTALL_DIR}/data/vaultwarden"
@@ -999,6 +1035,7 @@ print_completion_summary() {
         info "Required DNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
     fi
     info "Exported root CA: ${EXPORTED_ROOT_CA}"
+    info "Management command: ${VWCTL_TARGET}"
     info "Vaultwarden remains internal-only; only Caddy publishes host TCP port 443."
     if [[ "${APPLIANCE_STATE}" == "existing" || "${APPLIANCE_STATE}" == "legacy" ]]; then
         info "Existing appliance files and any existing Vaultwarden container were left unchanged."
@@ -1009,7 +1046,7 @@ print_completion_summary() {
 }
 
 main() {
-    printf 'Vaultwarden Appliance - Phase 3 installer\n'
+    printf 'Vaultwarden Appliance - Phase 4 installer\n'
 
     check_operating_system
     check_architecture
@@ -1065,6 +1102,7 @@ main() {
     deploy_caddy
     export_caddy_root_ca
     verify_phase3
+    install_vwctl
 
     print_completion_summary
 }

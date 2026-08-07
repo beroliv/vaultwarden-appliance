@@ -128,11 +128,11 @@ A possible layout is:
 │   └── caddy/
 │       ├── data/
 │       └── config/
-└── bin/
-    └── vwctl
 ```
 
 The final directory structure may evolve during implementation, but `/opt/vaultwarden` MUST remain the root directory.
+
+The management command is installed separately as `/usr/local/bin/vwctl`.
 
 ---
 
@@ -324,10 +324,10 @@ On reruns, the installer reports and preserves the stored access mode, address,
 Caddy configuration, persistent data and internal CA. It does not silently
 switch modes, change an IP address or hostname, or regenerate the CA.
 
-A future address-change command may update `.caddy-access` and the Caddyfile so
+The Phase 4 `vwctl access` command updates `.caddy-access` and the Caddyfile so
 Caddy obtains a new server certificate for the new IP address or hostname. It
-should preserve `/opt/vaultwarden/data/caddy` so the existing internal root CA
-can continue to be used. That command is not part of Phase 3.
+preserves `/opt/vaultwarden/data/caddy` so the existing internal root CA
+continues to be used.
 
 Advanced users MUST be able to inspect and manually modify the Caddy configuration.
 
@@ -358,8 +358,8 @@ Registration MUST be controllable through `vwctl`.
 Required commands:
 
 ```bash
-vwctl signup on
-vwctl signup off
+sudo vwctl signup on
+sudo vwctl signup off
 ```
 
 ---
@@ -394,51 +394,116 @@ vwctl
 
 `vwctl` should hide routine Docker Compose implementation details while keeping the underlying system transparent and accessible to advanced users.
 
-Version 1 SHOULD provide:
+The repository contains the Bash source script `vwctl`. The installer copies it
+to `/usr/local/bin/vwctl` with executable permissions. Read-only commands work
+without `sudo` when the user can access Docker. Mutating commands require root
+and print the corresponding `sudo vwctl ...` command instead of invoking sudo.
+
+Phase 4 provides:
 
 ```bash
 vwctl status
-vwctl update
-vwctl backup
-vwctl restore
-vwctl logs
-vwctl signup on
-vwctl signup off
-vwctl cert export
-vwctl reload
+vwctl logs [vaultwarden|caddy]
+sudo vwctl update
+sudo vwctl restart
+sudo vwctl access [ip|hostname]
+vwctl signup status
+sudo vwctl signup on
+sudo vwctl signup off
+sudo vwctl cert export
 ```
+
+Backup and restore commands remain future phases.
 
 ### 12.1 Update
 
-`vwctl update` SHOULD perform the equivalent of:
+`sudo vwctl update` pulls only the configured Vaultwarden and Caddy images and
+then applies them with Docker Compose:
 
 ```bash
-docker compose pull
-docker compose up -d
-docker image prune -a -f
+docker compose pull vaultwarden caddy
+docker compose up -d vaultwarden caddy
 ```
 
-The exact implementation must include appropriate error handling.
+Compose recreates containers only when their image or effective configuration
+changed. The command verifies both containers, the internal Docker network and
+the HTTPS endpoint. It preserves all bind-mounted Vaultwarden and Caddy data,
+the access state and the internal root CA. It does not update the operating
+system or prune Docker images.
 
 An update MUST NOT silently destroy existing data or configuration.
 
 ### 12.2 Status
 
-`vwctl status` SHOULD present human-readable information such as:
+`vwctl status` presents human-readable container state, configured access mode
+and URL, current LAN IPv4 address and any configured-IP mismatch, Docker
+network status, container images, signup state and root CA export state.
 
 ```text
 Vaultwarden:       Running
 Caddy:             Running
-HTTPS:             OK
-Registration:      Enabled
-Backup target:     USB connected
-Last backup:       2026-08-07 03:00
-Backup storage:    12 %
+Access:            IP
+URL:               https://192.168.0.192
+Current IP:        192.168.0.192
+Signup:            enabled
+Root CA:           /opt/vaultwarden/certs/caddy-root-ca.crt
 ```
 
-### 12.3 Doctor
+### 12.3 Logs and Restart
 
-A diagnostic command is desirable:
+`vwctl logs` shows the last 100 lines from both services without following
+indefinitely. An optional `vaultwarden` or `caddy` argument selects one service.
+
+`sudo vwctl restart` force-recreates only the two appliance containers using
+the existing Compose configuration and persistent bind mounts, then verifies
+both containers and HTTPS. It preserves the internal root CA.
+
+### 12.4 Access Configuration
+
+`sudo vwctl access` interactively offers IP address, local hostname or cancel.
+The `ip` and `hostname` arguments select a mode directly but still request the
+new address or confirmation. Address changes never modify host or external
+network configuration.
+
+Before an access change, `vwctl` saves the current Caddyfile, access state and
+public root certificate, creates and validates candidate configuration, then
+recreates only Caddy. The candidate changes exactly one matching site-address
+line and preserves the remainder of the Caddyfile; an unexpected Caddyfile
+shape fails safely. Success requires a running Caddy container, a valid HTTPS
+response using the exported root CA and an unchanged persistent root CA. If
+any check fails, the previous Caddyfile and access state are restored, Caddy
+is recreated again and the previous HTTPS endpoint is verified. The legacy
+`.caddy-hostname` file is included in the rollback backup. It is removed during
+an access change and restored automatically if verification fails, so it is
+absent only after a successful move to the authoritative `.caddy-access` state.
+
+Changing an IP address or hostname allows Caddy to issue a new leaf certificate
+while continuing to use the persistent internal root CA.
+
+### 12.5 Signup Management
+
+Signup changes use the appliance-managed override file:
+
+```text
+/opt/vaultwarden/docker-compose.vwctl.yml
+```
+
+This override contains only `SIGNUPS_ALLOWED`, preserving every other Compose
+setting. A candidate override is validated before it replaces the managed
+file. Compose recreates Vaultwarden only when required and the resulting
+container environment is verified. On failure, the previous override and
+signup state are restored.
+
+### 12.6 Root CA Export
+
+`sudo vwctl cert export` atomically refreshes only the public certificate at
+`/opt/vaultwarden/certs/caddy-root-ca.crt`, sets readable permissions and
+verifies it byte-for-byte against Caddy's persistent public root certificate.
+Private CA keys are never read or exported.
+
+### 12.7 Future Diagnostics
+
+A diagnostic command remains desirable in a later phase:
 
 ```bash
 vwctl doctor
@@ -459,7 +524,7 @@ Last backup            ✓
 Backup integrity       ✓
 ```
 
-`vwctl doctor` is a SHOULD requirement rather than a mandatory first implementation milestone.
+`vwctl doctor` is a SHOULD requirement rather than part of Phase 4.
 
 ---
 
@@ -715,7 +780,7 @@ The USB device SHOULD also contain a short README explaining that this certifica
 The appliance MUST also provide:
 
 ```bash
-vwctl cert export
+sudo vwctl cert export
 ```
 
 to export the certificate again when required.
