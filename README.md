@@ -21,9 +21,25 @@ without modification.
 
 Vaultwarden data is stored in `/opt/vaultwarden/data/vaultwarden`. Vaultwarden
 has no host-published port. Caddy publishes only TCP port 443 and provides local
-HTTPS through its internal CA. The installer asks for a local hostname, using
-`vaultwarden.local` by default, and prints the DNS mapping that must be created
-by the administrator.
+HTTPS through its internal CA.
+
+Direct access through the detected LAN IPv4 address is the recommended default:
+
+```text
+https://192.168.0.192
+```
+
+This requires no local DNS, but the address should not change. Create a DHCP
+reservation for the Raspberry Pi in the router or DHCP server. The installer
+does not configure a static IP or modify any host, router, DNS or DHCP settings.
+
+Local hostname access remains optional and defaults to `vaultwarden.local`.
+When selected, the installer prints the DNS or hosts-file mapping that the
+administrator must configure manually.
+
+The selected mode and HTTPS address are stored in
+`/opt/vaultwarden/.caddy-access`. Reruns report and preserve this state. An
+existing hostname-based Phase 3 installation remains hostname-based.
 
 Caddy's persistent data is stored below `/opt/vaultwarden/data/caddy`. Its
 public root CA certificate is exported to:

@@ -6,6 +6,7 @@ set -o pipefail
 
 readonly INSTALL_DIR="/opt/vaultwarden"
 readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
+readonly CADDY_ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
 readonly CADDY_HOSTNAME_FILE="${INSTALL_DIR}/.caddy-hostname"
 readonly CADDYFILE="${INSTALL_DIR}/Caddyfile"
 readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
@@ -28,7 +29,9 @@ DOCKER_USER=""
 DOCKER_GROUP_CHANGED=0
 APPLIANCE_STATE="fresh"
 CADDY_STATE="absent"
-CADDY_HOSTNAME=""
+CADDY_ACCESS_MODE=""
+CADDY_ACCESS_ADDRESS=""
+CADDY_ACCESS_NEEDS_MIGRATION=0
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -205,30 +208,82 @@ validate_local_hostname() {
     done
 }
 
+validate_ipv4_address() {
+    local address=$1
+    local octet
+    local -a octets
+
+    [[ "${address}" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+    IFS='.' read -r -a octets <<<"${address}"
+    (( ${#octets[@]} == 4 )) || return 1
+
+    for octet in "${octets[@]}"; do
+        (( ${#octet} <= 3 )) || return 1
+        (( 10#${octet} <= 255 )) || return 1
+    done
+
+    [[ "${address}" != "0.0.0.0" && "${address}" != "255.255.255.255" ]]
+}
+
+load_caddy_access_state() {
+    local address
+    local mode
+    local -a lines
+
+    mapfile -t lines < "${CADDY_ACCESS_FILE}"
+    (( ${#lines[@]} == 2 )) || return 1
+    [[ "${lines[0]}" == mode=* && "${lines[1]}" == address=* ]] || return 1
+
+    mode=${lines[0]#mode=}
+    address=${lines[1]#address=}
+
+    case "${mode}" in
+        ip)
+            validate_ipv4_address "${address}" || return 1
+            ;;
+        hostname)
+            validate_local_hostname "${address}" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    CADDY_ACCESS_MODE=${mode}
+    CADDY_ACCESS_ADDRESS=${address}
+}
+
+create_caddy_access_state() {
+    if ! (set -o noclobber; printf 'mode=%s\naddress=%s\n' \
+        "${CADDY_ACCESS_MODE}" "${CADDY_ACCESS_ADDRESS}" > "${CADDY_ACCESS_FILE}"); then
+        error "Unable to create ${CADDY_ACCESS_FILE}."
+        return 1
+    fi
+
+    chmod 0644 "${CADDY_ACCESS_FILE}"
+}
+
 detect_caddy_configuration() {
     local -a hostname_lines
-    local managed_files=0
+    local core_files=0
 
     section "Caddy configuration"
 
-    if [[ -e "${CADDY_HOSTNAME_FILE}" ]]; then
-        managed_files=$((managed_files + 1))
-    fi
     if [[ -e "${CADDYFILE}" ]]; then
-        managed_files=$((managed_files + 1))
+        core_files=$((core_files + 1))
     fi
     if [[ -e "${CADDY_COMPOSE_FILE}" ]]; then
-        managed_files=$((managed_files + 1))
+        core_files=$((core_files + 1))
     fi
 
-    if (( managed_files == 0 )); then
+    if (( core_files == 0 )) && \
+       [[ ! -e "${CADDY_ACCESS_FILE}" && ! -e "${CADDY_HOSTNAME_FILE}" ]]; then
         CADDY_STATE="absent"
         info "Caddy is not configured yet."
         return
     fi
 
-    if (( managed_files != 3 )) || \
-       [[ ! -f "${CADDY_HOSTNAME_FILE}" || -L "${CADDY_HOSTNAME_FILE}" ]] || \
+    if (( core_files != 2 )) || \
        [[ ! -f "${CADDYFILE}" || -L "${CADDYFILE}" ]] || \
        [[ ! -f "${CADDY_COMPOSE_FILE}" || -L "${CADDY_COMPOSE_FILE}" ]] || \
        [[ ! -d "${CADDY_DATA_DIR}" || ! -d "${CADDY_CONFIG_DIR}" ]]; then
@@ -236,16 +291,48 @@ detect_caddy_configuration() {
         return
     fi
 
-    mapfile -t hostname_lines < "${CADDY_HOSTNAME_FILE}"
-    if (( ${#hostname_lines[@]} != 1 )) || ! validate_local_hostname "${hostname_lines[0]}"; then
-        error "The stored Caddy hostname is missing or invalid; existing Caddy files will not be changed."
-        return
+    if [[ -e "${CADDY_ACCESS_FILE}" ]]; then
+        if [[ ! -f "${CADDY_ACCESS_FILE}" || -L "${CADDY_ACCESS_FILE}" ]] || \
+           ! load_caddy_access_state; then
+            error "The stored Caddy access state is missing or invalid; existing Caddy files will not be changed."
+            return
+        fi
+
+        if [[ -e "${CADDY_HOSTNAME_FILE}" ]]; then
+            if [[ ! -f "${CADDY_HOSTNAME_FILE}" || -L "${CADDY_HOSTNAME_FILE}" ]]; then
+                error "The legacy Caddy hostname state is not a regular file; existing Caddy files will not be changed."
+                return
+            fi
+            mapfile -t hostname_lines < "${CADDY_HOSTNAME_FILE}"
+            if (( ${#hostname_lines[@]} != 1 )) || \
+               [[ "${CADDY_ACCESS_MODE}" != "hostname" ]] || \
+               [[ "${hostname_lines[0]}" != "${CADDY_ACCESS_ADDRESS}" ]]; then
+                error "The current and legacy Caddy access state disagree; existing Caddy files will not be changed."
+                return
+            fi
+        fi
+    else
+        if [[ ! -f "${CADDY_HOSTNAME_FILE}" || -L "${CADDY_HOSTNAME_FILE}" ]]; then
+            error "The stored Caddy access state is missing or invalid; existing Caddy files will not be changed."
+            return
+        fi
+
+        mapfile -t hostname_lines < "${CADDY_HOSTNAME_FILE}"
+        if (( ${#hostname_lines[@]} != 1 )) || ! validate_local_hostname "${hostname_lines[0]}"; then
+            error "The stored Caddy hostname is missing or invalid; existing Caddy files will not be changed."
+            return
+        fi
+
+        CADDY_ACCESS_MODE="hostname"
+        CADDY_ACCESS_ADDRESS=${hostname_lines[0]}
+        CADDY_ACCESS_NEEDS_MIGRATION=1
+        info "Legacy hostname access state detected; its HTTPS address will be preserved."
     fi
 
-    CADDY_HOSTNAME=${hostname_lines[0]}
     CADDY_STATE="configured"
-    ok "Existing Caddy configuration detected for ${CADDY_HOSTNAME}."
-    info "Hostname changes are not performed automatically; the existing hostname will be preserved."
+    ok "Existing Caddy configuration detected."
+    info "Configured HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
+    info "Access mode and address changes are not performed automatically."
 }
 
 check_docker() {
@@ -618,18 +705,16 @@ deploy_vaultwarden() {
     ok "Vaultwarden is running without a host-published HTTP port."
 }
 
-prompt_for_caddy_hostname() {
+print_ip_stability_warning() {
+    printf '\nIMPORTANT:\n'
+    printf 'This IP address should not change.\n\n'
+    printf 'Recommended:\n'
+    printf 'Create a DHCP reservation for %s in your router/DHCP server.\n\n' "${CADDY_ACCESS_ADDRESS}"
+    printf 'The appliance will not modify your network configuration.\n'
+}
+
+prompt_for_local_hostname() {
     local answer=""
-
-    section "Local HTTPS hostname"
-    info "Detected LAN IPv4 address: ${IPV4_ADDRESS}"
-    info "The chosen hostname must resolve to this address on every client device."
-    info "The installer will not modify DNS servers, routers, Pi-hole, AdGuard Home, or hosts files."
-
-    if [[ ! -r /dev/tty ]]; then
-        error "An interactive terminal is required to choose the Vaultwarden hostname."
-        return 1
-    fi
 
     while true; do
         if ! read -r -p "Vaultwarden hostname [vaultwarden.local]: " answer </dev/tty; then
@@ -637,20 +722,91 @@ prompt_for_caddy_hostname() {
             return 1
         fi
 
-        CADDY_HOSTNAME=${answer:-vaultwarden.local}
-        if validate_local_hostname "${CADDY_HOSTNAME}"; then
+        CADDY_ACCESS_ADDRESS=${answer:-vaultwarden.local}
+        if validate_local_hostname "${CADDY_ACCESS_ADDRESS}"; then
             break
         fi
         warn "Invalid hostname. Use dot-separated DNS labels without spaces or underscores."
     done
 
-    info "Required DNS mapping: ${CADDY_HOSTNAME} -> ${IPV4_ADDRESS}"
+    CADDY_ACCESS_MODE="hostname"
+    info "Required DNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+    info "The installer will not modify DNS servers, routers, Pi-hole, AdGuard Home, or hosts files."
+}
+
+prompt_for_caddy_access() {
+    local answer=""
+
+    section "HTTPS access address"
+
+    if [[ ! -r /dev/tty ]]; then
+        error "An interactive terminal is required to choose the HTTPS access address."
+        return 1
+    fi
+
+    printf 'How should Vaultwarden be accessed?\n\n'
+    printf '1) IP address [recommended]\n'
+    printf '   https://%s\n' "${IPV4_ADDRESS}"
+    printf '   No local DNS configuration required.\n\n'
+    printf '2) Local hostname\n'
+    printf '   https://vaultwarden.local\n'
+    printf '   Requires local DNS or hosts configuration.\n\n'
+
+    while true; do
+        if ! read -r -p "Choice [1]: " answer </dev/tty; then
+            error "Unable to read the HTTPS access choice."
+            return 1
+        fi
+
+        case "${answer:-1}" in
+            1)
+                if ! validate_ipv4_address "${IPV4_ADDRESS}"; then
+                    error "IP address mode requires a detected LAN IPv4 address. Choose hostname mode or correct the network configuration."
+                    return 1
+                fi
+                CADDY_ACCESS_MODE="ip"
+                CADDY_ACCESS_ADDRESS=${IPV4_ADDRESS}
+                print_ip_stability_warning
+                break
+                ;;
+            2)
+                prompt_for_local_hostname
+                break
+                ;;
+            *)
+                warn "Invalid choice. Enter 1 for IP address or 2 for local hostname."
+                ;;
+        esac
+    done
+
+    info "HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
+}
+
+report_configured_caddy_access() {
+    if [[ "${CADDY_ACCESS_MODE}" == "ip" ]]; then
+        info "Configured access mode: IP address."
+    else
+        info "Configured access mode: local hostname."
+    fi
+    info "HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
+
+    if [[ "${CADDY_ACCESS_MODE}" == "ip" ]]; then
+        print_ip_stability_warning
+        if validate_ipv4_address "${IPV4_ADDRESS}" && [[ "${IPV4_ADDRESS}" != "${CADDY_ACCESS_ADDRESS}" ]]; then
+            warn "The detected LAN IPv4 address (${IPV4_ADDRESS}) differs from the configured HTTPS address (${CADDY_ACCESS_ADDRESS})."
+            warn "The configured address will not be changed automatically."
+        fi
+    else
+        info "Required DNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+        info "The installer will not modify local DNS or hosts files."
+    fi
 }
 
 create_caddy_configuration() {
     section "Caddy configuration"
 
-    if [[ -e "${CADDY_HOSTNAME_FILE}" || -e "${CADDYFILE}" || -e "${CADDY_COMPOSE_FILE}" ]]; then
+    if [[ -e "${CADDY_ACCESS_FILE}" || -e "${CADDY_HOSTNAME_FILE}" || \
+          -e "${CADDYFILE}" || -e "${CADDY_COMPOSE_FILE}" ]]; then
         error "Caddy configuration paths appeared during installation; refusing to overwrite them."
         return 1
     fi
@@ -662,7 +818,7 @@ create_caddy_configuration() {
     auto_https disable_redirects
 }
 
-https://${CADDY_HOSTNAME} {
+https://${CADDY_ACCESS_ADDRESS} {
     tls internal
     reverse_proxy vaultwarden:80
 }
@@ -692,14 +848,10 @@ COMPOSE
         return 1
     fi
 
-    if ! (set -o noclobber; printf '%s\n' "${CADDY_HOSTNAME}" > "${CADDY_HOSTNAME_FILE}"); then
-        error "Unable to create ${CADDY_HOSTNAME_FILE}."
-        return 1
-    fi
-
-    chmod 0644 "${CADDYFILE}" "${CADDY_COMPOSE_FILE}" "${CADDY_HOSTNAME_FILE}"
+    chmod 0644 "${CADDYFILE}" "${CADDY_COMPOSE_FILE}"
+    create_caddy_access_state
     CADDY_STATE="configured"
-    ok "Created Caddy configuration for ${CADDY_HOSTNAME}."
+    ok "Created Caddy configuration for https://${CADDY_ACCESS_ADDRESS}."
 }
 
 deploy_caddy() {
@@ -755,7 +907,7 @@ export_caddy_root_ca() {
         ok "Exported Caddy's public root CA certificate to ${EXPORTED_ROOT_CA}."
     fi
 
-    info "Client devices must trust this root CA before ${CADDY_HOSTNAME} will be trusted."
+    info "Client devices must trust this root CA before https://${CADDY_ACCESS_ADDRESS} will be trusted."
     info "Caddy's private CA key remains only in the persistent Caddy data directory and is not exported."
 }
 
@@ -814,8 +966,8 @@ verify_phase3() {
         if curl --fail --silent --show-error \
             --noproxy '*' \
             --cacert "${EXPORTED_ROOT_CA}" \
-            --resolve "${CADDY_HOSTNAME}:443:127.0.0.1" \
-            "https://${CADDY_HOSTNAME}/alive" >/dev/null 2>&1; then
+            --connect-to "${CADDY_ACCESS_ADDRESS}:443:127.0.0.1:443" \
+            "https://${CADDY_ACCESS_ADDRESS}/alive" >/dev/null 2>&1; then
             endpoint_ok=1
             break
         fi
@@ -837,8 +989,15 @@ print_completion_summary() {
     info "Compose file: ${INSTALL_DIR}/docker-compose.yml"
     info "Persistent data: ${INSTALL_DIR}/data/vaultwarden"
     info "Docker network: vaultwarden-appliance"
-    info "HTTPS endpoint: https://${CADDY_HOSTNAME}"
-    info "Required DNS mapping: ${CADDY_HOSTNAME} -> ${IPV4_ADDRESS}"
+    if [[ "${CADDY_ACCESS_MODE}" == "ip" ]]; then
+        info "Access mode: IP address"
+    else
+        info "Access mode: local hostname"
+    fi
+    info "HTTPS endpoint: https://${CADDY_ACCESS_ADDRESS}"
+    if [[ "${CADDY_ACCESS_MODE}" == "hostname" ]]; then
+        info "Required DNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+    fi
     info "Exported root CA: ${EXPORTED_ROOT_CA}"
     info "Vaultwarden remains internal-only; only Caddy publishes host TCP port 443."
     if [[ "${APPLIANCE_STATE}" == "existing" || "${APPLIANCE_STATE}" == "legacy" ]]; then
@@ -873,6 +1032,11 @@ main() {
 
     configure_docker_group
 
+    if (( CADDY_ACCESS_NEEDS_MIGRATION == 1 )); then
+        create_caddy_access_state
+        ok "Stored the existing hostname access mode without changing Caddy or its HTTPS address."
+    fi
+
     case "${APPLIANCE_STATE}" in
         fresh)
             create_appliance_files
@@ -892,10 +1056,10 @@ main() {
     esac
 
     if [[ "${CADDY_STATE}" == "absent" ]]; then
-        prompt_for_caddy_hostname
+        prompt_for_caddy_access
         create_caddy_configuration
     else
-        info "Required DNS mapping: ${CADDY_HOSTNAME} -> ${IPV4_ADDRESS}"
+        report_configured_caddy_access
     fi
 
     deploy_caddy
