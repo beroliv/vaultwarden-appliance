@@ -795,9 +795,13 @@ filesystem_label=VWBACKUP
 ```
 
 The file is not group- or world-writable. UUID is authoritative; `/dev/sdX` is
-not stored. `vwctl usb status` reports label, UUID, presence, current device path
-when uniquely present, and mount state. Absence is normal and does not make the
-appliance unhealthy. Phase 5B creates no `/etc/fstab` entry and performs no
+not stored. `vwctl usb status` requires exactly one UUID match, verifies exFAT
+and label `VWBACKUP`, and resolves the filesystem through the safe topology to
+one real, non-system physical disk. It reports label, UUID, presence, current
+device path when uniquely present, and mount state. Absence is normal and does
+not make the appliance unhealthy. Duplicate UUIDs, mismatched filesystem
+metadata, protected backing disks, virtual devices, and unsupported backing
+topologies fail clearly. Phase 5B creates no `/etc/fstab` entry and performs no
 automatic mounting.
 
 ---

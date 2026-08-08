@@ -212,10 +212,12 @@ and system-disk protection, the non-secret state is installed atomically at:
 /opt/vaultwarden/.backup-device
 ```
 
-It contains the filesystem UUID and `VWBACKUP` label. Future backup code must
-locate the medium by UUID rather than `/dev/sdX`. Phase 5B does not mount the
-filesystem, add an `/etc/fstab` entry, create a backup, restore data, schedule
-jobs, or implement retention.
+It contains the filesystem UUID and `VWBACKUP` label. `vwctl usb status` locates
+the medium by UUID rather than `/dev/sdX`, verifies its exFAT type and label,
+and safely resolves it to one real, non-system physical disk. A disconnected
+configured medium is reported normally. Phase 5B does not mount the filesystem,
+add an `/etc/fstab` entry, create a backup, restore data, schedule jobs, or
+implement retention.
 
 ## Basic verification
 

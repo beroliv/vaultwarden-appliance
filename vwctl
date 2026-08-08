@@ -1627,14 +1627,16 @@ usb_print_candidates() {
 
 usb_print_configured_backup_media() {
     local device
+    local disk
     local label
-    local matches
+    local lookup
+    local lookup_status
     local mountpoints
     local owner
     local permissions
     local state
     local uuid
-    local -a devices=()
+    local -a lookup_fields=()
 
     [[ -e "${BACKUP_STATE_FILE}" || -L "${BACKUP_STATE_FILE}" ]] || return 0
     [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || \
@@ -1651,27 +1653,43 @@ usb_print_configured_backup_media() {
         die "The configured backup-media state is invalid."
     uuid=${state%%|*}
     label=${state#*|}
-    matches=$(storage_devices_for_uuid "${USB_TOPOLOGY}" "${uuid}") || \
-        die "Unable to locate the configured backup filesystem safely."
-    [[ -z "${matches}" ]] || mapfile -t devices <<<"${matches}"
 
     printf 'Configured backup media:\n'
     printf '  Label: %s\n' "${label}"
     printf '  UUID: %s\n' "${uuid}"
-    if ((${#devices[@]} == 0)); then
-        printf '  Present: no\n'
-        printf '  Mounted: no\n\n'
-        return 0
+
+    if lookup=$(storage_lookup_configured_backup \
+        "${USB_TOPOLOGY}" "${USB_PROTECTED_DISKS}" "${uuid}" "${label}"); then
+        mapfile -t lookup_fields <<<"${lookup}"
+    else
+        lookup_status=$?
+        case "${lookup_status}" in
+            2)
+                printf '  Present: no\n'
+                printf '  Mounted: no\n'
+                printf '  Status: configured backup medium is not connected; UUID was not found.\n\n'
+                return 0
+                ;;
+            3) die "Multiple block devices report the configured backup UUID ${uuid}." ;;
+            4) die "The filesystem matching backup UUID ${uuid} is not exFAT." ;;
+            5) die "The filesystem matching backup UUID ${uuid} is not labeled VWBACKUP." ;;
+            6) die "The configured backup medium changed or disappeared during inspection." ;;
+            7) die "The configured backup medium has an unsafe or unsupported backing topology." ;;
+            8) die "The configured backup filesystem is backed by a protected system disk." ;;
+            9) die "The configured backup filesystem is backed by a virtual device." ;;
+            *) die "The configured backup-media state is invalid." ;;
+        esac
     fi
+
+    ((${#lookup_fields[@]} == 2)) || \
+        die "Unable to inspect the configured backup medium safely."
+    device=${lookup_fields[0]}
+    disk=${lookup_fields[1]}
+    mountpoints=$(storage_lsblk_property "${device}" MOUNTPOINTS) || \
+        die "The configured backup medium changed or disappeared during inspection."
     printf '  Present: yes\n'
-    if ((${#devices[@]} > 1)); then
-        printf '  Device: ambiguous (%d devices report this UUID)\n' "${#devices[@]}"
-        printf '  Mounted: unknown\n\n'
-        return 0
-    fi
-    device=${devices[0]}
-    mountpoints=$(storage_lsblk_property "${device}" MOUNTPOINTS || true)
     printf '  Device: %s\n' "${device}"
+    printf '  Backing disk: %s\n' "${disk}"
     if [[ -n "${mountpoints}" ]]; then
         printf '  Mounted: yes (%s)\n\n' "${mountpoints}"
     else

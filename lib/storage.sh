@@ -528,10 +528,89 @@ storage_devices_for_uuid() {
     local device_uuid
 
     storage_valid_filesystem_uuid "${uuid}" || return 1
+    storage_validate_inventory "${inventory}" || return 1
     while IFS= read -r device; do
         device_uuid=$(storage_lsblk_property "${device}" UUID || true)
         [[ "${device_uuid}" == "${uuid}" ]] && printf '%s\n' "${device}"
     done < <(storage_inventory_nodes "${inventory}")
+    return 0
+}
+
+# Print the uniquely configured filesystem node and its physical parent disk.
+# Return codes distinguish normal absence and safety failures for vwctl status:
+# 2 absent, 3 duplicate UUID, 4 wrong filesystem, 5 wrong label,
+# 6 UUID changed during inspection, 7 unsafe topology, 8 protected disk,
+# 9 virtual backing device.
+storage_lookup_configured_backup() {
+    local inventory=$1
+    local protected=$2
+    local uuid=$3
+    local expected_label=$4
+    local actual_label
+    local actual_uuid
+    local candidate
+    local candidates
+    local device
+    local device_backed
+    local disk
+    local disks_output
+    local filesystem
+    local protected_disk
+    local protected_reason
+    local type
+    local -a devices=()
+    local -a disks=()
+
+    storage_validate_inventory "${inventory}" || return 7
+    storage_valid_filesystem_uuid "${uuid}" || return 1
+    [[ "${expected_label}" == "VWBACKUP" ]] || return 1
+    candidates=$(storage_candidate_disks "${inventory}" "${protected}") || return 7
+
+    mapfile -t devices < <(storage_devices_for_uuid "${inventory}" "${uuid}")
+    ((${#devices[@]} > 0)) || return 2
+    ((${#devices[@]} == 1)) || return 3
+    device=${devices[0]}
+
+    actual_uuid=$(storage_lsblk_property "${device}" UUID) || return 6
+    [[ "${actual_uuid}" == "${uuid}" ]] || return 6
+    filesystem=$(storage_lsblk_property "${device}" FSTYPE) || return 4
+    [[ "${filesystem,,}" == "exfat" ]] || return 4
+    actual_label=$(storage_lsblk_property "${device}" LABEL) || return 5
+    [[ "${actual_label}" == "${expected_label}" ]] || return 5
+
+    type=$(storage_inventory_node_field "${inventory}" "${device}" type) || return 7
+    if [[ "${type}" == "disk" ]]; then
+        device_backed=$(storage_inventory_node_field \
+            "${inventory}" "${device}" device_backed) || return 7
+        [[ "${device_backed}" == "1" ]] || return 9
+        return 7
+    fi
+    case "${type}" in
+        loop|ram|rom|zram) return 9 ;;
+        part) ;;
+        *) return 7 ;;
+    esac
+
+    disks_output=$(storage_resolve_physical_disks "${inventory}" "${device}") || return 7
+    mapfile -t disks <<<"${disks_output}"
+    ((${#disks[@]} == 1)) || return 7
+    disk=${disks[0]}
+    device_backed=$(storage_inventory_node_field \
+        "${inventory}" "${disk}" device_backed) || return 7
+    [[ "${device_backed}" == "1" ]] || return 9
+
+    while IFS='|' read -r protected_disk protected_reason; do
+        if [[ "${protected_disk}" == "${disk}" ]]; then
+            return 8
+        fi
+    done <<<"${protected}"
+
+    while IFS= read -r candidate; do
+        [[ "${candidate}" == "${disk}" ]] || continue
+        printf '%s\n%s\n' "${device}" "${disk}"
+        return 0
+    done <<<"${candidates}"
+    return 7
 }
 
 storage_validate_backup_layout() {
