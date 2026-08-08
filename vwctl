@@ -158,10 +158,14 @@ detect_ipv4_address() {
     if command_exists ip; then
         candidate=$(ip -4 route get 1.1.1.1 2>/dev/null |
             awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
-    fi
-    if [[ -z "${candidate}" ]] && command_exists hostname; then
-        candidate=$(hostname -I 2>/dev/null |
-            awk '{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\./) {print $i; exit}}')
+        if [[ -z "${candidate}" ]]; then
+            candidate=$(ip -o -4 addr show up scope global 2>/dev/null |
+                awk '$2 !~ /^(docker[0-9]*|br-|veth|virbr|podman|cni)/ {
+                    split($4, address, "/")
+                    print address[1]
+                    exit
+                }')
+        fi
     fi
 
     if validate_ipv4_address "${candidate}"; then
@@ -173,7 +177,7 @@ detect_ipv4_address() {
 
 require_mdns_runtime() {
     command_exists avahi-resolve-host-name || die "avahi-utils is required. Rerun the appliance installer."
-    command_exists avahi-set-host-name || die "avahi-utils is required. Rerun the appliance installer."
+    command_exists avahi-publish-address || die "avahi-utils is required. Rerun the appliance installer."
     command_exists systemctl || die "systemd is required for appliance mDNS."
     [[ -f "${MDNS_ENV_FILE}" && ! -L "${MDNS_ENV_FILE}" ]] || \
         die "The appliance mDNS state is missing or unsafe. Rerun the appliance installer."
@@ -183,25 +187,48 @@ require_mdns_runtime() {
         die "The mDNS state is not appliance-managed."
     grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_SERVICE_FILE}" || \
         die "The mDNS service is not appliance-managed."
+    grep -Fq 'ExecStart=/usr/bin/avahi-publish-address' "${MDNS_SERVICE_FILE}" || \
+        die "The appliance mDNS service is obsolete. Rerun the appliance installer."
 }
 
 mdns_resolved_ipv4s() {
     local hostname=$1
 
     timeout 4 avahi-resolve-host-name -4 "${hostname}" 2>/dev/null |
-        awk 'NF >= 2 {print $2}'
+        awk 'NF >= 2 && !seen[$2]++ {print $2}'
+}
+
+local_ipv4_addresses() {
+    command_exists ip || return 1
+    ip -o -4 addr show 2>/dev/null |
+        awk '{split($4, address, "/"); if (!seen[address[1]]++) print address[1]}'
+}
+
+mdns_resolution_matches() {
+    local expected=$1
+    local resolved=$2
+
+    [[ "${resolved}" == "${expected}" ]]
 }
 
 mdns_name_conflicts() {
     local hostname=$1
+    local address
     local current_ip=""
+    local local_addresses=""
     local resolved=""
 
     current_ip=$(detect_ipv4_address || true)
     resolved=$(mdns_resolved_ipv4s "${hostname}" || true)
     [[ -n "${resolved}" ]] || return 1
-    [[ -n "${current_ip}" ]] && grep -Fxq "${current_ip}" <<<"${resolved}" && return 1
-    return 0
+    local_addresses=$(local_ipv4_addresses || true)
+
+    while IFS= read -r address; do
+        [[ -n "${current_ip}" && "${address}" == "${current_ip}" ]] && continue
+        grep -Fxq "${address}" <<<"${local_addresses}" && continue
+        return 0
+    done <<<"${resolved}"
+    return 1
 }
 
 next_available_mdns_hostname() {
@@ -221,13 +248,16 @@ next_available_mdns_hostname() {
 
 configure_mdns_hostname() {
     local hostname=$1
-    local label=${hostname%.local}
     local candidate
+    local current_ip
 
     require_mdns_runtime
+    current_ip=$(detect_ipv4_address) || \
+        die "Unable to detect the LAN IPv4 address for the mDNS publication."
     candidate=$(mktemp "${INSTALL_DIR}/.mdns-env.vwctl.XXXXXXXX") || \
         die "Unable to create a temporary mDNS state file."
-    printf '# Vaultwarden Appliance mDNS\nVAULTWARDEN_MDNS_LABEL=%s\n' "${label}" > "${candidate}"
+    printf '# Vaultwarden Appliance mDNS\nVAULTWARDEN_MDNS_HOSTNAME=%s\nVAULTWARDEN_MDNS_IPV4=%s\n' \
+        "${hostname}" "${current_ip}" > "${candidate}"
     chmod 0644 "${candidate}"
     if ! install -m 0644 "${candidate}" "${MDNS_ENV_FILE}"; then
         rm -f -- "${candidate}"
@@ -242,6 +272,7 @@ verify_mdns_hostname() {
     local hostname=$1
     local current_ip
     local deadline=$((SECONDS + ACCESS_HTTPS_TIMEOUT))
+    local getent_resolved=""
     local resolved=""
 
     current_ip=$(detect_ipv4_address) || {
@@ -259,12 +290,24 @@ verify_mdns_hostname() {
 
     while :; do
         resolved=$(mdns_resolved_ipv4s "${hostname}" || true)
-        grep -Fxq "${current_ip}" <<<"${resolved}" && return 0
+        if mdns_resolution_matches "${current_ip}" "${resolved}"; then
+            if command_exists getent; then
+                getent_resolved=$(timeout 4 getent hosts "${hostname}" 2>/dev/null |
+                    awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ && !seen[$1]++ {print $1}' || true)
+                if ! mdns_resolution_matches "${current_ip}" "${getent_resolved}"; then
+                    printf '[WARN] System host lookup does not yet resolve %s exclusively to %s; Avahi-specific resolution is correct.\n' \
+                        "${hostname}" "${current_ip}" >&2
+                    [[ -z "${getent_resolved}" ]] || \
+                        printf 'getent IPv4 address(es): %s\n' "${getent_resolved//$'\n'/, }" >&2
+                fi
+            fi
+            return 0
+        fi
         (( SECONDS >= deadline )) && break
         sleep "${ACCESS_HTTPS_RETRY_INTERVAL}"
     done
 
-    printf '[FAIL] mDNS did not resolve %s to the detected LAN IPv4 address %s.\n' \
+    printf '[FAIL] mDNS did not resolve %s exclusively to the detected LAN IPv4 address %s.\n' \
         "${hostname}" "${current_ip}" >&2
     [[ -z "${resolved}" ]] || printf 'Resolved IPv4 address(es): %s\n' "${resolved//$'\n'/, }" >&2
     return 1

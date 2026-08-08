@@ -145,7 +145,10 @@ hostname=vaultwarden.local
 
 The appliance also owns `/etc/default/vaultwarden-appliance-mdns` and
 `/etc/systemd/system/vaultwarden-appliance-mdns.service`. These files persist
-the Avahi hostname advertisement without changing the Linux system hostname.
+an explicit mDNS hostname-to-LAN-IPv4 publication without changing either the
+Linux system hostname or Avahi's global hostname. The service runs
+`avahi-publish-address` continuously and stores the validated `.local` hostname
+and detected LAN IPv4 address in the environment file.
 
 ---
 
@@ -275,9 +278,10 @@ a `.local` hostname advertised with mDNS. The default and recommended URL is
 
 The installer MUST NOT configure a static IP or modify NetworkManager, dhcpcd,
 systemd-networkd, interfaces, DNS, gateways, routers, DHCP settings, or client
-hosts files. The appliance's Avahi hostname is independent of the Linux system
-hostname; configuring or changing appliance access MUST NOT call `hostnamectl`
-or otherwise rename the host operating system.
+hosts files. The appliance's published mDNS mapping is independent of the Linux
+system hostname and Avahi's global hostname. Configuring or changing appliance
+access MUST NOT call `hostnamectl`, `avahi-set-host-name`, or otherwise rename
+either hostname.
 
 A typical architecture is:
 
@@ -299,8 +303,12 @@ advertised by another LAN device. On conflict it MUST refuse to claim that name
 and SHOULD offer a conflict-free alternative such as `vaultwarden-2.local`.
 
 The selected hostname is stored in `/opt/vaultwarden/.caddy-access` as
-non-secret, human-readable state. Avahi advertises the name and the installer
-verifies that it resolves to the detected appliance LAN IPv4 address. The
+non-secret, human-readable state. The appliance-managed systemd service uses
+`avahi-publish-address` to publish exactly that hostname and the detected
+default-route LAN IPv4 address. It MUST NOT publish Docker bridge or container
+interface addresses for the appliance hostname. The installer verifies with
+`avahi-resolve-host-name -4` that the result is exclusively the detected LAN
+IPv4 address and additionally checks `getent hosts` where available. The
 obsolete `.caddy-hostname` file is removed only after safe state migration.
 
 mDNS name resolution and HTTPS certificate trust are separate mechanisms.
@@ -501,9 +509,9 @@ After validating the requested address and receiving explicit confirmation,
 and removes only the Caddy service container, generates a complete formatted
 appliance Caddyfile, rewrites the hostname-only `.caddy-access`, removes the obsolete
 `.caddy-hostname` state and validates the new configuration with a one-off
-Caddy Compose container. It updates and verifies the appliance-managed Avahi
-hostname, then creates Caddy with `--no-deps`, leaving the Vaultwarden container
-untouched.
+Caddy Compose container. It updates and verifies the appliance-managed,
+explicit Avahi hostname-to-LAN-IP publication, then creates Caddy with
+`--no-deps`, leaving the Vaultwarden container untouched.
 
 Success requires Caddy and Vaultwarden to be running, Caddy to use the
 `vaultwarden-appliance` network and publish only TCP 443, Vaultwarden to publish
@@ -1008,7 +1016,8 @@ alternative when that name is already advertised on the LAN.
 
 This access migration MUST:
 
-* install and configure the appliance-managed Avahi hostname advertisement;
+* install and configure the appliance-managed explicit Avahi
+  hostname-to-LAN-IP publication;
 * regenerate the complete Caddyfile for the selected `.local` hostname;
 * stop and recreate only the Caddy container;
 * leave the Vaultwarden container and `/opt/vaultwarden/data/vaultwarden`
@@ -1023,6 +1032,15 @@ This access migration MUST:
 Old Caddy leaf certificates do not need to be preserved. Caddy may issue a new
 leaf certificate for the `.local` hostname from the existing persistent root
 CA, keeping already installed client root certificates valid.
+
+An installer rerun MUST safely replace the obsolete appliance-owned systemd
+service that called `avahi-set-host-name`. It removes that transient global
+Avahi hostname effect by restarting Avahi once, then starts the persistent
+`avahi-publish-address` service with the current detected LAN IPv4 address.
+Unrelated Avahi configuration MUST remain untouched. Conflict detection may
+recognize addresses assigned to local Docker interfaces as belonging to the
+same host, but final mDNS verification MUST reject every result other than the
+detected LAN IPv4 address.
 
 ---
 

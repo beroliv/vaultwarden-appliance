@@ -23,14 +23,16 @@ packages when needed. On a fresh configuration it asks:
 Local Vaultwarden name [vaultwarden.local]:
 ```
 
-The name must be a single valid label below `.local`. Avahi advertises it on
-the LAN, so the normal URL is:
+The name must be a single valid label below `.local`. An appliance-managed
+systemd service uses `avahi-publish-address` to publish an explicit mapping from
+that name to the detected LAN IPv4 address, so the normal URL is:
 
 ```text
 https://vaultwarden.local
 ```
 
-The appliance does not change the Raspberry Pi's system hostname and does not
+The appliance does not change the Raspberry Pi's system hostname or Avahi's
+global hostname and does not
 modify router, DNS, DHCP, static-IP, gateway, interface, or client hosts-file
 settings. If the requested mDNS name is already advertised by another device,
 the installer proposes an available alternative such as
@@ -49,7 +51,9 @@ The selected local name is stored as human-readable, non-secret state in:
 
 ## mDNS and certificate trust are separate
 
-mDNS makes `vaultwarden.local` resolve to the appliance's current LAN address.
+mDNS makes `vaultwarden.local` resolve to the appliance's detected LAN address.
+The appliance publication names that address explicitly, so Docker bridge
+addresses are not published for the Vaultwarden name.
 It does not make the HTTPS certificate trusted. Every client must also trust
 Caddy's exported public root CA:
 
@@ -90,8 +94,8 @@ sudo vwctl cert export
 
 `sudo vwctl access` and `sudo vwctl access hostname` change only the local
 `.local` name. After validation, conflict detection, and confirmation, `vwctl`
-updates the appliance mDNS advertisement, regenerates the complete Caddyfile,
-and rebuilds only Caddy. Vaultwarden is not stopped or recreated. Caddy's
+updates the explicit mDNS hostname-to-LAN-IP publication, regenerates the
+complete Caddyfile, and rebuilds only Caddy. Vaultwarden is not stopped or recreated. Caddy's
 persistent data is not deleted, and the internal root CA hash must remain
 unchanged while Caddy obtains a new leaf certificate for the new hostname.
 
@@ -108,6 +112,11 @@ Caddy while preserving Vaultwarden data and Caddy's persistent internal root CA.
 
 Unknown `/opt/vaultwarden` directories without the appliance marker or the
 recognized legacy Phase 2 structure are left unchanged.
+
+Rerunning the installer refreshes the stored publication address from the
+current default-route LAN IPv4 address. It also automatically replaces the
+older appliance-owned `avahi-set-host-name` service, without changing unrelated
+Avahi configuration.
 
 ## Basic verification
 

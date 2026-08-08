@@ -40,6 +40,7 @@ CADDY_STATE="absent"
 CADDY_ACCESS_ADDRESS=""
 CADDY_ACCESS_NEEDS_MIGRATION=0
 LEGACY_IP_ADDRESS=""
+LEGACY_MDNS_SERVICE=0
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -441,17 +442,21 @@ detect_ipv4_address() {
 
     if command_exists ip; then
         candidate=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
+        if [[ -z "${candidate}" ]]; then
+            candidate=$(ip -o -4 addr show up scope global 2>/dev/null |
+                awk '$2 !~ /^(docker[0-9]*|br-|veth|virbr|podman|cni)/ {
+                    split($4, address, "/")
+                    print address[1]
+                    exit
+                }')
+        fi
     fi
 
-    if [[ -z "${candidate}" ]] && command_exists hostname; then
-        candidate=$(hostname -I 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\./) {print $i; exit}}')
-    fi
-
-    if [[ -n "${candidate}" ]]; then
+    if validate_ipv4_address "${candidate}"; then
         IPV4_ADDRESS=${candidate}
-        ok "Detected IPv4 address: ${IPV4_ADDRESS}"
+        ok "Detected LAN IPv4 address: ${IPV4_ADDRESS}"
     else
-        warn "No usable IPv4 address could be detected automatically."
+        warn "No usable LAN IPv4 address could be detected from the default route or a non-container interface."
     fi
 }
 
@@ -762,8 +767,8 @@ install_mdns_support() {
         error "avahi-resolve-host-name is unavailable after package installation."
         return 1
     }
-    command_exists avahi-set-host-name || {
-        error "avahi-set-host-name is unavailable after package installation."
+    command_exists avahi-publish-address || {
+        error "avahi-publish-address is unavailable after package installation."
         return 1
     }
 
@@ -779,17 +784,38 @@ mdns_resolved_ipv4s() {
     local hostname=$1
 
     timeout 4 avahi-resolve-host-name -4 "${hostname}" 2>/dev/null |
-        awk 'NF >= 2 {print $2}'
+        awk 'NF >= 2 && !seen[$2]++ {print $2}'
+}
+
+local_ipv4_addresses() {
+    command_exists ip || return 1
+    ip -o -4 addr show 2>/dev/null |
+        awk '{split($4, address, "/"); if (!seen[address[1]]++) print address[1]}'
+}
+
+mdns_resolution_matches() {
+    local expected=$1
+    local resolved=$2
+
+    [[ "${resolved}" == "${expected}" ]]
 }
 
 mdns_name_conflicts() {
     local hostname=$1
+    local address
+    local local_addresses=""
     local resolved=""
 
     resolved=$(mdns_resolved_ipv4s "${hostname}" || true)
     [[ -n "${resolved}" ]] || return 1
-    grep -Fxq "${IPV4_ADDRESS}" <<<"${resolved}" && return 1
-    return 0
+    local_addresses=$(local_ipv4_addresses || true)
+
+    while IFS= read -r address; do
+        [[ "${address}" == "${IPV4_ADDRESS}" ]] && continue
+        grep -Fxq "${address}" <<<"${local_addresses}" && continue
+        return 0
+    done <<<"${resolved}"
+    return 1
 }
 
 next_available_mdns_hostname() {
@@ -867,8 +893,6 @@ prompt_for_local_hostname() {
 }
 
 write_mdns_service_configuration() {
-    local label=${CADDY_ACCESS_ADDRESS%.local}
-
     if [[ -e "${MDNS_ENV_FILE}" ]] && \
        { [[ ! -f "${MDNS_ENV_FILE}" || -L "${MDNS_ENV_FILE}" ]] || \
          ! grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_ENV_FILE}" 2>/dev/null; }; then
@@ -882,25 +906,34 @@ write_mdns_service_configuration() {
         return 1
     fi
 
+    if [[ -f "${MDNS_SERVICE_FILE}" && ! -L "${MDNS_SERVICE_FILE}" ]] &&
+       grep -Fq 'avahi-set-host-name' "${MDNS_SERVICE_FILE}"; then
+        LEGACY_MDNS_SERVICE=1
+        info "Replacing the obsolete appliance mDNS hostname service."
+        systemctl stop "${MDNS_SERVICE}" || true
+    fi
+
     cat > "${MDNS_ENV_FILE}" <<ENV
 # Vaultwarden Appliance mDNS
-VAULTWARDEN_MDNS_LABEL=${label}
+VAULTWARDEN_MDNS_HOSTNAME=${CADDY_ACCESS_ADDRESS}
+VAULTWARDEN_MDNS_IPV4=${IPV4_ADDRESS}
 ENV
     chmod 0644 "${MDNS_ENV_FILE}"
 
     cat > "${MDNS_SERVICE_FILE}" <<'SERVICE'
 # Vaultwarden Appliance mDNS
 [Unit]
-Description=Advertise the Vaultwarden Appliance mDNS hostname
+Description=Publish the Vaultwarden Appliance mDNS address mapping
 Requires=avahi-daemon.service
-After=avahi-daemon.service
-PartOf=avahi-daemon.service
+Wants=network-online.target
+After=network-online.target avahi-daemon.service
 
 [Service]
-Type=oneshot
+Type=simple
 EnvironmentFile=/etc/default/vaultwarden-appliance-mdns
-ExecStart=/usr/bin/avahi-set-host-name ${VAULTWARDEN_MDNS_LABEL}
-RemainAfterExit=yes
+ExecStart=/usr/bin/avahi-publish-address --no-fail ${VAULTWARDEN_MDNS_HOSTNAME} ${VAULTWARDEN_MDNS_IPV4}
+Restart=on-failure
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
@@ -908,12 +941,17 @@ SERVICE
     chmod 0644 "${MDNS_SERVICE_FILE}"
 
     systemctl daemon-reload
+    if (( LEGACY_MDNS_SERVICE == 1 )); then
+        info "Restarting Avahi once to clear the obsolete appliance hostname override."
+        systemctl restart avahi-daemon.service
+    fi
     systemctl enable "${MDNS_SERVICE}"
     systemctl restart "${MDNS_SERVICE}"
 }
 
 verify_mdns() {
     local _attempt
+    local getent_resolved=""
     local resolved=""
 
     systemctl is-active --quiet avahi-daemon.service || {
@@ -927,14 +965,24 @@ verify_mdns() {
 
     for _attempt in {1..30}; do
         resolved=$(mdns_resolved_ipv4s "${CADDY_ACCESS_ADDRESS}" || true)
-        grep -Fxq "${IPV4_ADDRESS}" <<<"${resolved}" && {
+        mdns_resolution_matches "${IPV4_ADDRESS}" "${resolved}" && {
             ok "mDNS resolves ${CADDY_ACCESS_ADDRESS} to ${IPV4_ADDRESS}."
+            if command_exists getent; then
+                getent_resolved=$(timeout 4 getent hosts "${CADDY_ACCESS_ADDRESS}" 2>/dev/null |
+                    awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ && !seen[$1]++ {print $1}' || true)
+                if mdns_resolution_matches "${IPV4_ADDRESS}" "${getent_resolved}"; then
+                    ok "System host lookup also resolves ${CADDY_ACCESS_ADDRESS} to ${IPV4_ADDRESS}."
+                else
+                    warn "System host lookup does not yet resolve only to ${IPV4_ADDRESS}; Avahi-specific resolution is correct."
+                    [[ -z "${getent_resolved}" ]] || info "getent IPv4 address(es): ${getent_resolved//$'\n'/, }"
+                fi
+            fi
             return 0
         }
         sleep 1
     done
 
-    error "mDNS did not resolve ${CADDY_ACCESS_ADDRESS} to the detected LAN IPv4 address ${IPV4_ADDRESS}."
+    error "mDNS did not resolve ${CADDY_ACCESS_ADDRESS} exclusively to the detected LAN IPv4 address ${IPV4_ADDRESS}."
     [[ -z "${resolved}" ]] || info "Resolved IPv4 address(es): ${resolved//$'\n'/, }"
     return 1
 }
