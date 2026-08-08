@@ -33,6 +33,8 @@ readonly CADDY_ROOT_CA="${CADDY_DATA_DIR}/caddy/pki/authorities/local/root.crt"
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
 readonly VWCTL_SOURCE="${SCRIPT_DIR}/vwctl"
 readonly VWCTL_TARGET="/usr/local/bin/vwctl"
+readonly USB_SETUP_SOURCE="${SCRIPT_DIR}/libexec/usb-setup"
+readonly USB_SETUP_TARGET="/usr/local/libexec/vaultwarden-appliance-usb-setup"
 readonly VERSION_SOURCE="${SCRIPT_DIR}/VERSION"
 readonly VERSION_TARGET="${INSTALL_DIR}/.appliance-version"
 readonly OPERATION_LOCK="/run/lock/vaultwarden-appliance.lock"
@@ -44,6 +46,13 @@ readonly MDNS_WRAPPER_SOURCE="${SCRIPT_DIR}/mdns-publisher"
 readonly MDNS_WRAPPER_FILE="/usr/local/libexec/vaultwarden-appliance-mdns"
 readonly MDNS_READY_FILE="/run/vaultwarden-appliance-mdns/ready"
 readonly MIN_DISK_SPACE_MB=2048
+
+if [[ ! -f "${USB_SETUP_SOURCE}" || -L "${USB_SETUP_SOURCE}" ]] ||
+   ! grep -Fxq '# Vaultwarden Appliance USB setup' "${USB_SETUP_SOURCE}"; then
+    printf '[FAIL] Required USB setup helper is missing or unsafe: %s\n' \
+        "${USB_SETUP_SOURCE}" >&2
+    exit 1
+fi
 
 ERRORS=0
 WARNINGS=0
@@ -734,6 +743,35 @@ package_is_installed() {
     dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | grep -q '^ii '
 }
 
+install_usb_setup_support() {
+    local package
+    local -a missing_packages=()
+
+    section "USB backup-media setup tools"
+
+    command_exists sfdisk || missing_packages+=(fdisk)
+    command_exists mkfs.exfat || missing_packages+=(exfatprogs)
+    if ((${#missing_packages[@]} > 0)); then
+        command_exists apt-get || {
+            error "USB backup-media setup requires apt-get on this Debian-based system."
+            return 1
+        }
+        info "Installing required USB setup packages: ${missing_packages[*]}"
+        DEBIAN_FRONTEND=noninteractive apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_packages[@]}"
+    else
+        ok "Required USB backup-media setup tools are already installed."
+    fi
+
+    for package in sfdisk mkfs.exfat lsblk findmnt umount readlink; do
+        command_exists "${package}" || {
+            error "Required USB setup command '${package}' is unavailable after package installation."
+            return 1
+        }
+    done
+    ok "GPT and exFAT setup tools are available."
+}
+
 install_mdns_support() {
     local package
     local -a missing_packages=()
@@ -1255,6 +1293,11 @@ install_vwctl() {
         error "The vwctl source script does not contain the expected appliance identifier."
         return 1
     fi
+    if [[ ! -f "${USB_SETUP_SOURCE}" || -L "${USB_SETUP_SOURCE}" ]] ||
+       ! grep -Fxq '# Vaultwarden Appliance USB setup' "${USB_SETUP_SOURCE}"; then
+        error "The appliance USB setup helper is missing or unsafe at ${USB_SETUP_SOURCE}."
+        return 1
+    fi
 
     if [[ -e "${VWCTL_TARGET}" ]]; then
         if [[ ! -f "${VWCTL_TARGET}" || -L "${VWCTL_TARGET}" ]] || \
@@ -1292,7 +1335,19 @@ install_vwctl() {
         return 1
     fi
 
-    ok "Installed the appliance management command at ${VWCTL_TARGET}."
+    install -d -m 0755 /usr/local/libexec
+    if [[ -e "${USB_SETUP_TARGET}" &&
+          ( ! -f "${USB_SETUP_TARGET}" || -L "${USB_SETUP_TARGET}" ) ]]; then
+        error "The USB setup helper target is unsafe: ${USB_SETUP_TARGET}."
+        return 1
+    fi
+    install -m 0755 "${USB_SETUP_SOURCE}" "${USB_SETUP_TARGET}"
+    if [[ ! -x "${USB_SETUP_TARGET}" ]]; then
+        error "The USB setup helper was copied but is not executable at ${USB_SETUP_TARGET}."
+        return 1
+    fi
+
+    ok "Installed the appliance management command and USB setup helper."
 }
 
 install_appliance_version() {
@@ -1369,6 +1424,7 @@ main() {
 
     configure_docker_group
     install_mdns_support
+    install_usb_setup_support
 
     case "${APPLIANCE_STATE}" in
         fresh|existing) create_appliance_files ;;

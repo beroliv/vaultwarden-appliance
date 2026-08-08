@@ -11,15 +11,23 @@ storage_valid_device_path() {
        "${path}" != */. && "${path}" != */.. ]]
 }
 
-storage_sysfs_disk_is_device_backed() {
+storage_sysfs_path_for_major_minor() {
     local major_minor=$1
     local sysfs_path
 
     [[ "${major_minor}" =~ ^[0-9]+:[0-9]+$ ]] || return 1
     command_exists readlink || return 1
     sysfs_path=$(readlink -f -- "/sys/dev/block/${major_minor}" 2>/dev/null) || return 1
-    [[ "${sysfs_path}" == /sys/devices/* &&
-       "${sysfs_path}" != /sys/devices/virtual/* ]]
+    [[ "${sysfs_path}" == /sys/devices/* ]] || return 1
+    printf '%s\n' "${sysfs_path}"
+}
+
+storage_sysfs_disk_is_device_backed() {
+    local major_minor=$1
+    local sysfs_path
+
+    sysfs_path=$(storage_sysfs_path_for_major_minor "${major_minor}") || return 1
+    [[ "${sysfs_path}" != /sys/devices/virtual/* ]]
 }
 
 storage_validate_inventory() {
@@ -285,6 +293,274 @@ storage_selection_index() {
     printf '%d\n' "$((10#${selection} - 1))"
 }
 
+storage_identity_value_valid() {
+    local value=$1
+
+    (( ${#value} <= 255 )) || return 1
+    [[ "${value}" != *'|'* && "${value}" != *$'\n'* && "${value}" != *$'\r'* ]]
+}
+
+storage_make_disk_identity() {
+    local device=$1
+    local major_minor=$2
+    local size=$3
+    local serial=$4
+    local model=$5
+    local transport=$6
+    local sysfs_path=$7
+
+    storage_valid_device_path "${device}" || return 1
+    [[ "${major_minor}" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+    [[ "${size}" =~ ^[1-9][0-9]*$ ]] || return 1
+    storage_identity_value_valid "${serial}" || return 1
+    storage_identity_value_valid "${model}" || return 1
+    storage_identity_value_valid "${transport}" || return 1
+    [[ "${sysfs_path}" == /sys/devices/* &&
+       "${sysfs_path}" != /sys/devices/virtual/* &&
+       "${sysfs_path}" != *'|'* ]] || return 1
+    printf '%s|%s|%s|%s|%s|%s|%s\n' \
+        "${device}" "${major_minor}" "${size}" "${serial}" "${model}" \
+        "${transport}" "${sysfs_path}"
+}
+
+storage_validate_disk_identity() {
+    local identity=$1
+    local device
+    local extra
+    local major_minor
+    local model
+    local serial
+    local size
+    local sysfs_path
+    local transport
+
+    IFS='|' read -r device major_minor size serial model transport sysfs_path extra <<<"${identity}"
+    [[ -z "${extra:-}" ]] || return 1
+    [[ -n "${device}" && -n "${major_minor}" && -n "${size}" &&
+       -n "${sysfs_path}" ]] || return 1
+    [[ "$(storage_make_disk_identity "${device}" "${major_minor}" "${size}" \
+        "${serial}" "${model}" "${transport}" "${sysfs_path}")" == "${identity}" ]]
+}
+
+storage_disk_identity_field() {
+    local identity=$1
+    local field=$2
+    local device
+    local extra
+    local major_minor
+    local model
+    local serial
+    local size
+    local sysfs_path
+    local transport
+
+    storage_validate_disk_identity "${identity}" || return 1
+    IFS='|' read -r device major_minor size serial model transport sysfs_path extra <<<"${identity}"
+    case "${field}" in
+        device) printf '%s\n' "${device}" ;;
+        major_minor) printf '%s\n' "${major_minor}" ;;
+        size) printf '%s\n' "${size}" ;;
+        serial) printf '%s\n' "${serial}" ;;
+        model) printf '%s\n' "${model}" ;;
+        transport) printf '%s\n' "${transport}" ;;
+        sysfs_path) printf '%s\n' "${sysfs_path}" ;;
+        *) return 1 ;;
+    esac
+}
+
+storage_capture_disk_identity() {
+    local inventory=$1
+    local device=$2
+    local major_minor
+    local model
+    local serial
+    local size
+    local sysfs_path
+    local transport
+
+    [[ "$(storage_inventory_node_field "${inventory}" "${device}" type)" == "disk" ]] || return 1
+    [[ "$(storage_inventory_node_field "${inventory}" "${device}" device_backed)" == "1" ]] || return 1
+    major_minor=$(storage_inventory_node_field "${inventory}" "${device}" major_minor) || return 1
+    size=$(storage_inventory_node_field "${inventory}" "${device}" size) || return 1
+    serial=$(storage_lsblk_property "${device}" SERIAL || true)
+    model=$(storage_lsblk_property "${device}" MODEL || true)
+    transport=$(storage_lsblk_property "${device}" TRAN || true)
+    sysfs_path=$(storage_sysfs_path_for_major_minor "${major_minor}") || return 1
+    storage_make_disk_identity "${device}" "${major_minor}" "${size}" \
+        "${serial}" "${model}" "${transport}" "${sysfs_path}"
+}
+
+storage_disk_identities_match() {
+    local expected=$1
+    local actual=$2
+
+    storage_validate_disk_identity "${expected}" || return 1
+    storage_validate_disk_identity "${actual}" || return 1
+    [[ "${expected}" == "${actual}" ]]
+}
+
+storage_disk_confirmation_text() {
+    local identity=$1
+    local serial
+    local size
+    local sysfs_path
+
+    serial=$(storage_disk_identity_field "${identity}" serial) || return 1
+    if [[ -n "${serial}" ]]; then
+        printf 'ERASE %s\n' "${serial}"
+        return
+    fi
+    sysfs_path=$(storage_disk_identity_field "${identity}" sysfs_path) || return 1
+    size=$(storage_disk_identity_field "${identity}" size) || return 1
+    printf 'ERASE %s %s\n' "${sysfs_path}" "${size}"
+}
+
+storage_confirmation_matches() {
+    local identity=$1
+    local confirmation=$2
+    local expected
+
+    expected=$(storage_disk_confirmation_text "${identity}") || return 1
+    [[ "${confirmation}" == "${expected}" ]]
+}
+
+storage_revalidate_selected_disk() {
+    local expected_identity=$1
+    local actual_identity=$2
+    local candidate_list=$3
+    local protected=$4
+    local device
+
+    storage_validate_disk_identity "${expected_identity}" || return 1
+    [[ -n "${actual_identity}" ]] || return 2
+    storage_disk_identities_match "${expected_identity}" "${actual_identity}" || return 3
+    device=$(storage_disk_identity_field "${actual_identity}" device) || return 3
+    if cut -d'|' -f1 <<<"${protected}" | grep -Fxq "${device}"; then
+        return 4
+    fi
+    grep -Fxq "${device}" <<<"${candidate_list}" || return 5
+}
+
+storage_partition_nodes_for_disk() {
+    local inventory=$1
+    local disk=$2
+    local node
+    local type
+
+    while IFS= read -r node; do
+        [[ "${node}" != "${disk}" ]] || continue
+        type=$(storage_inventory_node_field "${inventory}" "${node}" type) || return 1
+        [[ "${type}" == "part" ]] && printf '%s\n' "${node}"
+    done < <(storage_disk_nodes "${inventory}" "${disk}")
+}
+
+storage_disk_layout_is_simple() {
+    local inventory=$1
+    local disk=$2
+    local node
+    local resolved
+    local type
+
+    while IFS= read -r node; do
+        type=$(storage_inventory_node_field "${inventory}" "${node}" type) || return 1
+        if [[ "${node}" == "${disk}" ]]; then
+            [[ "${type}" == "disk" ]] || return 1
+            continue
+        fi
+        [[ "${type}" == "part" ]] || return 1
+        resolved=$(storage_resolve_physical_disks "${inventory}" "${node}") || return 1
+        [[ "${resolved}" == "${disk}" ]] || return 1
+    done < <(storage_disk_nodes "${inventory}" "${disk}")
+}
+
+storage_gpt_layout() {
+    printf '%s\n' \
+        'label: gpt' \
+        'unit: sectors' \
+        '' \
+        'size=+, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7, name="Vaultwarden Backup"'
+}
+
+storage_valid_filesystem_uuid() {
+    local uuid=$1
+
+    (( ${#uuid} >= 3 && ${#uuid} <= 128 )) || return 1
+    [[ "${uuid}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]
+}
+
+storage_backup_state_content() {
+    local uuid=$1
+
+    storage_valid_filesystem_uuid "${uuid}" || return 1
+    printf 'filesystem_uuid=%s\nfilesystem_label=VWBACKUP\n' "${uuid}"
+}
+
+storage_read_backup_state() {
+    local state_file=$1
+    local label
+    local uuid
+    local -a lines=()
+
+    [[ -f "${state_file}" && ! -L "${state_file}" ]] || return 1
+    mapfile -t lines < "${state_file}" || return 1
+    (( ${#lines[@]} == 2 )) || return 1
+    [[ "${lines[0]}" == filesystem_uuid=* &&
+       "${lines[1]}" == filesystem_label=* ]] || return 1
+    uuid=${lines[0]#filesystem_uuid=}
+    label=${lines[1]#filesystem_label=}
+    storage_valid_filesystem_uuid "${uuid}" || return 1
+    [[ "${label}" == "VWBACKUP" ]] || return 1
+    printf '%s|%s\n' "${uuid}" "${label}"
+}
+
+storage_inventory_nodes() {
+    local inventory=$1
+    local device_backed
+    local extra
+    local major_minor
+    local name
+    local parent
+    local read_only
+    local size
+    local type
+
+    storage_validate_inventory "${inventory}" || return 1
+    while IFS='|' read -r name parent type major_minor size read_only device_backed extra; do
+        printf '%s\n' "${name}"
+    done <<<"${inventory}" | sort -u
+}
+
+storage_devices_for_uuid() {
+    local inventory=$1
+    local uuid=$2
+    local device
+    local device_uuid
+
+    storage_valid_filesystem_uuid "${uuid}" || return 1
+    while IFS= read -r device; do
+        device_uuid=$(storage_lsblk_property "${device}" UUID || true)
+        [[ "${device_uuid}" == "${uuid}" ]] && printf '%s\n' "${device}"
+    done < <(storage_inventory_nodes "${inventory}")
+}
+
+storage_validate_backup_layout() {
+    local partition_table=$1
+    local partition_count=$2
+    local partition_type=${3,,}
+    local filesystem=${4,,}
+    local label=$5
+    local uuid=$6
+    local mountpoints=$7
+
+    [[ "${partition_table,,}" == "gpt" ]] || return 1
+    [[ "${partition_count}" == "1" ]] || return 1
+    [[ "${partition_type}" == "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7" ]] || return 1
+    [[ "${filesystem}" == "exfat" ]] || return 1
+    [[ "${label}" == "VWBACKUP" ]] || return 1
+    storage_valid_filesystem_uuid "${uuid}" || return 1
+    [[ -z "${mountpoints}" ]]
+}
+
 storage_format_bytes() {
     local bytes=$1
 
@@ -436,7 +712,7 @@ storage_lsblk_property() {
 
     storage_valid_device_path "${device}" || return 1
     case "${property}" in
-        MODEL|VENDOR|SERIAL|TRAN|RM|FSTYPE|MOUNTPOINTS) ;;
+        MODEL|VENDOR|SERIAL|TRAN|RM|FSTYPE|MOUNTPOINTS|PTTYPE|PARTTYPE|LABEL|UUID) ;;
         *) return 1 ;;
     esac
     value=$(lsblk --nodeps --noheadings --output "${property}" "${device}" 2>/dev/null) || return 1

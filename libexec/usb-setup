@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# Vaultwarden Appliance USB setup
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIR
+if [[ -f "${SCRIPT_DIR}/../lib/common.sh" && ! -L "${SCRIPT_DIR}/../lib/common.sh" ]]; then
+    LIB_DIR=$(cd -- "${SCRIPT_DIR}/../lib" && pwd -P)
+else
+    LIB_DIR="/usr/local/lib/vaultwarden-appliance"
+fi
+readonly LIB_DIR
+for library in common storage; do
+    library_path="${LIB_DIR}/${library}.sh"
+    if [[ ! -f "${library_path}" || -L "${library_path}" ]]; then
+        printf 'Error: Required USB setup library is missing or unsafe: %s\n' \
+            "${library_path}" >&2
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    . "${library_path}"
+done
+unset library library_path
+
+readonly INSTALL_DIR="/opt/vaultwarden"
+readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
+readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
+readonly BACKUP_LABEL="VWBACKUP"
+readonly PARTITION_WAIT_SECONDS=30
+
+USB_TOPOLOGY=""
+USB_SYSTEM_MOUNTS=""
+USB_PROTECTED_DISKS=""
+USB_CANDIDATES=""
+USB_REVALIDATED_IDENTITY=""
+USB_PARTITION=""
+USB_VERIFY_ERROR=""
+USB_VERIFY_UUID=""
+USB_DESTRUCTIVE_STARTED=0
+
+usb_setup_die() {
+    printf 'Error: %s\n' "$*" >&2
+    if (( USB_DESTRUCTIVE_STARTED == 0 )); then
+        printf 'No partition table or filesystem was changed.\n' >&2
+    else
+        printf 'Destructive setup had already begun; erased data cannot be restored.\n' >&2
+        printf 'Correct the reported problem, then rerun: sudo vwctl usb setup\n' >&2
+    fi
+    exit 1
+}
+
+usb_setup_require_environment() {
+    local command
+
+    (( EUID == 0 )) || usb_setup_die "USB setup must run as root through sudo vwctl usb setup."
+    [[ -d "${INSTALL_DIR}" && ! -L "${INSTALL_DIR}" ]] || \
+        usb_setup_die "The appliance installation directory is missing or unsafe."
+    [[ -f "${APPLIANCE_MARKER}" && ! -L "${APPLIANCE_MARKER}" ]] || \
+        usb_setup_die "The appliance marker is missing or unsafe."
+    [[ -r /dev/tty ]] || usb_setup_die "An interactive terminal is required."
+    for command in lsblk findmnt readlink sfdisk mkfs.exfat umount; do
+        command_exists "${command}" || \
+            usb_setup_die "Required command '${command}' is unavailable. Rerun the installer."
+    done
+}
+
+usb_setup_refresh_storage() {
+    USB_TOPOLOGY=$(storage_collect_topology) || return 1
+    USB_SYSTEM_MOUNTS=$(storage_collect_system_mounts "${USB_TOPOLOGY}") || return 1
+    USB_PROTECTED_DISKS=$(storage_protected_disks_from_mounts \
+        "${USB_TOPOLOGY}" "${USB_SYSTEM_MOUNTS}") || return 1
+    USB_CANDIDATES=$(storage_candidate_disks \
+        "${USB_TOPOLOGY}" "${USB_PROTECTED_DISKS}") || return 1
+}
+
+usb_setup_revalidate_selected() {
+    local expected_identity=$1
+    local actual_identity=""
+    local device
+    local result
+
+    device=$(storage_disk_identity_field "${expected_identity}" device) || return 1
+    usb_setup_refresh_storage || {
+        printf 'Error: Unable to establish fresh block-device topology safely.\n' >&2
+        return 1
+    }
+    actual_identity=$(storage_capture_disk_identity "${USB_TOPOLOGY}" "${device}" || true)
+    if storage_revalidate_selected_disk "${expected_identity}" "${actual_identity}" \
+        "${USB_CANDIDATES}" "${USB_PROTECTED_DISKS}"; then
+        :
+    else
+        result=$?
+        case "${result}" in
+            2) printf 'Error: The selected disk disappeared before final revalidation.\n' >&2 ;;
+            3) printf 'Error: The selected disk identity changed before final revalidation.\n' >&2 ;;
+            4) printf 'Error: The selected disk now backs a protected system filesystem.\n' >&2 ;;
+            5) printf 'Error: The selected disk is no longer a safe physical candidate.\n' >&2 ;;
+            *) printf 'Error: The selected disk failed final safety revalidation.\n' >&2 ;;
+        esac
+        return 1
+    fi
+    storage_disk_layout_is_simple "${USB_TOPOLOGY}" "${device}" || {
+        printf 'Error: The selected disk has an unsupported composite block layout.\n' >&2
+        return 1
+    }
+    if [[ -n "$(usb_setup_active_swap_nodes "${USB_TOPOLOGY}" "${device}")" ]]; then
+        printf 'Error: The selected disk contains active swap and cannot be initialized safely.\n' >&2
+        return 1
+    fi
+    USB_REVALIDATED_IDENTITY=${actual_identity}
+}
+
+usb_setup_active_swap_nodes() {
+    local inventory=$1
+    local disk=$2
+    local mountpoints
+    local node
+
+    while IFS= read -r node; do
+        mountpoints=$(storage_lsblk_property "${node}" MOUNTPOINTS || true)
+        [[ "${mountpoints}" == *'[SWAP]'* ]] && printf '%s\n' "${node}"
+    done < <(storage_disk_nodes "${inventory}" "${disk}")
+}
+
+usb_setup_mounted_nodes() {
+    local inventory=$1
+    local disk=$2
+    local node
+
+    while IFS= read -r node; do
+        if findmnt --evaluate --noheadings --raw --source "${node}" >/dev/null 2>&1; then
+            printf '%s\n' "${node}"
+        fi
+    done < <(storage_disk_nodes "${inventory}" "${disk}")
+}
+
+usb_setup_mountpoint_details() {
+    local inventory=$1
+    local disk=$2
+    local node
+    local targets
+
+    while IFS= read -r node; do
+        targets=$(findmnt --evaluate --noheadings --raw --output TARGET \
+            --source "${node}" 2>/dev/null || true)
+        [[ -n "${targets}" ]] || continue
+        while IFS= read -r target; do
+            [[ -n "${target}" ]] && printf '  %s -> %s\n' "${node}" "${target}"
+        done <<<"${targets}"
+    done < <(storage_disk_nodes "${inventory}" "${disk}")
+}
+
+usb_setup_unmount_selected() {
+    local inventory=$1
+    local disk=$2
+    local node
+
+    while IFS= read -r node; do
+        if ! findmnt --evaluate --noheadings --raw --source "${node}" >/dev/null 2>&1; then
+            continue
+        fi
+        printf 'Unmounting filesystems on %s...\n' "${node}"
+        umount --all-targets -- "${node}" || return 1
+        if findmnt --evaluate --noheadings --raw --source "${node}" >/dev/null 2>&1; then
+            return 1
+        fi
+    done < <(storage_disk_nodes "${inventory}" "${disk}")
+}
+
+usb_setup_settle_udev() {
+    if command_exists udevadm; then
+        udevadm settle --timeout=10 || true
+    fi
+}
+
+usb_setup_wait_for_single_partition() {
+    local expected_identity=$1
+    local attempt
+    local device
+    local partitions
+    local -a partition_nodes=()
+
+    device=$(storage_disk_identity_field "${expected_identity}" device) || return 1
+    for ((attempt = 1; attempt <= PARTITION_WAIT_SECONDS; attempt++)); do
+        usb_setup_settle_udev
+        if usb_setup_revalidate_selected "${expected_identity}"; then
+            partitions=$(storage_partition_nodes_for_disk "${USB_TOPOLOGY}" "${device}" || true)
+            partition_nodes=()
+            [[ -z "${partitions}" ]] || mapfile -t partition_nodes <<<"${partitions}"
+            if ((${#partition_nodes[@]} == 1)); then
+                USB_PARTITION=${partition_nodes[0]}
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+usb_setup_verify_layout_once() {
+    local expected_identity=$1
+    local device
+    local filesystem
+    local label
+    local mountpoints
+    local partition_count
+    local partition_table
+    local partition_type
+    local partitions
+    local uuid
+    local -a partition_nodes=()
+
+    USB_VERIFY_ERROR=""
+    device=$(storage_disk_identity_field "${expected_identity}" device) || return 1
+    usb_setup_revalidate_selected "${expected_identity}" || {
+        USB_VERIFY_ERROR="selected disk failed final safety verification"
+        return 1
+    }
+    partitions=$(storage_partition_nodes_for_disk "${USB_TOPOLOGY}" "${device}" || true)
+    [[ -z "${partitions}" ]] || mapfile -t partition_nodes <<<"${partitions}"
+    partition_count=${#partition_nodes[@]}
+    if (( partition_count != 1 )); then
+        USB_VERIFY_ERROR="expected exactly one data partition, found ${partition_count}"
+        return 1
+    fi
+    USB_PARTITION=${partition_nodes[0]}
+    partition_table=$(storage_lsblk_property "${device}" PTTYPE || true)
+    partition_type=$(storage_lsblk_property "${USB_PARTITION}" PARTTYPE || true)
+    filesystem=$(storage_lsblk_property "${USB_PARTITION}" FSTYPE || true)
+    label=$(storage_lsblk_property "${USB_PARTITION}" LABEL || true)
+    uuid=$(storage_lsblk_property "${USB_PARTITION}" UUID || true)
+    mountpoints=$(storage_lsblk_property "${USB_PARTITION}" MOUNTPOINTS || true)
+    if ! storage_validate_backup_layout "${partition_table}" "${partition_count}" \
+        "${partition_type}" "${filesystem}" "${label}" "${uuid}" "${mountpoints}"; then
+        USB_VERIFY_ERROR="GPT, partition type, exFAT label, UUID, or mount state is incorrect"
+        return 1
+    fi
+    USB_VERIFY_UUID=${uuid}
+}
+
+usb_setup_wait_for_verified_layout() {
+    local expected_identity=$1
+    local attempt
+
+    for ((attempt = 1; attempt <= PARTITION_WAIT_SECONDS; attempt++)); do
+        usb_setup_settle_udev
+        if usb_setup_verify_layout_once "${expected_identity}"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+usb_setup_install_state() {
+    local uuid=$1
+    local state_content
+    local temporary=""
+
+    state_content=$(storage_backup_state_content "${uuid}") || return 1
+    if [[ -e "${BACKUP_STATE_FILE}" &&
+          ( ! -f "${BACKUP_STATE_FILE}" || -L "${BACKUP_STATE_FILE}" ) ]]; then
+        return 1
+    fi
+    temporary=$(mktemp "${INSTALL_DIR}/.backup-device.XXXXXXXX") || return 1
+    if ! printf '%s\n' "${state_content}" > "${temporary}" ||
+       ! chown 0:0 "${temporary}" ||
+       ! chmod 0644 "${temporary}" ||
+       ! mv -f -- "${temporary}" "${BACKUP_STATE_FILE}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    [[ "$(storage_read_backup_state "${BACKUP_STATE_FILE}")" == "${uuid}|${BACKUP_LABEL}" ]]
+}
+
+usb_setup_print_warning() {
+    local identity=$1
+    local confirmation
+    local device
+    local model
+    local serial
+    local size
+    local transport
+
+    device=$(storage_disk_identity_field "${identity}" device) || return 1
+    model=$(storage_disk_identity_field "${identity}" model) || return 1
+    serial=$(storage_disk_identity_field "${identity}" serial) || return 1
+    size=$(storage_disk_identity_field "${identity}" size) || return 1
+    transport=$(storage_disk_identity_field "${identity}" transport) || return 1
+    confirmation=$(storage_disk_confirmation_text "${identity}") || return 1
+
+    printf '\nWARNING: ALL DATA ON THIS DEVICE WILL BE ERASED.\n\n'
+    printf 'Selected device:\n'
+    [[ -z "${model}" ]] || printf '  Model: %s\n' "${model}"
+    printf '  Device: %s\n' "${device}"
+    [[ -z "${serial}" ]] || printf '  Serial: %s\n' "${serial}"
+    printf '  Size: %s\n' "$(storage_format_bytes "${size}")"
+    printf '  Transport: %s\n' "${transport:-unknown}"
+    if [[ -n "$(usb_setup_mounted_nodes "${USB_TOPOLOGY}" "${device}")" ]]; then
+        printf '  Mounted filesystems:\n'
+        usb_setup_mountpoint_details "${USB_TOPOLOGY}" "${device}"
+    else
+        printf '  Mounted filesystems: none\n'
+    fi
+    printf '\nThis operation will remove the existing partition table and create a new\n'
+    printf 'GPT with one exFAT Vaultwarden Appliance backup filesystem.\n\n'
+    printf 'Kein Backup, keine Gnade.\n'
+    printf 'No backup, no mercy.\n\n'
+    printf 'Type %s to continue: ' "${confirmation}"
+}
+
+usb_setup_main() {
+    local expected_identity=${1:-}
+    local confirmation=""
+    local device
+    local partitions
+
+    usb_setup_require_environment
+    storage_validate_disk_identity "${expected_identity}" || \
+        usb_setup_die "The selected-disk identity supplied by vwctl is invalid."
+    usb_setup_revalidate_selected "${expected_identity}" || \
+        usb_setup_die "The selected disk is not safe to initialize."
+    device=$(storage_disk_identity_field "${expected_identity}" device) || \
+        usb_setup_die "The selected disk identity cannot be read."
+
+    usb_setup_print_warning "${USB_REVALIDATED_IDENTITY}" || \
+        usb_setup_die "Unable to prepare the destructive confirmation."
+    if ! read -r confirmation </dev/tty; then
+        usb_setup_die "Unable to read destructive confirmation."
+    fi
+    if ! storage_confirmation_matches "${USB_REVALIDATED_IDENTITY}" "${confirmation}"; then
+        printf '\nCancelled. The confirmation did not match; no changes were made.\n'
+        return 0
+    fi
+
+    usb_setup_revalidate_selected "${expected_identity}" || \
+        usb_setup_die "Final safety revalidation failed after confirmation."
+    usb_setup_unmount_selected "${USB_TOPOLOGY}" "${device}" || \
+        usb_setup_die "Unable to unmount every filesystem belonging to ${device}."
+    usb_setup_revalidate_selected "${expected_identity}" || \
+        usb_setup_die "Final safety revalidation failed immediately before partitioning."
+    [[ -z "$(usb_setup_mounted_nodes "${USB_TOPOLOGY}" "${device}")" ]] || \
+        usb_setup_die "A selected filesystem became mounted again before partitioning."
+
+    printf 'Creating the GPT partition layout on %s...\n' "${device}"
+    USB_DESTRUCTIVE_STARTED=1
+    if ! storage_gpt_layout | sfdisk --lock=yes --wipe always \
+        --wipe-partitions never "${device}"; then
+        usb_setup_die "Writing the GPT partition table failed."
+    fi
+    usb_setup_settle_udev
+    usb_setup_wait_for_single_partition "${expected_identity}" || \
+        usb_setup_die "The kernel did not expose exactly one new partition safely."
+
+    usb_setup_revalidate_selected "${expected_identity}" || \
+        usb_setup_die "Safety revalidation failed immediately before filesystem creation."
+    partitions=$(storage_partition_nodes_for_disk "${USB_TOPOLOGY}" "${device}" || true)
+    [[ "${partitions}" == "${USB_PARTITION}" ]] || \
+        usb_setup_die "The selected partition changed before filesystem creation."
+    [[ -z "$(usb_setup_mounted_nodes "${USB_TOPOLOGY}" "${device}")" ]] || \
+        usb_setup_die "A selected filesystem became mounted before filesystem creation."
+    printf 'Creating exFAT filesystem %s on %s...\n' "${BACKUP_LABEL}" "${USB_PARTITION}"
+    mkfs.exfat -L "${BACKUP_LABEL}" "${USB_PARTITION}" || \
+        usb_setup_die "Creating the exFAT filesystem failed."
+
+    usb_setup_settle_udev
+    usb_setup_wait_for_verified_layout "${expected_identity}" || \
+        usb_setup_die "Final backup-media verification failed: ${USB_VERIFY_ERROR:-unknown error}."
+    usb_setup_install_state "${USB_VERIFY_UUID}" || \
+        usb_setup_die "The verified backup-media state could not be stored atomically."
+
+    printf '\nBackup device initialized successfully.\n\n'
+    printf 'Device:      %s\n' "${device}"
+    printf 'Partition:   %s\n' "${USB_PARTITION}"
+    printf 'Filesystem:  exfat\n'
+    printf 'Label:       %s\n' "${BACKUP_LABEL}"
+    printf 'UUID:        %s\n' "${USB_VERIFY_UUID}"
+    printf 'Size:        %s\n' "$(storage_format_bytes \
+        "$(storage_disk_identity_field "${expected_identity}" size)")"
+    printf '\nThe device was not added to /etc/fstab and no backup was created.\n'
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    (( $# == 1 )) || usb_setup_die "Usage: usb-setup <validated-disk-identity>"
+    usb_setup_main "$1"
+fi

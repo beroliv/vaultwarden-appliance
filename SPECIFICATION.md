@@ -488,17 +488,18 @@ sudo vwctl cert export
 
 Backup and restore commands remain future phases.
 
-Phase 5A adds read-only block-device discovery and a non-destructive selection
-test:
+Phase 5A adds read-only block-device discovery. Phase 5B turns the setup command
+into explicit destructive backup-media initialization:
 
 ```bash
 vwctl usb status
 sudo vwctl usb setup
 ```
 
-Neither command formats, partitions, wipes, mounts, unmounts, labels, repairs,
-or otherwise writes to a block device. A later phase must separately implement
-and revalidate any destructive backup-media setup.
+`vwctl usb status` remains read-only. `sudo vwctl usb setup` is destructive only
+after numbered selection, repeated safety revalidation and an exact
+device-specific `ERASE` confirmation. Phase 5B initializes media but does not
+create a Vaultwarden backup.
 
 ### 12.1 Update
 
@@ -698,9 +699,9 @@ Other backup targets are outside Version 1 scope.
 
 ## 14. USB Device Detection
 
-Phase 5A provides block-device discovery through `vwctl usb status` and a
-non-destructive selection test through `sudo vwctl usb setup`. It does not yet
-configure backup media.
+Phase 5A provides block-device discovery through `vwctl usb status`. Phase 5B
+uses the same discovery and protection logic for `sudo vwctl usb setup`, which
+deliberately initializes one explicitly selected backup disk.
 
 Discovery uses `lsblk`, `findmnt`, and the Linux block-device topology. The
 physical disk or disks backing `/`, `/boot`, and `/boot/firmware` MUST be
@@ -729,12 +730,22 @@ device name such as `/dev/sda`.
 `sudo vwctl usb setup` uses the normal global appliance operation lock. It
 numbers only the safe candidate list and accepts only a number generated for
 that invocation. A raw device path such as `/dev/sdb`, an out-of-range value,
-or a protected system disk is rejected. Selecting a candidate only reports the
-selection and makes no device or configuration change.
+or a protected system disk is rejected.
 
-Persistent device identification by filesystem UUID or an equivalent stable
-identifier remains a requirement for the later backup-media implementation;
-Phase 5A stores no selected device.
+At selection time the command records the device path, major/minor number,
+exact size, resolved non-virtual sysfs path and available serial, model, and
+transport values. Before confirmation, after confirmation, after unmounting,
+and immediately before filesystem creation, it performs a fresh
+`lsblk`/`findmnt`/sysfs scan. The disk must still have exactly the same identity,
+remain a real whole physical candidate and remain outside the complete backing
+set for `/`, `/boot`, and `/boot/firmware`. A disappearance, reused device path,
+identity mismatch, new protected role, or unsupported composite layout aborts
+the operation. No replacement candidate is selected automatically.
+
+If filesystems on the selected disk or its simple child partitions are mounted,
+their mountpoints are displayed before confirmation. After successful exact
+confirmation, only those device nodes are unmounted. Failure to unmount or a
+remaining mount aborts before the partition table is changed.
 
 ---
 
@@ -750,9 +761,44 @@ The main reasons are portability and easy access from Windows, macOS and Linux s
 
 Existing suitable filesystems may be retained if supported by the implementation.
 
-The installer SHOULD offer to format the selected USB storage device as exFAT.
+Phase 5B uses `sfdisk` from Debian's `fdisk` package and `mkfs.exfat` from
+`exfatprogs`. The installer installs only missing required packages and verifies
+that `sfdisk`, `mkfs.exfat`, `lsblk`, `findmnt`, `umount`, and `readlink` are
+available.
 
-Filesystem selection and formatting are not implemented in Phase 5A.
+After exact destructive confirmation, the setup command creates:
+
+```text
+GPT partition table
+one Microsoft Basic Data partition using the usable device capacity
+exFAT filesystem labeled VWBACKUP
+```
+
+It does not use `dd`, perform a full-device wipe, or mount the resulting
+filesystem. `sfdisk` replaces only the partition metadata required for the new
+layout, asks the kernel to reread it and uses a block-device lock. The actual
+child partition is rediscovered from block topology; `${device}1` is never
+assumed.
+
+Final verification requires GPT, exactly one expected partition, the Microsoft
+Basic Data GPT type, exFAT, label `VWBACKUP`, a non-empty filesystem UUID, no
+unexpected mountpoint, unchanged disk identity, and continued system-disk
+protection.
+
+Only after successful verification, the appliance atomically installs the
+root-owned, non-secret state file `/opt/vaultwarden/.backup-device` with mode
+`0644`:
+
+```text
+filesystem_uuid=<UUID>
+filesystem_label=VWBACKUP
+```
+
+The file is not group- or world-writable. UUID is authoritative; `/dev/sdX` is
+not stored. `vwctl usb status` reports label, UUID, presence, current device path
+when uniquely present, and mount state. Absence is normal and does not make the
+appliance unhealthy. Phase 5B creates no `/etc/fstab` entry and performs no
+automatic mounting.
 
 ---
 
@@ -760,8 +806,9 @@ Filesystem selection and formatting are not implemented in Phase 5A.
 
 Formatting a storage device is destructive.
 
-Formatting is not implemented in Phase 5A. Its discovery and selection commands
-MUST remain entirely non-destructive.
+`vwctl usb status` remains entirely non-destructive. `sudo vwctl usb setup`
+MUST make no disk change until all preflight checks and the exact destructive
+confirmation have succeeded.
 
 The installer MUST NOT format any device without explicit confirmation.
 
@@ -778,12 +825,19 @@ Device: SanDisk Ultra
 Path:   /dev/sda
 Size:   29.8 GB
 
-Type YES to continue:
+Type ERASE <selected-device-identifier> to continue:
 ```
 
-The installer MUST abort formatting if the expected confirmation is not entered.
+The setup command MUST cancel without modification if the exact expected text
+is not entered. A usable serial number is preferred for the confirmation. If it
+is unavailable, the freshly verified sysfs device path plus exact byte size is
+used.
 
-Where practical, additional safeguards SHOULD prevent formatting the system disk.
+After destructive work begins, failures identify the failed step and do not
+attempt to restore the old partition table or erased contents. The command does
+not touch another disk and instructs the administrator to correct the problem
+and rerun setup. Backup, restore, retention, scheduling, automatic mounting,
+encryption, and multi-disk sets remain later or out-of-scope work.
 
 ---
 

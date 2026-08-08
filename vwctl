@@ -32,6 +32,7 @@ readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
 readonly VWCTL_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.vwctl.yml"
 readonly CADDYFILE="${INSTALL_DIR}/Caddyfile"
 readonly ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
+readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
 readonly CADDY_ROOT_CA="${INSTALL_DIR}/data/caddy/data/caddy/pki/authorities/local/root.crt"
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
 readonly APPLIANCE_NETWORK="vaultwarden-appliance"
@@ -46,6 +47,12 @@ readonly ACCESS_HTTPS_TIMEOUT=60
 readonly ACCESS_HTTPS_RETRY_INTERVAL=2
 readonly MIN_FREE_DISK_MB=2048
 readonly OPERATION_LOCK="/run/lock/vaultwarden-appliance.lock"
+if [[ -f "${SCRIPT_DIR}/libexec/usb-setup" && ! -L "${SCRIPT_DIR}/libexec/usb-setup" ]]; then
+    USB_SETUP_HELPER="${SCRIPT_DIR}/libexec/usb-setup"
+else
+    USB_SETUP_HELPER="/usr/local/libexec/vaultwarden-appliance-usb-setup"
+fi
+readonly USB_SETUP_HELPER
 
 ACCESS_ADDRESS=""
 HTTPS_LAST_ERROR=""
@@ -105,7 +112,7 @@ Commands:
   cert info          Show public root and HTTPS server certificate information
   cert export        Refresh the public Caddy root CA export
   usb status         Discover block devices without modifying them
-  usb setup          Select a safe candidate for a Phase 5A discovery test only
+  usb setup          ERASE and initialize one explicitly selected backup disk
 HELP
 }
 
@@ -1618,12 +1625,67 @@ usb_print_candidates() {
     done
 }
 
+usb_print_configured_backup_media() {
+    local device
+    local label
+    local matches
+    local mountpoints
+    local owner
+    local permissions
+    local state
+    local uuid
+    local -a devices=()
+
+    [[ -e "${BACKUP_STATE_FILE}" || -L "${BACKUP_STATE_FILE}" ]] || return 0
+    [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || \
+        die "The configured backup-media state file is unsafe."
+    owner=$(stat -c '%u' "${BACKUP_STATE_FILE}" 2>/dev/null) || \
+        die "Unable to verify backup-media state ownership."
+    permissions=$(stat -c '%a' "${BACKUP_STATE_FILE}" 2>/dev/null) || \
+        die "Unable to verify backup-media state permissions."
+    [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || \
+        die "The configured backup-media state ownership or permissions are invalid."
+    (( (8#${permissions} & 8#022) == 0 )) || \
+        die "The configured backup-media state file must not be group- or world-writable."
+    state=$(storage_read_backup_state "${BACKUP_STATE_FILE}") || \
+        die "The configured backup-media state is invalid."
+    uuid=${state%%|*}
+    label=${state#*|}
+    matches=$(storage_devices_for_uuid "${USB_TOPOLOGY}" "${uuid}") || \
+        die "Unable to locate the configured backup filesystem safely."
+    [[ -z "${matches}" ]] || mapfile -t devices <<<"${matches}"
+
+    printf 'Configured backup media:\n'
+    printf '  Label: %s\n' "${label}"
+    printf '  UUID: %s\n' "${uuid}"
+    if ((${#devices[@]} == 0)); then
+        printf '  Present: no\n'
+        printf '  Mounted: no\n\n'
+        return 0
+    fi
+    printf '  Present: yes\n'
+    if ((${#devices[@]} > 1)); then
+        printf '  Device: ambiguous (%d devices report this UUID)\n' "${#devices[@]}"
+        printf '  Mounted: unknown\n\n'
+        return 0
+    fi
+    device=${devices[0]}
+    mountpoints=$(storage_lsblk_property "${device}" MOUNTPOINTS || true)
+    printf '  Device: %s\n' "${device}"
+    if [[ -n "${mountpoints}" ]]; then
+        printf '  Mounted: yes (%s)\n\n' "${mountpoints}"
+    else
+        printf '  Mounted: no\n\n'
+    fi
+}
+
 command_usb_status() {
     require_appliance
     discover_storage_devices || \
         die "Unable to establish the system block-device topology safely; no backup device can be offered."
 
     printf 'Backup media\n\n'
+    usb_print_configured_backup_media
     usb_print_system_devices
     if ((${#USB_CANDIDATES[@]} == 0)); then
         printf 'No suitable external backup devices detected.\n'
@@ -1631,10 +1693,11 @@ command_usb_status() {
     fi
     printf 'Available backup devices:\n\n'
     usb_print_candidates
-    printf 'Phase 5A discovery only. No block device was modified.\n'
+    printf 'Discovery is read-only. No block device was modified.\n'
 }
 
 command_usb_setup() {
+    local identity
     local index
     local selected_disk
     local selection=""
@@ -1646,11 +1709,11 @@ command_usb_setup() {
     discover_storage_devices || \
         die "Unable to establish the system block-device topology safely; no backup device can be offered."
 
-    printf 'Backup media setup — Phase 5A discovery test\n\n'
+    printf 'Backup media setup — DESTRUCTIVE\n\n'
     usb_print_system_devices
     if ((${#USB_CANDIDATES[@]} == 0)); then
         printf 'No suitable external backup devices detected.\n\n'
-        printf 'Phase 5A discovery test only.\nNo changes were made to any device.\n'
+        printf 'No changes were made to any device.\n'
         return 0
     fi
 
@@ -1663,12 +1726,13 @@ command_usb_setup() {
         die "Invalid selection. Enter only one of the displayed device numbers."
     selected_disk=${USB_CANDIDATES[${index}]}
 
-    printf '\nSelected backup device:\n'
-    printf '  %s\n' "${selected_disk}"
-    printf '  %s\n' "$(usb_disk_label "${selected_disk}" || printf '%s' "${selected_disk##*/}")"
-    printf '  %s\n\n' "$(usb_disk_size "${selected_disk}" || printf unknown)"
-    printf 'Phase 5A discovery test only.\n'
-    printf 'No changes were made to the device.\n'
+    identity=$(storage_capture_disk_identity "${USB_TOPOLOGY}" "${selected_disk}") || \
+        die "Unable to capture a stable identity for the selected physical disk."
+    if [[ ! -f "${USB_SETUP_HELPER}" || -L "${USB_SETUP_HELPER}" ]] ||
+       ! grep -Fxq '# Vaultwarden Appliance USB setup' "${USB_SETUP_HELPER}"; then
+        die "The appliance USB setup helper is missing or unsafe at ${USB_SETUP_HELPER}."
+    fi
+    bash "${USB_SETUP_HELPER}" "${identity}"
 }
 
 command_usb() {

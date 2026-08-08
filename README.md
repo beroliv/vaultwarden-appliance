@@ -174,7 +174,7 @@ The wrapper remains active with the publisher, confirms that the hostname
 resolves exclusively to the configured LAN IPv4 address, and turns an early
 successful publisher exit into a service failure.
 
-## Phase 5A block-device discovery
+## Phase 5A/5B backup-media setup
 
 `vwctl usb status` performs read-only block-device discovery. It inspects the
 devices backing `/`, `/boot`, and `/boot/firmware` where present, follows
@@ -189,13 +189,33 @@ do not report it reliably. Loop, RAM, zram, optical, and device-mapper pseudo
 devices are not selectable. If the system topology cannot be established
 safely, discovery fails closed and offers no device.
 
-`sudo vwctl usb setup` uses the global appliance operation lock and lets the
-administrator select only a number from the internally generated safe candidate
-list. The system disk is never numbered, and entering a `/dev/...` path is not
-accepted. In Phase 5A the command only prints the selected device and exits.
-It does not partition, format, wipe, mount, unmount, label, repair, or otherwise
-modify any block device. Destructive media setup will be implemented and tested
-separately.
+`sudo vwctl usb setup` is destructive. It uses the global appliance operation
+lock and lets the administrator select only a number from the internally
+generated safe candidate list. The system disk is never numbered, and entering
+a `/dev/...` path is not accepted. The selected disk is identified by its
+major/minor number, exact size, serial/model/transport where available, and
+resolved kernel device path. The complete topology and identity are scanned
+again after selection, after the device-specific confirmation, and immediately
+before each destructive step.
+
+The command displays mounted filesystems belonging to the selected simple disk
+layout. Only after the user types the exact `ERASE <device identifier>` text are
+those selected filesystems unmounted. It then replaces the partition table with
+GPT, creates one Microsoft Basic Data partition spanning the usable disk, and
+formats it as exFAT with label `VWBACKUP`. There is no default `y/N` confirmation
+and no attempt to restore erased data.
+
+After fresh verification of the GPT layout, exFAT label, UUID, unmounted state,
+and system-disk protection, the non-secret state is installed atomically at:
+
+```text
+/opt/vaultwarden/.backup-device
+```
+
+It contains the filesystem UUID and `VWBACKUP` label. Future backup code must
+locate the medium by UUID rather than `/dev/sdX`. Phase 5B does not mount the
+filesystem, add an `/etc/fstab` entry, create a backup, restore data, schedule
+jobs, or implement retention.
 
 ## Basic verification
 
@@ -218,5 +238,6 @@ docker inspect caddy --format '{{json .HostConfig.PortBindings}}'
 ```
 
 Use the actual hostname reported by `vwctl status` if a conflict-free
-alternative was selected. Phase 5A provides discovery only; formatting, backup,
-restore, retention, and scheduling are not implemented yet.
+alternative was selected. Phase 5B initializes explicitly selected backup
+media; backup creation, automatic mounting, restore, retention, and scheduling
+are not implemented yet.
