@@ -18,6 +18,8 @@ readonly CADDY_ROOT_CA="${CADDY_DATA_DIR}/caddy/pki/authorities/local/root.crt"
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
 readonly VWCTL_SOURCE="${SCRIPT_DIR}/vwctl"
 readonly VWCTL_TARGET="/usr/local/bin/vwctl"
+readonly VERSION_SOURCE="${SCRIPT_DIR}/VERSION"
+readonly VERSION_TARGET="${INSTALL_DIR}/.appliance-version"
 readonly DEFAULT_MDNS_HOSTNAME="vaultwarden.local"
 readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
 readonly MDNS_SERVICE_FILE="/etc/systemd/system/vaultwarden-appliance-mdns.service"
@@ -1331,6 +1333,34 @@ install_vwctl() {
     ok "Installed the appliance management command at ${VWCTL_TARGET}."
 }
 
+install_appliance_version() {
+    local version
+    local -a lines
+
+    section "Appliance version"
+
+    if [[ ! -f "${VERSION_SOURCE}" || -L "${VERSION_SOURCE}" ]]; then
+        error "The appliance version source is missing or unsafe at ${VERSION_SOURCE}."
+        return 1
+    fi
+    mapfile -t lines < "${VERSION_SOURCE}"
+    if (( ${#lines[@]} != 1 )) ||
+       [[ ! "${lines[0]}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+        error "The appliance version source is invalid."
+        return 1
+    fi
+    version=${lines[0]}
+
+    if [[ -e "${VERSION_TARGET}" &&
+          ( ! -f "${VERSION_TARGET}" || -L "${VERSION_TARGET}" ) ]]; then
+        error "The appliance version path is unsafe and will not be overwritten."
+        return 1
+    fi
+
+    install -m 0644 "${VERSION_SOURCE}" "${VERSION_TARGET}"
+    ok "Installed Vaultwarden Appliance version ${version}."
+}
+
 print_completion_summary() {
     section "Phase 4 complete"
     info "Installation directory: ${INSTALL_DIR}"
@@ -1435,6 +1465,7 @@ main() {
     deploy_caddy
     export_caddy_root_ca
     verify_phase3
+    install_appliance_version
     install_vwctl
 
     print_completion_summary

@@ -7,6 +7,7 @@ set -o pipefail
 
 readonly INSTALL_DIR="/opt/vaultwarden"
 readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
+readonly APPLIANCE_VERSION_FILE="${INSTALL_DIR}/.appliance-version"
 readonly BASE_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
 readonly VWCTL_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.vwctl.yml"
@@ -25,10 +26,14 @@ readonly MDNS_READY_FILE="/run/vaultwarden-appliance-mdns/ready"
 readonly LOG_LINES=100
 readonly ACCESS_HTTPS_TIMEOUT=60
 readonly ACCESS_HTTPS_RETRY_INTERVAL=2
+readonly MIN_FREE_DISK_MB=2048
 
 ACCESS_ADDRESS=""
 ACCESS_NEEDS_MIGRATION=0
 HTTPS_LAST_ERROR=""
+HEALTH_FAILURES=0
+UPDATE_CHECK_AVAILABLE=0
+UPDATE_CHECK_UNDETERMINED=0
 
 info() {
     printf '%s\n' "$*"
@@ -50,22 +55,34 @@ Vaultwarden Appliance management
 Usage:
   vwctl help
   vwctl status
+  vwctl health
   vwctl logs [vaultwarden|caddy]
+  sudo vwctl start
+  sudo vwctl stop
   sudo vwctl update
+  vwctl update check
   sudo vwctl restart
   sudo vwctl access [hostname]
+  vwctl version
   vwctl signup status
   sudo vwctl signup on
   sudo vwctl signup off
+  vwctl cert info
   sudo vwctl cert export
 
 Commands:
   status             Show appliance and access information
+  health             Run read-only appliance diagnostics
   logs               Show the last 100 log lines; optionally select one service
+  start              Start and verify the appliance services
+  stop               Stop appliance services without removing them or their data
   update             Pull and apply appliance container image updates
+  update check       Check remote image metadata without applying updates
   restart            Safely recreate the appliance containers
   access             Change the local mDNS hostname used for HTTPS access
+  version            Show appliance and component versions
   signup             Show, enable, or disable account registration
+  cert info          Show public root and HTTPS server certificate information
   cert export        Refresh the public Caddy root CA export
 HELP
 }
@@ -430,6 +447,48 @@ container_image() {
     printf '%s\n' "${image}"
 }
 
+configured_service_image() {
+    local service=$1
+    local image=""
+
+    image=$(docker inspect --format '{{.Config.Image}}' "${service}" 2>/dev/null || true)
+    if [[ -n "${image}" ]]; then
+        printf '%s\n' "${image}"
+        return 0
+    fi
+
+    compose config 2>/dev/null | awk -v service="${service}" '
+        $0 == "  " service ":" {in_service=1; next}
+        in_service && $0 ~ /^  [^ ]/ {exit}
+        in_service && $1 == "image:" {print $2; exit}
+    '
+}
+
+container_exists() {
+    docker inspect "$1" >/dev/null 2>&1
+}
+
+container_is_running() {
+    [[ "$(docker inspect --format '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]
+}
+
+container_repo_digests() {
+    local container=$1
+    local image_id
+
+    image_id=$(docker inspect --format '{{.Image}}' "${container}" 2>/dev/null) || return 1
+    docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${image_id}" 2>/dev/null |
+        awk -F@ 'NF == 2 && $2 ~ /^sha256:/ && !seen[$2]++ {print $2}'
+}
+
+remote_image_digest() {
+    local image=$1
+    local output
+
+    output=$(docker buildx imagetools inspect "${image}" 2>/dev/null) || return 1
+    awk '$1 == "Digest:" && $2 ~ /^sha256:/ {print $2; exit}' <<<"${output}"
+}
+
 container_is_connected_to_network() {
     local container=$1
     local network=$2
@@ -764,6 +823,122 @@ cleanup_operation_directory() {
     rmdir -- "${directory}"
 }
 
+health_ok() {
+    printf '[ OK ] %s\n' "$1"
+}
+
+health_fail() {
+    local check=$1
+    local reason=$2
+
+    printf '[FAIL] %s: %s\n' "${check}" "${reason}" >&2
+    HEALTH_FAILURES=$((HEALTH_FAILURES + 1))
+}
+
+root_ca_export_matches_caddy() {
+    [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || return 1
+    container_is_running caddy || return 1
+    docker exec caddy cat /data/caddy/pki/authorities/local/root.crt 2>/dev/null |
+        cmp -s - "${EXPORTED_ROOT_CA}"
+}
+
+command_health() {
+    local available_kb=""
+    local available_mb=0
+    local current_ip=""
+    local docker_ready=0
+    local mdns_ready=0
+    local resolved=""
+
+    require_appliance
+    HEALTH_FAILURES=0
+    printf 'Vaultwarden Appliance health\n\n'
+
+    if command_exists docker &&
+       docker compose version >/dev/null 2>&1 &&
+       docker info >/dev/null 2>&1; then
+        docker_ready=1
+        health_ok "Docker"
+    else
+        health_fail "Docker" "daemon or Docker Compose v2 is not accessible"
+    fi
+
+    if (( docker_ready == 1 )) &&
+       container_exists vaultwarden &&
+       container_is_running vaultwarden &&
+       [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' vaultwarden 2>/dev/null)" == "0" ]] &&
+       container_is_connected_to_network vaultwarden "${APPLIANCE_NETWORK}"; then
+        health_ok "Vaultwarden"
+    else
+        health_fail "Vaultwarden" "container is missing, stopped, publishing a host port, or disconnected from ${APPLIANCE_NETWORK}"
+    fi
+
+    if (( docker_ready == 1 )) &&
+       container_exists caddy &&
+       container_is_running caddy &&
+       caddy_publishes_only_https &&
+       container_is_connected_to_network caddy "${APPLIANCE_NETWORK}"; then
+        health_ok "Caddy"
+    else
+        health_fail "Caddy" "container is missing, stopped, not publishing only TCP 443, or disconnected from ${APPLIANCE_NETWORK}"
+    fi
+
+    if load_access_state &&
+       (( ACCESS_NEEDS_MIGRATION == 0 )) &&
+       current_ip=$(detect_ipv4_address) &&
+       command_exists systemctl &&
+       command_exists avahi-resolve-host-name &&
+       systemctl is-active --quiet avahi-daemon.service &&
+       systemctl is-active --quiet "${MDNS_SERVICE}" &&
+       mdns_service_is_ready "${ACCESS_ADDRESS}" "${current_ip}"; then
+        resolved=$(mdns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
+        if mdns_resolution_matches "${current_ip}" "${resolved}"; then
+            mdns_ready=1
+            health_ok "mDNS"
+        else
+            health_fail "mDNS" "${ACCESS_ADDRESS} does not resolve exclusively to ${current_ip}"
+        fi
+    else
+        health_fail "mDNS" "Avahi, publisher state, access state, or LAN IPv4 verification failed"
+    fi
+
+    if (( docker_ready == 1 && mdns_ready == 1 )) &&
+       command_exists curl &&
+       verify_https "${ACCESS_ADDRESS}" 10 2; then
+        health_ok "HTTPS"
+    else
+        health_fail "HTTPS" "https://${ACCESS_ADDRESS:-unknown}/alive did not validate with the exported root CA"
+    fi
+
+    if (( docker_ready == 1 )) && root_ca_export_matches_caddy; then
+        health_ok "Root CA"
+    else
+        health_fail "Root CA" "the readable export is missing or does not match Caddy's persistent public root certificate"
+    fi
+
+    available_kb=$(df -Pk "${INSTALL_DIR}" 2>/dev/null | awk 'NR == 2 {print $4}')
+    if [[ -d "${INSTALL_DIR}/data/vaultwarden" &&
+          -d "${INSTALL_DIR}/data/caddy" &&
+          "${available_kb}" =~ ^[0-9]+$ ]]; then
+        available_mb=$((available_kb / 1024))
+        if (( available_mb >= MIN_FREE_DISK_MB )); then
+            health_ok "Storage (${available_mb} MiB free)"
+        else
+            health_fail "Storage" "only ${available_mb} MiB free; ${MIN_FREE_DISK_MB} MiB is required"
+        fi
+    else
+        health_fail "Storage" "persistent data directories or disk-space information are unavailable"
+    fi
+
+    if (( HEALTH_FAILURES == 0 )); then
+        printf '\nHealth check: OK\n'
+        return 0
+    fi
+
+    printf '\nHealth check: FAILED (%d check(s))\n' "${HEALTH_FAILURES}" >&2
+    return 1
+}
+
 command_status() {
     local caddy_state
     local current_ip="not detected"
@@ -849,6 +1024,189 @@ command_logs() {
             die "Usage: vwctl logs [vaultwarden|caddy]"
             ;;
     esac
+}
+
+command_start() {
+    local already_running=0
+
+    require_root "start"
+    require_appliance
+    require_docker
+    load_access_state || die "The appliance access state is missing or invalid."
+    (( ACCESS_NEEDS_MIGRATION == 0 )) || die "Obsolete access state detected. Rerun the appliance installer first."
+    require_mdns_runtime
+    require_https_verification_ready
+    compose config --quiet || die "The appliance Compose configuration is invalid."
+
+    if container_is_running vaultwarden &&
+       container_is_running caddy &&
+       systemctl is-active --quiet "${MDNS_SERVICE}"; then
+        already_running=1
+        info "Vaultwarden, Caddy, and the mDNS publisher are already running."
+    else
+        info "Starting Vaultwarden and Caddy without recreating existing containers..."
+        compose up -d --no-recreate vaultwarden caddy || \
+            die "Docker Compose could not start the appliance containers."
+        systemctl start "${MDNS_SERVICE}" || \
+            die "The appliance mDNS publisher could not be started."
+    fi
+
+    verify_appliance || die "Started appliance verification failed."
+    if (( already_running == 1 )); then
+        info "Appliance services were already running and are healthy."
+    else
+        info "Appliance services started and verified."
+    fi
+    info "URL: https://${ACCESS_ADDRESS}"
+}
+
+command_stop() {
+    local already_stopped=0
+
+    require_root "stop"
+    require_appliance
+    require_docker
+    require_mdns_runtime
+    compose config --quiet || die "The appliance Compose configuration is invalid."
+
+    if ! container_is_running vaultwarden &&
+       ! container_is_running caddy &&
+       ! systemctl is-active --quiet "${MDNS_SERVICE}"; then
+        already_stopped=1
+        info "Vaultwarden, Caddy, and the mDNS publisher are already stopped."
+    else
+        info "Stopping the appliance mDNS advertisement..."
+        systemctl stop "${MDNS_SERVICE}" || \
+            die "The appliance mDNS publisher could not be stopped."
+        info "Stopping Caddy and Vaultwarden without removing containers..."
+        compose stop caddy vaultwarden || \
+            die "Docker Compose could not stop the appliance containers."
+    fi
+
+    if container_is_running vaultwarden || container_is_running caddy; then
+        die "One or more appliance containers are still running."
+    fi
+    if systemctl is-active --quiet "${MDNS_SERVICE}"; then
+        die "The appliance mDNS publisher is still active."
+    fi
+
+    if (( already_stopped == 1 )); then
+        info "No changes were needed."
+    else
+        info "Vaultwarden, Caddy, and the mDNS publisher are stopped."
+    fi
+    info "Containers, Docker network, persistent data, and Caddy CA data were preserved."
+    info "Avahi remains running for unrelated services."
+}
+
+command_version() {
+    local appliance_version="unavailable"
+    local caddy_image="unavailable"
+    local caddy_version=""
+    local compose_version="unavailable"
+    local docker_version="unavailable"
+    local vaultwarden_image="unavailable"
+    local vaultwarden_version=""
+    local -a version_lines
+
+    require_appliance
+
+    if [[ -f "${APPLIANCE_VERSION_FILE}" && ! -L "${APPLIANCE_VERSION_FILE}" ]]; then
+        mapfile -t version_lines < "${APPLIANCE_VERSION_FILE}"
+        if (( ${#version_lines[@]} == 1 )); then
+            appliance_version=${version_lines[0]}
+        fi
+    fi
+
+    if command_exists docker; then
+        docker_version=$(docker --version 2>/dev/null || printf 'unavailable')
+        compose_version=$(docker compose version --short 2>/dev/null || printf 'unavailable')
+        if docker info >/dev/null 2>&1; then
+            vaultwarden_image=$(configured_service_image vaultwarden || printf 'unavailable')
+            caddy_image=$(configured_service_image caddy || printf 'unavailable')
+            if container_is_running vaultwarden; then
+                vaultwarden_version=$(docker exec vaultwarden /vaultwarden --version 2>/dev/null |
+                    awk 'NF {print; exit}' || true)
+            fi
+            if container_is_running caddy; then
+                caddy_version=$(docker exec caddy caddy version 2>/dev/null |
+                    awk 'NF {print; exit}' || true)
+            fi
+        fi
+    fi
+
+    [[ -n "${vaultwarden_version}" ]] || vaultwarden_version=${vaultwarden_image:-unavailable}
+    [[ -n "${caddy_version}" ]] || caddy_version=${caddy_image:-unavailable}
+
+    printf '%-23s %s\n' 'Vaultwarden Appliance:' "${appliance_version}"
+    printf '%-23s %s\n' 'Vaultwarden:' "${vaultwarden_version}"
+    printf '%-23s %s\n' 'Caddy:' "${caddy_version}"
+    printf '%-23s %s\n' 'Docker:' "${docker_version}"
+    printf '%-23s %s\n' 'Docker Compose:' "${compose_version}"
+}
+
+check_service_update() {
+    local label=$1
+    local service=$2
+    local image
+    local local_digests
+    local remote_digest
+
+    image=$(configured_service_image "${service}" || true)
+    if [[ -z "${image}" ]]; then
+        printf '[WARN] %s: unable to determine the configured image\n' "${label}"
+        UPDATE_CHECK_UNDETERMINED=$((UPDATE_CHECK_UNDETERMINED + 1))
+        return
+    fi
+
+    local_digests=$(container_repo_digests "${service}" || true)
+    if [[ -z "${local_digests}" ]]; then
+        printf '[WARN] %s: unable to determine the running image digest (%s)\n' "${label}" "${image}"
+        UPDATE_CHECK_UNDETERMINED=$((UPDATE_CHECK_UNDETERMINED + 1))
+        return
+    fi
+
+    remote_digest=$(remote_image_digest "${image}" || true)
+    if [[ -z "${remote_digest}" ]]; then
+        printf '[WARN] %s: unable to retrieve remote image metadata (%s)\n' "${label}" "${image}"
+        UPDATE_CHECK_UNDETERMINED=$((UPDATE_CHECK_UNDETERMINED + 1))
+        return
+    fi
+
+    if grep -Fxq "${remote_digest}" <<<"${local_digests}"; then
+        printf '[ OK ] %s: up to date (%s)\n' "${label}" "${image}"
+    else
+        printf '[UPDATE] %s: update available (%s)\n' "${label}" "${image}"
+        printf '         local:  %s\n' "$(head -n 1 <<<"${local_digests}")"
+        printf '         remote: %s\n' "${remote_digest}"
+        UPDATE_CHECK_AVAILABLE=$((UPDATE_CHECK_AVAILABLE + 1))
+    fi
+}
+
+command_update_check() {
+    require_appliance
+    require_docker
+
+    printf 'Vaultwarden Appliance update check\n\n'
+    if ! docker buildx version >/dev/null 2>&1; then
+        printf '[WARN] Docker Buildx is unavailable; remote image metadata cannot be inspected.\n' >&2
+        return 1
+    fi
+
+    UPDATE_CHECK_AVAILABLE=0
+    UPDATE_CHECK_UNDETERMINED=0
+    check_service_update "Vaultwarden" vaultwarden
+    check_service_update "Caddy" caddy
+
+    if (( UPDATE_CHECK_UNDETERMINED > 0 )); then
+        printf '\nUpdate check: unable to determine %d image(s).\n' "${UPDATE_CHECK_UNDETERMINED}" >&2
+        return 1
+    fi
+    if (( UPDATE_CHECK_AVAILABLE > 0 )); then
+        printf '\nUpdate check: %d update(s) available.\n' "${UPDATE_CHECK_AVAILABLE}"
+    else
+        printf '\nUpdate check: all configured images are up to date.\n'
+    fi
 }
 
 command_update() {
@@ -1223,6 +1581,82 @@ command_cert_export() {
     info "No private CA key was copied."
 }
 
+certificate_query() {
+    local source_type=$1
+    local source=$2
+    shift 2
+
+    case "${source_type}" in
+        file) openssl x509 -in "${source}" "$@" ;;
+        pem) openssl x509 "$@" <<<"${source}" ;;
+        *) return 1 ;;
+    esac
+}
+
+print_certificate_details() {
+    local source_type=$1
+    local source=$2
+    local include_san=$3
+    local fingerprint
+    local issuer
+    local not_after
+    local not_before
+    local san=""
+    local subject
+
+    fingerprint=$(certificate_query "${source_type}" "${source}" -noout -sha256 -fingerprint) || return 1
+    subject=$(certificate_query "${source_type}" "${source}" -noout -subject) || return 1
+    issuer=$(certificate_query "${source_type}" "${source}" -noout -issuer) || return 1
+    not_before=$(certificate_query "${source_type}" "${source}" -noout -startdate) || return 1
+    not_after=$(certificate_query "${source_type}" "${source}" -noout -enddate) || return 1
+
+    printf '  SHA-256:   %s\n' "${fingerprint#*=}"
+    printf '  Subject:   %s\n' "${subject#subject=}"
+    printf '  Issuer:    %s\n' "${issuer#issuer=}"
+    printf '  Valid from:  %s\n' "${not_before#notBefore=}"
+    printf '  Valid until: %s\n' "${not_after#notAfter=}"
+
+    if [[ "${include_san}" == "yes" ]]; then
+        san=$(certificate_query "${source_type}" "${source}" -noout -ext subjectAltName 2>/dev/null |
+            awk 'NR > 1 {sub(/^[[:space:]]*/, ""); printf "%s%s", separator, $0; separator=" "}' || true)
+        printf '  SAN:       %s\n' "${san:-unavailable}"
+    fi
+}
+
+command_cert_info() {
+    local leaf_certificate
+
+    require_appliance
+    command_exists openssl || die "openssl is required for certificate information and was not found."
+    command_exists timeout || die "timeout is required for certificate information and was not found."
+    load_access_state || die "The appliance access state is missing or invalid."
+    (( ACCESS_NEEDS_MIGRATION == 0 )) || die "Obsolete access state detected. Rerun the appliance installer first."
+    [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || \
+        die "The exported Caddy root CA is missing at ${EXPORTED_ROOT_CA}."
+
+    printf 'Root CA:\n'
+    printf '  Path:      %s\n' "${EXPORTED_ROOT_CA}"
+    print_certificate_details file "${EXPORTED_ROOT_CA}" no || \
+        die "The exported Caddy root CA could not be parsed."
+
+    printf '\nServer certificate:\n'
+    printf '  Hostname:  %s\n' "${ACCESS_ADDRESS}"
+    leaf_certificate=$(timeout 10 openssl s_client \
+        -connect 127.0.0.1:443 \
+        -servername "${ACCESS_ADDRESS}" \
+        -verify_hostname "${ACCESS_ADDRESS}" \
+        -verify_return_error \
+        -CAfile "${EXPORTED_ROOT_CA}" </dev/null 2>/dev/null |
+        openssl x509 -outform PEM 2>/dev/null) || \
+        die "Unable to obtain and validate the live HTTPS server certificate for ${ACCESS_ADDRESS}."
+    [[ -n "${leaf_certificate}" ]] || \
+        die "The live HTTPS endpoint did not provide a server certificate."
+    print_certificate_details pem "${leaf_certificate}" yes || \
+        die "The HTTPS server certificate could not be parsed."
+
+    info "No private CA or server key was accessed."
+}
+
 main() {
     local command=${1:-help}
 
@@ -1235,13 +1669,30 @@ main() {
             (( $# == 1 )) || die "Usage: vwctl status"
             command_status
             ;;
+        health)
+            (( $# == 1 )) || die "Usage: vwctl health"
+            command_health
+            ;;
         logs)
             (( $# <= 2 )) || die "Usage: vwctl logs [vaultwarden|caddy]"
             command_logs "${2:-}"
             ;;
+        start)
+            (( $# == 1 )) || die "Usage: sudo vwctl start"
+            command_start
+            ;;
+        stop)
+            (( $# == 1 )) || die "Usage: sudo vwctl stop"
+            command_stop
+            ;;
         update)
-            (( $# == 1 )) || die "Usage: sudo vwctl update"
-            command_update
+            if (( $# == 1 )); then
+                command_update
+            elif [[ "${2:-}" == "check" && $# == 2 ]]; then
+                command_update_check
+            else
+                die "Usage: sudo vwctl update | vwctl update check"
+            fi
             ;;
         restart)
             (( $# == 1 )) || die "Usage: sudo vwctl restart"
@@ -1251,13 +1702,22 @@ main() {
             (( $# <= 2 )) || die "Usage: sudo vwctl access [hostname]"
             command_access "${2:-}"
             ;;
+        version)
+            (( $# == 1 )) || die "Usage: vwctl version"
+            command_version
+            ;;
         signup)
             (( $# == 2 )) || die "Usage: vwctl signup status | sudo vwctl signup on|off"
             command_signup "${2}"
             ;;
         cert)
-            [[ "${2:-}" == "export" && $# == 2 ]] || die "Usage: sudo vwctl cert export"
-            command_cert_export
+            if [[ "${2:-}" == "export" && $# == 2 ]]; then
+                command_cert_export
+            elif [[ "${2:-}" == "info" && $# == 2 ]]; then
+                command_cert_info
+            else
+                die "Usage: vwctl cert info | sudo vwctl cert export"
+            fi
             ;;
         *)
             die "Unknown command '${command}'. Run 'vwctl help'."

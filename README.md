@@ -81,16 +81,45 @@ The installer copies `vwctl` to `/usr/local/bin/vwctl`:
 ```bash
 vwctl help
 vwctl status
+vwctl health
 vwctl logs [vaultwarden|caddy]
+sudo vwctl start
+sudo vwctl stop
 sudo vwctl update
+vwctl update check
 sudo vwctl restart
 sudo vwctl access
 sudo vwctl access hostname
+vwctl version
 vwctl signup status
 sudo vwctl signup on
 sudo vwctl signup off
+vwctl cert info
 sudo vwctl cert export
 ```
+
+`vwctl health` performs read-only checks of Docker, both containers and their
+ports/network, mDNS, HTTPS with the exported root CA, persistent public CA
+consistency, data directories, and free disk space. It reports every failed
+check and exits non-zero if the appliance is not healthy.
+
+`sudo vwctl start` starts existing appliance containers without unnecessarily
+recreating them and starts the appliance mDNS publisher. `sudo vwctl stop`
+stops both containers and that publisher without removing containers, the
+Docker network, persistent data, or Caddy CA data. Avahi itself remains
+running.
+
+`vwctl version` reads the appliance version installed from the repository's
+single `VERSION` file and reports available component versions or configured
+images. `vwctl update check` reads remote container manifest metadata without
+pulling an image or changing running containers; `sudo vwctl update` remains
+the command that applies updates. `vwctl cert info` reads the exported public
+root certificate and the live HTTPS leaf certificate. It never reads private
+keys.
+
+Read-only commands can run without `sudo` when the user has access to Docker.
+Commands that change appliance state require root and print the exact `sudo`
+command when invoked without it.
 
 `sudo vwctl access` and `sudo vwctl access hostname` change only the local
 `.local` name. After validation, conflict detection, and confirmation, `vwctl`
@@ -128,10 +157,14 @@ successful publisher exit into a service failure.
 
 ## Basic verification
 
-After installation:
+After installation, a concise end-to-end check is:
 
 ```bash
-sudo vwctl status
+vwctl version
+vwctl status
+vwctl health
+vwctl cert info
+vwctl update check
 systemctl is-active avahi-daemon
 systemctl is-active vaultwarden-appliance-mdns
 avahi-resolve-host-name -4 vaultwarden.local

@@ -444,13 +444,19 @@ Phase 4 provides:
 
 ```bash
 vwctl status
+vwctl health
 vwctl logs [vaultwarden|caddy]
+sudo vwctl start
+sudo vwctl stop
 sudo vwctl update
+vwctl update check
 sudo vwctl restart
 sudo vwctl access [hostname]
+vwctl version
 vwctl signup status
 sudo vwctl signup on
 sudo vwctl signup off
+vwctl cert info
 sudo vwctl cert export
 ```
 
@@ -474,6 +480,13 @@ system or prune Docker images.
 
 An update MUST NOT silently destroy existing data or configuration.
 
+`vwctl update check` is read-only. It obtains each running container's local
+repository digest and compares it with the configured image reference's remote
+manifest digest using Docker Buildx. It does not pull images, recreate or
+restart containers, update Debian, or prune anything. Results distinguish an
+up-to-date image, an apparently available update, and metadata that could not
+be determined. Registry access and Docker Buildx are required for this check.
+
 ### 12.2 Status
 
 `vwctl status` presents human-readable Vaultwarden and Caddy state, configured
@@ -493,16 +506,41 @@ Signup:            enabled
 Root CA:           /opt/vaultwarden/certs/caddy-root-ca.crt
 ```
 
-### 12.3 Logs and Restart
+### 12.3 Health
+
+`vwctl health` runs independent, read-only checks and reports every failure
+before returning a non-zero status. It verifies Docker daemon and Compose v2
+access; that Vaultwarden and Caddy exist, run, use the
+`vaultwarden-appliance` network and publish only their intended ports; that
+Avahi and the appliance mDNS publisher are active; that the ready file and
+`.local` resolution match the detected LAN IPv4 address; that `/alive`
+validates with the exported Caddy root CA; that the export matches Caddy's
+persistent public root certificate; and that both data directories exist with
+at least 2048 MiB of free space.
+
+The check does not modify the system. A user without access to Docker's Unix
+socket may run it with `sudo`, although it is otherwise a read-only command.
+
+### 12.4 Logs, Start, Stop and Restart
 
 `vwctl logs` shows the last 100 lines from both services without following
 indefinitely. An optional `vaultwarden` or `caddy` argument selects one service.
+
+`sudo vwctl start` uses the existing Compose configuration to start
+Vaultwarden and Caddy with `--no-recreate`, starts the appliance mDNS publisher
+and verifies the containers, network, mDNS and HTTPS endpoint. It is safe when
+services are already running.
+
+`sudo vwctl stop` stops the appliance mDNS publisher followed by Caddy and
+Vaultwarden. It verifies that all three are inactive. It does not remove
+containers, the Docker network, persistent data, or Caddy CA data, and it
+leaves `avahi-daemon` running for unrelated services.
 
 `sudo vwctl restart` force-recreates only the two appliance containers using
 the existing Compose configuration and persistent bind mounts, then verifies
 both containers and HTTPS. It preserves the internal root CA.
 
-### 12.4 Access Configuration
+### 12.5 Access Configuration
 
 `sudo vwctl access` and `sudo vwctl access hostname` both prompt for a new local
 `.local` hostname, validate it, check for a conflicting mDNS advertisement and
@@ -538,7 +576,7 @@ leaves the generated Caddyfile and authoritative hostname state in place for
 inspection. Vaultwarden remains running, and the administrator can correct the
 reported problem and rerun `sudo vwctl access hostname`.
 
-### 12.5 Signup Management
+### 12.6 Signup Management
 
 Signup changes use the appliance-managed override file:
 
@@ -552,37 +590,35 @@ file. Compose recreates Vaultwarden only when required and the resulting
 container environment is verified. On failure, the previous override and
 signup state are restored.
 
-### 12.6 Root CA Export
+### 12.7 Version Information
+
+The repository's `VERSION` file is the single authoritative appliance version
+source. The installer validates it and copies it to the non-secret runtime
+state file `/opt/vaultwarden/.appliance-version`. The initial development
+version is `0.1.0-dev`; it does not claim a stable release.
+
+`vwctl version` reports that appliance version, running Vaultwarden and Caddy
+versions where they can be queried reliably, and Docker and Docker Compose
+versions. When a container runtime version is unavailable, it reports the
+configured image reference instead of guessing.
+
+### 12.8 Certificate Information and Root CA Export
+
+`vwctl cert info` uses OpenSSL to show the exported public root CA path,
+SHA-256 fingerprint, subject, issuer and validity period. It obtains the live
+HTTPS leaf certificate for the configured `.local` name through TCP 443,
+validates it with the exported root CA and hostname, and reports its SHA-256
+fingerprint, subject, issuer, validity period and subject alternative names.
+The command fails clearly if OpenSSL is unavailable or the endpoint cannot be
+validated. It never reads or displays a private key.
 
 `sudo vwctl cert export` atomically refreshes only the public certificate at
 `/opt/vaultwarden/certs/caddy-root-ca.crt`, sets readable permissions and
 verifies it byte-for-byte against Caddy's persistent public root certificate.
 Private CA keys are never read or exported.
 
-### 12.7 Future Diagnostics
-
-A diagnostic command remains desirable in a later phase:
-
-```bash
-vwctl doctor
-```
-
-Possible checks:
-
-```text
-Docker                 ✓
-Docker Compose         ✓
-Vaultwarden            ✓
-Caddy                  ✓
-HTTPS                  ✓
-Database               ✓
-Disk space             ✓
-USB backup target      ✓
-Last backup            ✓
-Backup integrity       ✓
-```
-
-`vwctl doctor` is a SHOULD requirement rather than part of Phase 4.
+Future backup-specific diagnostics remain part of later phases and are not
+included in `vwctl health` yet.
 
 ---
 
