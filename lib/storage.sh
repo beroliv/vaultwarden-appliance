@@ -11,8 +11,20 @@ storage_valid_device_path() {
        "${path}" != */. && "${path}" != */.. ]]
 }
 
+storage_sysfs_disk_is_device_backed() {
+    local major_minor=$1
+    local sysfs_path
+
+    [[ "${major_minor}" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+    command_exists readlink || return 1
+    sysfs_path=$(readlink -f -- "/sys/dev/block/${major_minor}" 2>/dev/null) || return 1
+    [[ "${sysfs_path}" == /sys/devices/* &&
+       "${sysfs_path}" != /sys/devices/virtual/* ]]
+}
+
 storage_validate_inventory() {
     local inventory=$1
+    local device_backed
     local extra
     local major_minor
     local name
@@ -24,7 +36,7 @@ storage_validate_inventory() {
     local -A node_metadata=()
 
     [[ -n "${inventory}" ]] || return 1
-    while IFS='|' read -r name parent type major_minor size read_only extra; do
+    while IFS='|' read -r name parent type major_minor size read_only device_backed extra; do
         [[ -z "${extra:-}" ]] || return 1
         storage_valid_device_path "${name}" || return 1
         [[ -z "${parent}" ]] || storage_valid_device_path "${parent}" || return 1
@@ -32,15 +44,17 @@ storage_validate_inventory() {
         [[ "${major_minor}" =~ ^[0-9]+:[0-9]+$ ]] || return 1
         [[ "${size}" =~ ^[0-9]+$ ]] || return 1
         [[ "${read_only}" == "0" || "${read_only}" == "1" ]] || return 1
+        [[ "${device_backed}" == "0" || "${device_backed}" == "1" ]] || return 1
+        [[ "${type}" == "disk" || "${device_backed}" == "0" ]] || return 1
         if [[ -n "${node_metadata[${name}]:-}" &&
-              "${node_metadata[${name}]}" != "${type}|${major_minor}|${size}|${read_only}" ]]; then
+              "${node_metadata[${name}]}" != "${type}|${major_minor}|${size}|${read_only}|${device_backed}" ]]; then
             return 1
         fi
         known_nodes["${name}"]=1
-        node_metadata["${name}"]="${type}|${major_minor}|${size}|${read_only}"
+        node_metadata["${name}"]="${type}|${major_minor}|${size}|${read_only}|${device_backed}"
     done <<<"${inventory}"
 
-    while IFS='|' read -r name parent type major_minor size read_only extra; do
+    while IFS='|' read -r name parent type major_minor size read_only device_backed extra; do
         if [[ -n "${parent}" && -z "${known_nodes[${parent}]:-}" ]]; then
             return 1
         fi
@@ -54,6 +68,7 @@ storage_inventory_node_field() {
     local inventory=$1
     local requested_node=$2
     local field=$3
+    local device_backed
     local extra
     local major_minor
     local name
@@ -65,13 +80,14 @@ storage_inventory_node_field() {
     local value
 
     storage_validate_inventory "${inventory}" || return 1
-    while IFS='|' read -r name parent type major_minor size read_only extra; do
+    while IFS='|' read -r name parent type major_minor size read_only device_backed extra; do
         [[ "${name}" == "${requested_node}" ]] || continue
         case "${field}" in
             type) value=${type} ;;
             major_minor) value=${major_minor} ;;
             size) value=${size} ;;
             read_only) value=${read_only} ;;
+            device_backed) value=${device_backed} ;;
             *) return 1 ;;
         esac
         if [[ -n "${result}" && "${result}" != "${value}" ]]; then
@@ -86,6 +102,7 @@ storage_inventory_node_field() {
 storage_inventory_parents() {
     local inventory=$1
     local requested_node=$2
+    local device_backed
     local extra
     local major_minor
     local name
@@ -96,7 +113,7 @@ storage_inventory_parents() {
     local -A parents=()
 
     storage_validate_inventory "${inventory}" || return 1
-    while IFS='|' read -r name parent type major_minor size read_only extra; do
+    while IFS='|' read -r name parent type major_minor size read_only device_backed extra; do
         [[ "${name}" == "${requested_node}" && -n "${parent}" ]] || continue
         parents["${parent}"]=1
     done <<<"${inventory}"
@@ -107,6 +124,7 @@ storage_inventory_parents() {
 storage_inventory_node_by_major_minor() {
     local inventory=$1
     local requested_major_minor=$2
+    local device_backed
     local extra
     local major_minor
     local name
@@ -118,7 +136,7 @@ storage_inventory_node_by_major_minor() {
 
     [[ "${requested_major_minor}" =~ ^[0-9]+:[0-9]+$ ]] || return 1
     storage_validate_inventory "${inventory}" || return 1
-    while IFS='|' read -r name parent type major_minor size read_only extra; do
+    while IFS='|' read -r name parent type major_minor size read_only device_backed extra; do
         [[ "${major_minor}" == "${requested_major_minor}" ]] || continue
         matches["${name}"]=1
     done <<<"${inventory}"
@@ -212,6 +230,7 @@ storage_protected_disks_from_mounts() {
 storage_candidate_disks() {
     local inventory=$1
     local protected=$2
+    local device_backed
     local disk
     local extra
     local major_minor
@@ -237,15 +256,16 @@ storage_candidate_disks() {
     # Any real block-composition node with an unresolved ancestry makes the
     # topology questionable. Pseudo devices are never candidates and need no
     # physical-parent resolution.
-    while IFS='|' read -r name parent type major_minor size read_only extra; do
+    while IFS='|' read -r name parent type major_minor size read_only device_backed extra; do
         case "${type}" in
             disk|loop|rom|ram|zram) ;;
             *) storage_resolve_physical_disks "${inventory}" "${name}" >/dev/null || return 1 ;;
         esac
     done <<<"${inventory}"
 
-    while IFS='|' read -r name parent type major_minor size read_only extra; do
-        [[ "${type}" == "disk" && "${read_only}" == "0" ]] || continue
+    while IFS='|' read -r name parent type major_minor size read_only device_backed extra; do
+        [[ "${type}" == "disk" && "${device_backed}" == "1" &&
+           "${read_only}" == "0" ]] || continue
         (( size > 0 )) || continue
         [[ -z "${protected_disks[${name}]:-}" ]] || continue
         candidates["${name}"]=1
@@ -279,6 +299,7 @@ storage_format_bytes() {
 }
 
 storage_collect_topology() {
+    local device_backed
     local initial=""
     local inventory=""
     local major_minor
@@ -330,6 +351,14 @@ storage_collect_topology() {
         major_minor=${node_major_minor[${index}]}
         size=${node_sizes[${index}]}
         read_only=${node_read_only[${index}]}
+        device_backed=0
+        # lsblk also reports virtual disks such as zram as TYPE=disk. Resolve
+        # the kernel devpath so only non-virtual, device-backed whole disks can
+        # become candidates; the transport value is intentionally irrelevant.
+        if [[ "${type}" == "disk" ]] &&
+           storage_sysfs_disk_is_device_backed "${major_minor}"; then
+            device_backed=1
+        fi
         topology_parents=()
         slaves_directory="/sys/dev/block/${major_minor}/slaves"
 
@@ -355,10 +384,10 @@ storage_collect_topology() {
         fi
 
         if ((${#topology_parents[@]} == 0)); then
-            inventory+="${name}||${type}|${major_minor}|${size}|${read_only}"$'\n'
+            inventory+="${name}||${type}|${major_minor}|${size}|${read_only}|${device_backed}"$'\n'
         else
             for parent in "${topology_parents[@]}"; do
-                inventory+="${name}|${parent}|${type}|${major_minor}|${size}|${read_only}"$'\n'
+                inventory+="${name}|${parent}|${type}|${major_minor}|${size}|${read_only}|${device_backed}"$'\n'
             done
         fi
     done
@@ -417,6 +446,7 @@ storage_lsblk_property() {
 storage_disk_nodes() {
     local inventory=$1
     local requested_disk=$2
+    local device_backed
     local extra
     local major_minor
     local name
@@ -428,7 +458,7 @@ storage_disk_nodes() {
 
     [[ "$(storage_inventory_node_field "${inventory}" "${requested_disk}" type)" == "disk" ]] || return 1
     printf '%s\n' "${requested_disk}"
-    while IFS='|' read -r name parent type major_minor size read_only extra; do
+    while IFS='|' read -r name parent type major_minor size read_only device_backed extra; do
         [[ "${name}" != "${requested_disk}" ]] || continue
         resolved=$(storage_resolve_physical_disks "${inventory}" "${name}" 2>/dev/null) || continue
         grep -Fxq "${requested_disk}" <<<"${resolved}" && printf '%s\n' "${name}"
