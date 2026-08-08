@@ -6,10 +6,25 @@ set -o pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly SCRIPT_DIR
+readonly LIB_SOURCE_DIR="${SCRIPT_DIR}/lib"
+readonly LIB_TARGET_DIR="/usr/local/lib/vaultwarden-appliance"
+
+for library in common network docker caddy mdns; do
+    library_path="${LIB_SOURCE_DIR}/${library}.sh"
+    if [[ ! -f "${library_path}" || -L "${library_path}" ]]; then
+        printf '[FAIL] Required installer library is missing or unsafe: %s\n' "${library_path}" >&2
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    . "${library_path}"
+done
+unset library library_path
+
 readonly INSTALL_DIR="/opt/vaultwarden"
 readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
+readonly BASE_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
+readonly VWCTL_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.vwctl.yml"
 readonly CADDY_ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
-readonly CADDY_HOSTNAME_FILE="${INSTALL_DIR}/.caddy-hostname"
 readonly CADDYFILE="${INSTALL_DIR}/Caddyfile"
 readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
 readonly CADDY_DATA_DIR="${INSTALL_DIR}/data/caddy/data"
@@ -20,6 +35,7 @@ readonly VWCTL_SOURCE="${SCRIPT_DIR}/vwctl"
 readonly VWCTL_TARGET="/usr/local/bin/vwctl"
 readonly VERSION_SOURCE="${SCRIPT_DIR}/VERSION"
 readonly VERSION_TARGET="${INSTALL_DIR}/.appliance-version"
+readonly OPERATION_LOCK="/run/lock/vaultwarden-appliance.lock"
 readonly DEFAULT_MDNS_HOSTNAME="vaultwarden.local"
 readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
 readonly MDNS_SERVICE_FILE="/etc/systemd/system/vaultwarden-appliance-mdns.service"
@@ -43,8 +59,6 @@ DOCKER_GROUP_CHANGED=0
 APPLIANCE_STATE="fresh"
 CADDY_STATE="absent"
 CADDY_ACCESS_ADDRESS=""
-CADDY_ACCESS_NEEDS_MIGRATION=0
-LEGACY_IP_ADDRESS=""
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -66,10 +80,6 @@ error() {
 
 section() {
     printf '\n%s\n' "$*"
-}
-
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
 }
 
 check_operating_system() {
@@ -127,6 +137,25 @@ check_architecture() {
     esac
 }
 
+check_required_basic_tools() {
+    local command
+    local -a missing=()
+
+    section "Required basic tools"
+    for command in curl ip timeout sha256sum cmp flock; do
+        if ! command_exists "${command}"; then
+            missing+=("${command}")
+        fi
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        error "Required command(s) missing: ${missing[*]}."
+        info "On Debian install the corresponding packages: curl iproute2 coreutils diffutils util-linux."
+        return
+    fi
+    ok "Required networking, verification, comparison, and locking tools are available."
+}
+
 check_disk_space() {
     local check_path="/"
     local available_kb
@@ -138,7 +167,10 @@ check_disk_space() {
         check_path="/opt"
     fi
 
-    available_kb=$(df -Pk "${check_path}" 2>/dev/null | awk 'NR == 2 {print $4}')
+    if ! available_kb=$(df -Pk "${check_path}" 2>/dev/null | awk 'NR == 2 {print $4}'); then
+        error "Unable to determine free disk space for ${INSTALL_DIR}."
+        return
+    fi
 
     if [[ ! "${available_kb}" =~ ^[0-9]+$ ]]; then
         error "Unable to determine free disk space for ${INSTALL_DIR}."
@@ -153,28 +185,6 @@ check_disk_space() {
     else
         ok "Disk-space check passed (minimum ${MIN_DISK_SPACE_MB} MiB)."
     fi
-}
-
-legacy_phase2_structure_matches() {
-    local compose_config
-    local images
-    local networks
-    local services
-
-    [[ -f "${INSTALL_DIR}/docker-compose.yml" ]] || return 1
-    [[ -d "${INSTALL_DIR}/data/vaultwarden" ]] || return 1
-    command_exists docker || return 1
-    docker compose version >/dev/null 2>&1 || return 1
-
-    services=$(docker compose --project-directory "${INSTALL_DIR}" config --services 2>/dev/null) || return 1
-    images=$(docker compose --project-directory "${INSTALL_DIR}" config --images 2>/dev/null) || return 1
-    networks=$(docker compose --project-directory "${INSTALL_DIR}" config --networks 2>/dev/null) || return 1
-    compose_config=$(docker compose --project-directory "${INSTALL_DIR}" config 2>/dev/null) || return 1
-
-    [[ "${services}" == "vaultwarden" ]] || return 1
-    [[ "${images}" =~ ^vaultwarden/server(:[^[:space:]]+|@sha256:[[:xdigit:]]+)$ ]] || return 1
-    [[ "${networks}" == "appliance" ]] || return 1
-    grep -Eq '^[[:space:]]+name:[[:space:]]+vaultwarden-appliance[[:space:]]*$' <<<"${compose_config}"
 }
 
 check_existing_installation() {
@@ -192,94 +202,13 @@ check_existing_installation() {
         return
     fi
 
-    if legacy_phase2_structure_matches; then
-        APPLIANCE_STATE="legacy"
-        ok "Legacy Phase 2 appliance installation detected."
-        info "A marker will be added after the preflight without changing appliance data or configuration."
-        return
-    fi
-
     APPLIANCE_STATE="unknown"
-    error "${INSTALL_DIR} exists without a valid appliance marker or recognized Phase 2 structure."
+    error "${INSTALL_DIR} exists without a valid appliance marker."
     info "The existing directory will not be modified."
 }
 
-validate_local_hostname() {
-    local hostname=$1
-
-    (( ${#hostname} <= 69 )) || return 1
-    [[ "${hostname}" == "${hostname,,}" ]] || return 1
-    [[ "${hostname}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.local$ ]]
-}
-
-validate_ipv4_address() {
-    local address=$1
-    local octet
-    local -a octets
-
-    [[ "${address}" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
-    IFS='.' read -r -a octets <<<"${address}"
-    (( ${#octets[@]} == 4 )) || return 1
-
-    for octet in "${octets[@]}"; do
-        (( ${#octet} <= 3 )) || return 1
-        (( 10#${octet} <= 255 )) || return 1
-    done
-
-    [[ "${address}" != "0.0.0.0" && "${address}" != "255.255.255.255" ]]
-}
-
-load_caddy_access_state() {
-    local address
-    local mode
-    local -a lines
-
-    mapfile -t lines < "${CADDY_ACCESS_FILE}"
-
-    if (( ${#lines[@]} == 1 )) && [[ "${lines[0]}" == hostname=* ]]; then
-        address=${lines[0]#hostname=}
-        validate_local_hostname "${address}" || return 1
-        CADDY_ACCESS_ADDRESS=${address}
-        return 0
-    fi
-
-    (( ${#lines[@]} == 2 )) || return 1
-    [[ "${lines[0]}" == mode=* && "${lines[1]}" == address=* ]] || return 1
-    mode=${lines[0]#mode=}
-    address=${lines[1]#address=}
-
-    case "${mode}" in
-        hostname)
-            if validate_local_hostname "${address}"; then
-                CADDY_ACCESS_ADDRESS=${address}
-                CADDY_ACCESS_NEEDS_MIGRATION=1
-            else
-                CADDY_ACCESS_NEEDS_MIGRATION=2
-            fi
-            ;;
-        ip)
-            validate_ipv4_address "${address}" || return 1
-            LEGACY_IP_ADDRESS=${address}
-            CADDY_ACCESS_NEEDS_MIGRATION=2
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-create_caddy_access_state() {
-    if ! (set -o noclobber; printf 'hostname=%s\n' \
-        "${CADDY_ACCESS_ADDRESS}" > "${CADDY_ACCESS_FILE}"); then
-        error "Unable to create ${CADDY_ACCESS_FILE}."
-        return 1
-    fi
-
-    chmod 0644 "${CADDY_ACCESS_FILE}"
-}
-
 detect_caddy_configuration() {
-    local -a hostname_lines
+    local parsed_address=""
     local core_files=0
 
     section "Caddy configuration"
@@ -291,71 +220,42 @@ detect_caddy_configuration() {
         core_files=$((core_files + 1))
     fi
 
-    if (( core_files == 0 )) && \
-       [[ ! -e "${CADDY_ACCESS_FILE}" && ! -e "${CADDY_HOSTNAME_FILE}" ]]; then
+    if (( core_files == 0 )) && [[ ! -e "${CADDY_ACCESS_FILE}" ]]; then
         CADDY_STATE="absent"
         info "Caddy is not configured yet."
         return
     fi
 
-    if (( core_files != 2 )) || \
-       [[ ! -f "${CADDYFILE}" || -L "${CADDYFILE}" ]] || \
-       [[ ! -f "${CADDY_COMPOSE_FILE}" || -L "${CADDY_COMPOSE_FILE}" ]] || \
-       [[ ! -d "${CADDY_DATA_DIR}" || ! -d "${CADDY_CONFIG_DIR}" ]]; then
-        error "A partial or unrecognized Caddy configuration exists under ${INSTALL_DIR}; it will not be overwritten."
+    if [[ -e "${CADDY_ACCESS_FILE}" ]]; then
+        if ! parsed_address=$(read_access_hostname "${CADDY_ACCESS_FILE}"); then
+            error "The stored Caddy access state is missing or invalid; existing Caddy files will not be changed."
+            return
+        fi
+        CADDY_ACCESS_ADDRESS=${parsed_address}
+    else
+        if [[ -e "${CADDYFILE}" ]]; then
+            if ! parsed_address=$(read_caddyfile_hostname "${CADDYFILE}"); then
+                error "The partial Caddyfile does not contain one valid appliance .local hostname."
+                return
+            fi
+            CADDY_ACCESS_ADDRESS=${parsed_address}
+            info "Recovered the selected hostname from the appliance Caddyfile: ${CADDY_ACCESS_ADDRESS}."
+        fi
+        CADDY_STATE="partial"
+        info "Appliance-owned partial Caddy configuration detected; missing files will be reconciled."
         return
     fi
 
-    if [[ -e "${CADDY_ACCESS_FILE}" ]]; then
-        if [[ ! -f "${CADDY_ACCESS_FILE}" || -L "${CADDY_ACCESS_FILE}" ]] || \
-           ! load_caddy_access_state; then
-            error "The stored Caddy access state is missing or invalid; existing Caddy files will not be changed."
-            return
-        fi
-
-        if [[ -e "${CADDY_HOSTNAME_FILE}" ]]; then
-            if [[ ! -f "${CADDY_HOSTNAME_FILE}" || -L "${CADDY_HOSTNAME_FILE}" ]]; then
-                error "The legacy Caddy hostname state is not a regular file; existing Caddy files will not be changed."
-                return
-            fi
-            mapfile -t hostname_lines < "${CADDY_HOSTNAME_FILE}"
-            if (( CADDY_ACCESS_NEEDS_MIGRATION == 2 )) || \
-               (( ${#hostname_lines[@]} != 1 )) || \
-               [[ "${hostname_lines[0]}" != "${CADDY_ACCESS_ADDRESS}" ]]; then
-                error "The current and legacy Caddy access state disagree; existing Caddy files will not be changed."
-                return
-            fi
-            CADDY_ACCESS_NEEDS_MIGRATION=1
-        fi
+    if (( core_files == 2 )) && \
+       [[ -f "${CADDYFILE}" && ! -L "${CADDYFILE}" ]] && \
+       [[ -f "${CADDY_COMPOSE_FILE}" && ! -L "${CADDY_COMPOSE_FILE}" ]]; then
+        CADDY_STATE="configured"
+        ok "Existing Caddy configuration detected."
     else
-        if [[ ! -f "${CADDY_HOSTNAME_FILE}" || -L "${CADDY_HOSTNAME_FILE}" ]]; then
-            error "The stored Caddy access state is missing or invalid; existing Caddy files will not be changed."
-            return
-        fi
-
-        mapfile -t hostname_lines < "${CADDY_HOSTNAME_FILE}"
-        if (( ${#hostname_lines[@]} != 1 )); then
-            error "The stored Caddy hostname is missing or invalid; existing Caddy files will not be changed."
-            return
-        fi
-
-        if validate_local_hostname "${hostname_lines[0]}"; then
-            CADDY_ACCESS_ADDRESS=${hostname_lines[0]}
-            CADDY_ACCESS_NEEDS_MIGRATION=1
-            info "Legacy hostname access state detected; its .local HTTPS address will be preserved."
-        else
-            CADDY_ACCESS_NEEDS_MIGRATION=2
-        fi
+        CADDY_STATE="partial"
+        info "Appliance-owned partial Caddy configuration detected; missing files will be reconciled."
     fi
-
-    CADDY_STATE="configured"
-    ok "Existing Caddy configuration detected."
-    if (( CADDY_ACCESS_NEEDS_MIGRATION == 2 )); then
-        info "The existing non-mDNS access configuration will be migrated to a .local hostname."
-        [[ -z "${LEGACY_IP_ADDRESS}" ]] || info "Previous IP HTTPS address: ${LEGACY_IP_ADDRESS}"
-    else
-        info "Configured HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
-    fi
+    info "Configured HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
 }
 
 check_docker() {
@@ -383,44 +283,10 @@ check_docker() {
     fi
 }
 
-port_is_in_use() {
-    local port=$1
-    local port_hex
-
-    if command_exists ss; then
-        ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
-        return
-    fi
-
-    if command_exists netstat; then
-        netstat -ltn 2>/dev/null | awk -v port=":${port}" '$4 ~ port "$" {found=1} END {exit !found}'
-        return
-    fi
-
-    printf -v port_hex '%04X' "${port}"
-    awk -v port_hex="${port_hex}" '
-        $4 == "0A" {
-            split($2, address, ":")
-            if (address[2] == port_hex) {
-                found=1
-            }
-        }
-        END {exit !found}
-    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
-}
-
 caddy_owns_port_443() {
     [[ "${CADDY_STATE}" == "configured" ]] || return 1
     docker inspect --format '{{with (index .HostConfig.PortBindings "443/tcp")}}{{range .}}{{println .HostPort}}{{end}}{{end}}' caddy 2>/dev/null |
         grep -Fxq 443
-}
-
-container_is_connected_to_network() {
-    local container=$1
-    local network=$2
-
-    docker inspect --format '{{range $name, $settings := .NetworkSettings.Networks}}{{println $name}}{{end}}' "${container}" 2>/dev/null |
-        grep -Fxq "${network}"
 }
 
 check_ports() {
@@ -439,24 +305,12 @@ check_ports() {
     fi
 }
 
-detect_ipv4_address() {
+check_ipv4_address() {
     local candidate=""
 
     section "Network configuration"
 
-    if command_exists ip; then
-        candidate=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
-        if [[ -z "${candidate}" ]]; then
-            candidate=$(ip -o -4 addr show up scope global 2>/dev/null |
-                awk '$2 !~ /^(docker[0-9]*|br-|veth|virbr|podman|cni)/ {
-                    split($4, address, "/")
-                    print address[1]
-                    exit
-                }')
-        fi
-    fi
-
-    if validate_ipv4_address "${candidate}"; then
+    if candidate=$(detect_ipv4_address); then
         IPV4_ADDRESS=${candidate}
         ok "Detected LAN IPv4 address: ${IPV4_ADDRESS}"
     else
@@ -483,6 +337,23 @@ require_root() {
         error "Appliance installation must run as root. Re-run with sudo."
         return 1
     fi
+}
+
+acquire_operation_lock() {
+    local result=0
+
+    if acquire_appliance_lock "${OPERATION_LOCK}"; then
+        return 0
+    else
+        result=$?
+    fi
+
+    case "${result}" in
+        1) error "Another Vaultwarden Appliance operation is already running." ;;
+        2) error "flock is required for safe appliance operations; install the Debian util-linux package." ;;
+        *) error "Unable to create the root-owned appliance operation lock at ${OPERATION_LOCK}." ;;
+    esac
+    return 1
 }
 
 detect_docker_user() {
@@ -517,7 +388,10 @@ detect_docker_user() {
         return
     fi
 
-    canonical_user=$(getent passwd "${candidate_uid}" | awk -F: 'NR == 1 {print $1}')
+    if ! canonical_user=$(getent passwd "${candidate_uid}" 2>/dev/null | awk -F: 'NR == 1 {print $1}'); then
+        warn "Unable to look up UID ${candidate_uid}; Docker group configuration will be skipped."
+        return
+    fi
     if [[ "${canonical_user}" != "${candidate}" ]]; then
         warn "SUDO_USER '${candidate}' does not match the account name for UID ${candidate_uid}; Docker group configuration will be skipped."
         return
@@ -680,56 +554,180 @@ create_appliance_marker() {
     chmod 0644 "${APPLIANCE_MARKER}"
 }
 
+compose() {
+    local -a compose_command=(
+        docker compose
+        --project-directory "${INSTALL_DIR}"
+        --file "${BASE_COMPOSE_FILE}"
+    )
+
+    [[ -f "${CADDY_COMPOSE_FILE}" && ! -L "${CADDY_COMPOSE_FILE}" ]] &&
+        compose_command+=(--file "${CADDY_COMPOSE_FILE}")
+    [[ -f "${VWCTL_COMPOSE_FILE}" && ! -L "${VWCTL_COMPOSE_FILE}" ]] &&
+        compose_command+=(--file "${VWCTL_COMPOSE_FILE}")
+    "${compose_command[@]}" "$@"
+}
+
+compose_with_vaultwarden_candidate() {
+    local candidate=$1
+    shift
+    local -a compose_command=(
+        docker compose
+        --project-directory "${INSTALL_DIR}"
+        --file "${BASE_COMPOSE_FILE}"
+    )
+
+    [[ -f "${CADDY_COMPOSE_FILE}" && ! -L "${CADDY_COMPOSE_FILE}" ]] &&
+        compose_command+=(--file "${CADDY_COMPOSE_FILE}")
+    compose_command+=(--file "${candidate}")
+    "${compose_command[@]}" "$@"
+}
+
+write_base_compose_to() {
+    local destination=$1
+
+    printf '%s\n' \
+        'services:' \
+        '  vaultwarden:' \
+        '    image: vaultwarden/server:latest' \
+        '    container_name: vaultwarden' \
+        '    restart: unless-stopped' \
+        '    environment:' \
+        '      SIGNUPS_ALLOWED: "true"' \
+        '    volumes:' \
+        '      - ./data/vaultwarden:/data' \
+        '    networks:' \
+        '      - appliance' \
+        '' \
+        'networks:' \
+        '  appliance:' \
+        '    name: vaultwarden-appliance' > "${destination}" || return 1
+    chmod 0644 "${destination}"
+}
+
 create_appliance_files() {
+    local base_candidate
+
     section "Appliance files"
 
-    if [[ -e "${INSTALL_DIR}" ]]; then
+    if [[ "${APPLIANCE_STATE}" == "fresh" && -e "${INSTALL_DIR}" ]]; then
         error "${INSTALL_DIR} appeared during installation; refusing to overwrite it."
         return 1
     fi
 
-    install -d -m 0755 "${INSTALL_DIR}"
+    if [[ ! -e "${INSTALL_DIR}" ]]; then
+        install -d -m 0755 "${INSTALL_DIR}"
+    elif [[ ! -d "${INSTALL_DIR}" || -L "${INSTALL_DIR}" ]]; then
+        error "The appliance installation path is not a safe directory."
+        return 1
+    fi
+
+    if [[ -e "${INSTALL_DIR}/data/vaultwarden" &&
+          ( ! -d "${INSTALL_DIR}/data/vaultwarden" || -L "${INSTALL_DIR}/data/vaultwarden" ) ]]; then
+        error "The Vaultwarden data path is not a safe directory; it will not be changed."
+        return 1
+    fi
     install -d -m 0700 "${INSTALL_DIR}/data/vaultwarden"
 
-    cat > "${INSTALL_DIR}/docker-compose.yml" <<'COMPOSE'
-services:
-  vaultwarden:
-    image: vaultwarden/server:latest
-    container_name: vaultwarden
-    restart: unless-stopped
-    environment:
-      SIGNUPS_ALLOWED: "true"
-    volumes:
-      - ./data/vaultwarden:/data
-    networks:
-      - appliance
+    if [[ -e "${BASE_COMPOSE_FILE}" ]]; then
+        if [[ ! -f "${BASE_COMPOSE_FILE}" || -L "${BASE_COMPOSE_FILE}" ]]; then
+            error "The base Compose path is not a safe regular file."
+            return 1
+        fi
+        ok "Preserved the existing base Compose file and Vaultwarden data."
+    else
+        base_candidate=$(mktemp "${INSTALL_DIR}/.docker-compose.install.XXXXXXXX") || return 1
+        if ! write_base_compose_to "${base_candidate}" ||
+           ! mv -- "${base_candidate}" "${BASE_COMPOSE_FILE}"; then
+            rm -f -- "${base_candidate}"
+            error "Unable to create the base Compose configuration."
+            return 1
+        fi
+        ok "Created the missing base Compose configuration."
+    fi
 
-networks:
-  appliance:
-    name: vaultwarden-appliance
-COMPOSE
-    chmod 0644 "${INSTALL_DIR}/docker-compose.yml"
-    create_appliance_marker
-    ok "Created appliance files, persistent data directory, and marker."
+    if [[ "${APPLIANCE_STATE}" == "fresh" ]]; then
+        create_appliance_marker
+        APPLIANCE_STATE="existing"
+        ok "Created the appliance marker after initializing the appliance directory."
+    fi
+}
+
+current_signup_value() {
+    local configured=""
+    local environment=""
+
+    if container_exists vaultwarden; then
+        environment=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' vaultwarden \
+            2>/dev/null) || environment=""
+        configured=$(awk -F= '$1 == "SIGNUPS_ALLOWED" {print $2; found=1; exit} END {exit !found}' \
+            <<<"${environment}") || configured=""
+    fi
+    if [[ "${configured}" != "true" && "${configured}" != "false" ]]; then
+        configured=$(compose config 2>/dev/null |
+            awk '$1 == "SIGNUPS_ALLOWED:" {gsub(/"/, "", $2); print $2; found=1; exit} END {exit !found}') ||
+            configured=""
+    fi
+    [[ "${configured}" == "true" || "${configured}" == "false" ]] || configured="true"
+    printf '%s\n' "${configured}"
+}
+
+reconcile_vaultwarden_configuration() {
+    local candidate
+    local signup_value
+
+    section "Vaultwarden external URL"
+    signup_value=$(current_signup_value) || {
+        error "Unable to preserve the current signup setting."
+        return 1
+    }
+    candidate=$(mktemp "${INSTALL_DIR}/.docker-compose.vwctl.install.XXXXXXXX") || return 1
+    if ! write_vaultwarden_override_to "${candidate}" "${CADDY_ACCESS_ADDRESS}" "${signup_value}" ||
+       ! compose_with_vaultwarden_candidate "${candidate}" config --quiet; then
+        rm -f -- "${candidate}"
+        error "The managed Vaultwarden DOMAIN configuration is invalid."
+        return 1
+    fi
+
+    if [[ -e "${VWCTL_COMPOSE_FILE}" &&
+          ( ! -f "${VWCTL_COMPOSE_FILE}" || -L "${VWCTL_COMPOSE_FILE}" ) ]]; then
+        rm -f -- "${candidate}"
+        error "The managed Vaultwarden Compose path is not a safe regular file."
+        return 1
+    fi
+    if [[ -f "${VWCTL_COMPOSE_FILE}" ]] && cmp -s "${VWCTL_COMPOSE_FILE}" "${candidate}"; then
+        rm -f -- "${candidate}"
+        ok "Vaultwarden DOMAIN already matches https://${CADDY_ACCESS_ADDRESS}; no configuration change is needed."
+    else
+        mv -f -- "${candidate}" "${VWCTL_COMPOSE_FILE}"
+        ok "Set Vaultwarden DOMAIN to https://${CADDY_ACCESS_ADDRESS} while preserving the signup setting."
+    fi
 }
 
 deploy_vaultwarden() {
     section "Vaultwarden deployment"
 
-    if ! docker compose --project-directory "${INSTALL_DIR}" config --quiet; then
+    if ! compose config --quiet; then
         error "The generated Docker Compose configuration is invalid."
         return 1
     fi
 
-    docker compose --project-directory "${INSTALL_DIR}" pull vaultwarden
-    docker compose --project-directory "${INSTALL_DIR}" up -d vaultwarden
+    if ! docker image inspect vaultwarden/server:latest >/dev/null 2>&1; then
+        compose pull vaultwarden
+    fi
+    compose up -d vaultwarden
 
     if [[ "$(docker inspect --format '{{.State.Running}}' vaultwarden 2>/dev/null)" != "true" ]]; then
         error "Vaultwarden was created but is not running. Inspect it with: docker logs vaultwarden"
         return 1
     fi
 
-    ok "Vaultwarden is running without a host-published HTTP port."
+    if ! vaultwarden_domain_matches "${CADDY_ACCESS_ADDRESS}"; then
+        error "The running Vaultwarden DOMAIN does not match https://${CADDY_ACCESS_ADDRESS}."
+        return 1
+    fi
+
+    ok "Vaultwarden is running with the configured DOMAIN and without a host-published HTTP port."
 }
 
 package_is_installed() {
@@ -788,26 +786,6 @@ install_mdns_support() {
     ok "Avahi is installed and active."
 }
 
-mdns_resolved_ipv4s() {
-    local hostname=$1
-
-    timeout 4 avahi-resolve-host-name -4 "${hostname}" 2>/dev/null |
-        awk 'NF >= 2 && !seen[$2]++ {print $2}'
-}
-
-local_ipv4_addresses() {
-    command_exists ip || return 1
-    ip -o -4 addr show 2>/dev/null |
-        awk '{split($4, address, "/"); if (!seen[address[1]]++) print address[1]}'
-}
-
-mdns_resolution_matches() {
-    local expected=$1
-    local resolved=$2
-
-    [[ "${resolved}" == "${expected}" ]]
-}
-
 mdns_name_conflicts() {
     local hostname=$1
     local address
@@ -842,7 +820,7 @@ next_available_mdns_hostname() {
 }
 
 prompt_for_local_hostname() {
-    local default_hostname=${1:-${DEFAULT_MDNS_HOSTNAME}}
+    local default_hostname=${DEFAULT_MDNS_HOSTNAME}
     local answer=""
     local conflict_answer=""
     local suggestion=""
@@ -922,10 +900,6 @@ write_mdns_service_configuration() {
         return 1
     fi
 
-    if [[ -f "${MDNS_SERVICE_FILE}" && ! -L "${MDNS_SERVICE_FILE}" ]] &&
-       grep -Fq 'avahi-set-host-name' "${MDNS_SERVICE_FILE}"; then
-        info "Replacing the obsolete appliance mDNS hostname service."
-    fi
     if [[ -f "${MDNS_SERVICE_FILE}" && ! -L "${MDNS_SERVICE_FILE}" ]]; then
         systemctl stop "${MDNS_SERVICE}" || true
     fi
@@ -987,9 +961,7 @@ show_mdns_service_logs() {
 }
 
 mdns_service_is_ready() {
-    [[ -f "${MDNS_READY_FILE}" && ! -L "${MDNS_READY_FILE}" ]] || return 1
-    grep -Fxq "hostname=${CADDY_ACCESS_ADDRESS}" "${MDNS_READY_FILE}" &&
-        grep -Fxq "address=${IPV4_ADDRESS}" "${MDNS_READY_FILE}"
+    mdns_ready_file_matches "${MDNS_READY_FILE}" "${CADDY_ACCESS_ADDRESS}" "${IPV4_ADDRESS}"
 }
 
 verify_mdns() {
@@ -1044,150 +1016,106 @@ report_configured_caddy_access() {
     info "mDNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
 }
 
-write_caddyfile_to() {
-    local destination=$1
+reconcile_caddy_data_directories() {
+    local directory
 
-    cat > "${destination}" <<CADDY
-{
-	auto_https disable_redirects
-}
-
-https://${CADDY_ACCESS_ADDRESS} {
-	tls internal
-	reverse_proxy vaultwarden:80
-}
-CADDY
-    chmod 0644 "${destination}"
-}
-
-store_caddy_access_state() {
-    local candidate
-
-    candidate=$(mktemp "${INSTALL_DIR}/.caddy-access.install.XXXXXXXX") || return 1
-    if ! printf 'hostname=%s\n' "${CADDY_ACCESS_ADDRESS}" > "${candidate}" ||
-       ! chmod 0644 "${candidate}" ||
-       ! mv -f -- "${candidate}" "${CADDY_ACCESS_FILE}" ||
-       ! rm -f -- "${CADDY_HOSTNAME_FILE}"; then
-        rm -f -- "${candidate}"
-        return 1
-    fi
-}
-
-migrate_caddy_to_mdns() {
-    local caddy_candidate
-    local root_hash_after=""
-    local root_hash_before=""
-    local state_candidate
-
-    section "Hostname-only access migration"
-    command_exists sha256sum || {
-        error "sha256sum is required to verify preservation of Caddy's root CA."
-        return 1
-    }
-    if [[ -e "${CADDY_ROOT_CA}" && \
-          ( ! -f "${CADDY_ROOT_CA}" || -L "${CADDY_ROOT_CA}" ) ]]; then
-        error "Caddy's root CA path exists but is not a safe regular file."
-        return 1
-    fi
-    if [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]]; then
-        root_hash_before=$(sha256sum -- "${CADDY_ROOT_CA}" | awk 'NR == 1 {print $1}')
-    fi
-
-    caddy_candidate=$(mktemp "${INSTALL_DIR}/.Caddyfile.install.XXXXXXXX") || return 1
-    state_candidate=$(mktemp "${INSTALL_DIR}/.caddy-access.install.XXXXXXXX") || {
-        rm -f -- "${caddy_candidate}"
-        return 1
-    }
-    if ! write_caddyfile_to "${caddy_candidate}" ||
-       ! printf 'hostname=%s\n' "${CADDY_ACCESS_ADDRESS}" > "${state_candidate}" ||
-       ! chmod 0644 "${state_candidate}"; then
-        rm -f -- "${caddy_candidate}" "${state_candidate}"
-        error "Unable to generate the hostname-only Caddy configuration."
-        return 1
-    fi
-
-    info "Stopping and removing only the Caddy container. Vaultwarden remains running."
-    docker compose --project-directory "${INSTALL_DIR}" rm --stop --force caddy
-    mv -f -- "${caddy_candidate}" "${CADDYFILE}"
-    mv -f -- "${state_candidate}" "${CADDY_ACCESS_FILE}"
-    rm -f -- "${CADDY_HOSTNAME_FILE}"
-
-    docker compose --project-directory "${INSTALL_DIR}" config --quiet
-    docker compose --project-directory "${INSTALL_DIR}" up -d --no-deps caddy
-
-    if [[ -n "${root_hash_before}" ]]; then
-        root_hash_after=$(sha256sum -- "${CADDY_ROOT_CA}" 2>/dev/null | awk 'NR == 1 {print $1}')
-        if [[ "${root_hash_after}" != "${root_hash_before}" ]]; then
-            error "Caddy's persistent internal root CA changed unexpectedly during migration."
+    for directory in "${CADDY_DATA_DIR}" "${CADDY_CONFIG_DIR}"; do
+        if [[ -e "${directory}" && ( ! -d "${directory}" || -L "${directory}" ) ]]; then
+            error "The Caddy persistent path is not a safe directory: ${directory}."
             return 1
         fi
-        ok "Caddy's persistent internal root CA was preserved."
-    fi
-
-    CADDY_ACCESS_NEEDS_MIGRATION=0
-    ok "Migrated Caddy to hostname-only access at https://${CADDY_ACCESS_ADDRESS}."
+    done
+    install -d -m 0700 "${CADDY_DATA_DIR}" "${CADDY_CONFIG_DIR}"
 }
 
 create_caddy_configuration() {
+    local access_candidate
+    local caddy_candidate
+    local compose_candidate
+    local path
+
     section "Caddy configuration"
 
-    if [[ -e "${CADDY_ACCESS_FILE}" || -e "${CADDY_HOSTNAME_FILE}" || \
-          -e "${CADDYFILE}" || -e "${CADDY_COMPOSE_FILE}" ]]; then
-        error "Caddy configuration paths appeared during installation; refusing to overwrite them."
+    caddy_candidate=$(mktemp "${INSTALL_DIR}/.Caddyfile.install.XXXXXXXX") || return 1
+    compose_candidate=$(mktemp "${INSTALL_DIR}/.docker-compose.caddy.install.XXXXXXXX") || {
+        rm -f -- "${caddy_candidate}"
+        return 1
+    }
+    access_candidate=$(mktemp "${INSTALL_DIR}/.caddy-access.install.XXXXXXXX") || {
+        rm -f -- "${caddy_candidate}" "${compose_candidate}"
+        return 1
+    }
+
+    if ! write_caddyfile_to "${caddy_candidate}" "${CADDY_ACCESS_ADDRESS}" ||
+       ! printf '%s\n' \
+            'services:' \
+            '  caddy:' \
+            '    image: caddy:2' \
+            '    container_name: caddy' \
+            '    restart: unless-stopped' \
+            '    ports:' \
+            '      - "443:443/tcp"' \
+            '    volumes:' \
+            '      - ./Caddyfile:/etc/caddy/Caddyfile:ro' \
+            '      - ./data/caddy/data:/data' \
+            '      - ./data/caddy/config:/config' \
+            '    networks:' \
+            '      - appliance' > "${compose_candidate}" ||
+       ! printf 'hostname=%s\n' "${CADDY_ACCESS_ADDRESS}" > "${access_candidate}" ||
+       ! chmod 0644 "${compose_candidate}" "${access_candidate}"; then
+        rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
+        error "Unable to generate the appliance Caddy configuration."
         return 1
     fi
 
-    install -d -m 0700 "${CADDY_DATA_DIR}" "${CADDY_CONFIG_DIR}"
-
-    if ! write_caddyfile_to "${CADDYFILE}"; then
-        error "Unable to create ${CADDYFILE}."
+    for path in "${CADDYFILE}" "${CADDY_COMPOSE_FILE}" "${CADDY_ACCESS_FILE}"; do
+        if [[ -e "${path}" && ( ! -f "${path}" || -L "${path}" ) ]]; then
+            rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
+            error "The appliance Caddy path is unsafe: ${path}."
+            return 1
+        fi
+    done
+    if [[ -e "${CADDYFILE}" ]] && ! cmp -s "${CADDYFILE}" "${caddy_candidate}"; then
+        rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
+        error "The existing Caddyfile differs from the appliance-managed configuration; it will not be overwritten."
+        return 1
+    fi
+    if [[ -e "${CADDY_COMPOSE_FILE}" ]] && ! cmp -s "${CADDY_COMPOSE_FILE}" "${compose_candidate}"; then
+        rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
+        error "The existing Caddy Compose file differs from the appliance-managed configuration; it will not be overwritten."
+        return 1
+    fi
+    if [[ -e "${CADDY_ACCESS_FILE}" ]] && ! cmp -s "${CADDY_ACCESS_FILE}" "${access_candidate}"; then
+        rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
+        error "The existing Caddy access state disagrees with the selected hostname."
         return 1
     fi
 
-    if ! (set -o noclobber; cat > "${CADDY_COMPOSE_FILE}" <<'COMPOSE'
-services:
-  caddy:
-    image: caddy:2
-    container_name: caddy
-    restart: unless-stopped
-    ports:
-      - "443:443/tcp"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./data/caddy/data:/data
-      - ./data/caddy/config:/config
-    networks:
-      - appliance
-COMPOSE
-    ); then
-        error "Unable to create ${CADDY_COMPOSE_FILE}."
-        return 1
-    fi
-
-    chmod 0644 "${CADDYFILE}" "${CADDY_COMPOSE_FILE}"
-    create_caddy_access_state
+    if [[ -e "${CADDYFILE}" ]]; then rm -f -- "${caddy_candidate}"; else mv -- "${caddy_candidate}" "${CADDYFILE}"; fi
+    if [[ -e "${CADDY_COMPOSE_FILE}" ]]; then rm -f -- "${compose_candidate}"; else mv -- "${compose_candidate}" "${CADDY_COMPOSE_FILE}"; fi
+    if [[ -e "${CADDY_ACCESS_FILE}" ]]; then rm -f -- "${access_candidate}"; else mv -- "${access_candidate}" "${CADDY_ACCESS_FILE}"; fi
     CADDY_STATE="configured"
-    ok "Created Caddy configuration for https://${CADDY_ACCESS_ADDRESS}."
+    ok "Reconciled Caddy configuration for https://${CADDY_ACCESS_ADDRESS}."
 }
 
 deploy_caddy() {
     section "Caddy deployment"
 
-    if ! docker compose --project-directory "${INSTALL_DIR}" config --quiet; then
+    if ! compose config --quiet; then
         error "The combined Vaultwarden and Caddy Compose configuration is invalid."
         return 1
     fi
 
-    if ! docker compose --project-directory "${INSTALL_DIR}" config --services | grep -Fxq caddy; then
+    if ! compose config --services | grep -Fxq caddy; then
         error "The combined Compose configuration does not contain the Caddy service."
         return 1
     fi
 
     if ! docker image inspect caddy:2 >/dev/null 2>&1; then
-        docker compose --project-directory "${INSTALL_DIR}" pull caddy
+        compose pull caddy
     fi
 
-    docker compose --project-directory "${INSTALL_DIR}" up -d caddy
+    compose up -d caddy
     ok "Caddy deployment requested without publishing TCP port 80."
 }
 
@@ -1197,12 +1125,12 @@ export_caddy_root_ca() {
     section "Caddy root CA export"
 
     for _attempt in {1..30}; do
-        [[ -f "${CADDY_ROOT_CA}" ]] && break
+        [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]] && break
         sleep 1
     done
 
-    if [[ ! -f "${CADDY_ROOT_CA}" ]]; then
-        error "Caddy did not create its internal root CA certificate at ${CADDY_ROOT_CA}."
+    if [[ ! -f "${CADDY_ROOT_CA}" || -L "${CADDY_ROOT_CA}" ]]; then
+        error "Caddy's persistent root CA is missing or is not a safe regular file at ${CADDY_ROOT_CA}."
         return 1
     fi
 
@@ -1219,7 +1147,10 @@ export_caddy_root_ca() {
         fi
         ok "Existing root CA export matches Caddy's persistent CA."
     else
-        install -m 0644 "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}"
+        if ! copy_public_certificate_atomic "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}"; then
+            error "Unable to validate and atomically export Caddy's public root CA certificate."
+            return 1
+        fi
         ok "Exported Caddy's public root CA certificate to ${EXPORTED_ROOT_CA}."
     fi
 
@@ -1235,11 +1166,17 @@ verify_phase3() {
 
     verify_mdns
 
-    if [[ "$(docker inspect --format '{{.State.Running}}' vaultwarden 2>/dev/null)" != "true" ]]; then
+    if ! container_is_running vaultwarden; then
         error "Vaultwarden is not running."
         return 1
     fi
     ok "Vaultwarden container is running."
+
+    if ! vaultwarden_domain_matches "${CADDY_ACCESS_ADDRESS}"; then
+        error "The running Vaultwarden DOMAIN does not match https://${CADDY_ACCESS_ADDRESS}."
+        return 1
+    fi
+    ok "Vaultwarden DOMAIN matches the configured appliance URL."
 
     if [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' vaultwarden 2>/dev/null)" != "0" ]]; then
         error "Vaultwarden unexpectedly publishes a host port."
@@ -1302,6 +1239,10 @@ verify_phase3() {
 }
 
 install_vwctl() {
+    local library
+    local source_library
+    local target_library
+
     section "vwctl installation"
 
     if [[ ! -f "${VWCTL_SOURCE}" || -L "${VWCTL_SOURCE}" ]]; then
@@ -1322,6 +1263,27 @@ install_vwctl() {
             return 1
         fi
     fi
+
+    if [[ -e "${LIB_TARGET_DIR}" &&
+          ( ! -d "${LIB_TARGET_DIR}" || -L "${LIB_TARGET_DIR}" ) ]]; then
+        error "The shared-library installation path is unsafe: ${LIB_TARGET_DIR}."
+        return 1
+    fi
+    install -d -m 0755 "${LIB_TARGET_DIR}"
+    for library in common network docker caddy mdns; do
+        source_library="${LIB_SOURCE_DIR}/${library}.sh"
+        target_library="${LIB_TARGET_DIR}/${library}.sh"
+        if [[ ! -f "${source_library}" || -L "${source_library}" ]]; then
+            error "Required shared library is missing or unsafe: ${source_library}."
+            return 1
+        fi
+        if [[ -e "${target_library}" &&
+              ( ! -f "${target_library}" || -L "${target_library}" ) ]]; then
+            error "The shared-library target is unsafe: ${target_library}."
+            return 1
+        fi
+        install -m 0644 "${source_library}" "${target_library}"
+    done
 
     install -d -m 0755 /usr/local/bin
     install -m 0755 "${VWCTL_SOURCE}" "${VWCTL_TARGET}"
@@ -1369,14 +1331,13 @@ print_completion_summary() {
     info "Docker network: vaultwarden-appliance"
     info "Access: local mDNS hostname"
     info "HTTPS endpoint: https://${CADDY_ACCESS_ADDRESS}"
+    info "Vaultwarden DOMAIN: https://${CADDY_ACCESS_ADDRESS}"
     info "mDNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
     info "No local DNS configuration is required; Avahi advertises this name using mDNS."
     info "Exported root CA: ${EXPORTED_ROOT_CA}"
     info "Management command: ${VWCTL_TARGET}"
     info "Vaultwarden remains internal-only; only Caddy publishes host TCP port 443."
-    if [[ "${APPLIANCE_STATE}" == "existing" || "${APPLIANCE_STATE}" == "legacy" ]]; then
-        info "Existing appliance files and any existing Vaultwarden container were left unchanged."
-    fi
+    info "Appliance-owned files and containers were reconciled idempotently; persistent Vaultwarden data was preserved."
     if (( DOCKER_GROUP_CHANGED == 1 )); then
         info "User '${DOCKER_USER}' must start a new login session or reboot before using Docker without sudo."
     fi
@@ -1385,17 +1346,19 @@ print_completion_summary() {
 main() {
     printf 'Vaultwarden Appliance - Phase 4 installer\n'
 
+    require_root
+    acquire_operation_lock
     check_operating_system
     check_architecture
+    check_required_basic_tools
     check_disk_space
     check_docker
     check_existing_installation
     detect_caddy_configuration
     check_ports
-    detect_ipv4_address
+    check_ipv4_address
     print_preflight_summary
 
-    require_root
     detect_docker_user
 
     if (( DOCKER_READY == 0 )); then
@@ -1408,60 +1371,33 @@ main() {
     install_mdns_support
 
     case "${APPLIANCE_STATE}" in
-        fresh)
-            create_appliance_files
-            deploy_vaultwarden
-            ;;
-        legacy)
-            create_appliance_marker
-            ok "Legacy Phase 2 installation adopted as a Vaultwarden Appliance."
-            ;;
-        existing)
-            info "Skipping appliance file creation and Vaultwarden deployment on this rerun."
-            ;;
+        fresh|existing) create_appliance_files ;;
         *)
-            error "Unexpected appliance state '${APPLIANCE_STATE}'."
+            error "Unexpected or unsafe appliance state '${APPLIANCE_STATE}'."
             return 1
             ;;
     esac
 
-    if [[ "${CADDY_STATE}" == "absent" ]]; then
+    if [[ "${CADDY_STATE}" == "absent" ||
+          ( "${CADDY_STATE}" == "partial" && -z "${CADDY_ACCESS_ADDRESS}" ) ]]; then
         prompt_for_local_hostname
-        configure_mdns
-        create_caddy_configuration
     else
-        if (( CADDY_ACCESS_NEEDS_MIGRATION == 2 )); then
-            CADDY_ACCESS_ADDRESS=${DEFAULT_MDNS_HOSTNAME}
-            if mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
-                warn "The default mDNS name ${CADDY_ACCESS_ADDRESS} is already in use."
-                prompt_for_local_hostname
-            else
-                info "Migrating existing access automatically to https://${CADDY_ACCESS_ADDRESS}."
-            fi
-            configure_mdns
-            migrate_caddy_to_mdns
-        else
-            if mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
-                warn "The configured mDNS name ${CADDY_ACCESS_ADDRESS} is advertised by another LAN device."
-                CADDY_ACCESS_NEEDS_MIGRATION=2
-                prompt_for_local_hostname "${CADDY_ACCESS_ADDRESS}"
-                configure_mdns
-                migrate_caddy_to_mdns
-            else
-                configure_mdns
-                if (( CADDY_ACCESS_NEEDS_MIGRATION == 1 )); then
-                    store_caddy_access_state || {
-                        error "Unable to migrate the legacy hostname state file."
-                        return 1
-                    }
-                    CADDY_ACCESS_NEEDS_MIGRATION=0
-                    ok "Stored the existing .local hostname in the hostname-only access state."
-                fi
-            fi
+        if mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
+            error "The configured mDNS name ${CADDY_ACCESS_ADDRESS} is now advertised by another LAN device."
+            return 1
         fi
-        report_configured_caddy_access
     fi
 
+    reconcile_caddy_data_directories
+    configure_mdns
+    if [[ "${CADDY_STATE}" != "configured" ]]; then
+        create_caddy_configuration
+    else
+        ok "Preserved the existing Caddy configuration and persistent CA data."
+    fi
+    report_configured_caddy_access
+    reconcile_vaultwarden_configuration
+    deploy_vaultwarden
     deploy_caddy
     export_caddy_root_ca
     verify_phase3

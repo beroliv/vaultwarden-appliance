@@ -121,6 +121,7 @@ A possible layout is:
 /opt/vaultwarden/
 ├── docker-compose.yml
 ├── docker-compose.override.yml
+├── docker-compose.vwctl.yml
 ├── .caddy-access
 ├── .env
 ├── Caddyfile
@@ -160,17 +161,17 @@ exits successfully.
 
 ## 6. Installer
 
-Installation should be launchable with a single command similar to:
+Installation requires a complete repository checkout. From that checkout it is
+launched with:
 
 ```bash
-curl -fsSL https://example/install.sh | sudo bash
+sudo ./install.sh
 ```
 
-The final URL will be determined when the project is published.
-
-The initial `install.sh` SHOULD act primarily as a bootstrap installer.
-
-It SHOULD download/install the required appliance files into `/opt/vaultwarden`.
+`install.sh` is not a remote bootstrap downloader. The repository copies of
+`vwctl`, `mdns-publisher`, `VERSION`, and the shared `lib/` scripts MUST be
+present beside it. The installer copies required runtime files into their final
+system locations.
 
 ### 6.1 System Checks
 
@@ -185,6 +186,12 @@ Before making changes, the installer MUST check:
 * availability of required TCP port 443;
 * existing `/opt/vaultwarden` installation;
 * relevant network configuration.
+
+Before significant changes, the installer MUST also require the basic commands
+`curl`, `ip`, `timeout`, `sha256sum`, `cmp`, and `flock`. On Debian it may
+install the corresponding normal packages where appropriate; otherwise it MUST
+fail with clear package guidance. Docker Buildx, OpenSSL, and `journalctl` remain
+optional or command-specific dependencies.
 
 Before Caddy is configured, the installer MUST ensure that Debian's
 `avahi-daemon`, `avahi-utils`, and `libnss-mdns` packages are installed and that
@@ -232,12 +239,12 @@ checks, including Docker user/group configuration, should continue, but the
 installer MUST NOT unnecessarily recreate configuration, overwrite data or
 redeploy a running Vaultwarden container.
 
-For backward compatibility, an unmarked Phase 2 installation may be adopted
-once only when it has `docker-compose.yml`, `data/vaultwarden`, the official
-`vaultwarden/server` image and the expected `vaultwarden-appliance` Docker
-network. After all checks pass, the installer creates the marker. Any other
-unmarked `/opt/vaultwarden` directory MUST be treated as unknown and left
-unchanged.
+Marked installations are reconciled idempotently. Missing appliance-owned base
+configuration, data directories, managed overrides, or containers are recreated
+where safe, but existing persistent Vaultwarden data is never overwritten. This
+allows a rerun to recover from a failed first image pull or container creation.
+Any unmarked `/opt/vaultwarden` directory MUST be treated as unknown and left
+unchanged; current releases do not adopt arbitrary or development-era layouts.
 
 Existing installations and future migration scenarios must be considered before destructive operations are implemented.
 
@@ -314,8 +321,7 @@ non-secret, human-readable state. The appliance-managed systemd service uses
 default-route LAN IPv4 address. It MUST NOT publish Docker bridge or container
 interface addresses for the appliance hostname. The installer verifies with
 `avahi-resolve-host-name -4` that the result is exclusively the detected LAN
-IPv4 address and additionally checks `getent hosts` where available. The
-obsolete `.caddy-hostname` file is removed only after safe state migration.
+IPv4 address and additionally checks `getent hosts` where available.
 
 mDNS name resolution and HTTPS certificate trust are separate mechanisms.
 mDNS maps the `.local` name to the appliance's current address. Caddy's internal
@@ -364,8 +370,9 @@ configuration, persistent data and internal CA. It does not silently change a
 current `.local` hostname or regenerate the CA.
 
 The Phase 4 `vwctl access` command replaces the complete appliance-managed
-Caddyfile and `.caddy-access` state, then rebuilds only the Caddy container so
-Caddy can obtain a server certificate for the selected hostname.
+Caddyfile and `.caddy-access` state, updates Vaultwarden's managed `DOMAIN`,
+then rebuilds Caddy so it can obtain a server certificate for the selected
+hostname. Vaultwarden is recreated only when its effective `DOMAIN` changes.
 It never removes `/opt/vaultwarden/data/caddy`, so the existing internal root
 CA continues to be used. Old Caddyfile content and container-local state are
 not migrated to the rebuilt configuration.
@@ -395,6 +402,17 @@ Open registration does NOT provide access to existing user vaults.
 For a LAN-only appliance, registration may remain enabled if the administrator accepts that any device able to reach the service can create an account.
 
 Registration MUST be controllable through `vwctl`.
+
+Vaultwarden's external URL MUST be explicit in its container environment:
+
+```text
+DOMAIN=https://<configured-name>.local
+```
+
+Fresh installations set it, installer reruns reconcile it, and access changes
+update it together with Caddy and mDNS. The running value is part of the health
+check. Persistent Vaultwarden data is not replaced when the container must be
+recreated for a changed `DOMAIN`.
 
 Required commands:
 
@@ -440,6 +458,13 @@ to `/usr/local/bin/vwctl` with executable permissions. Read-only commands work
 without `sudo` when the user can access Docker. Mutating commands require root
 and print the corresponding `sudo vwctl ...` command instead of invoking sudo.
 
+The installer and every mutating `vwctl` command use the same non-blocking,
+root-owned runtime lock at `/run/lock/vaultwarden-appliance.lock`. If another
+operation holds it, the new operation fails clearly without waiting. The lock
+applies to install, start, stop, restart, update, access, signup changes, and
+certificate export. Status, health, logs, version, update check, signup status,
+certificate info, and help do not acquire it.
+
 Phase 4 provides:
 
 ```bash
@@ -480,6 +505,23 @@ system or prune Docker images.
 
 An update MUST NOT silently destroy existing data or configuration.
 
+Immediately before the first image/container mutation, the command displays:
+
+```text
+Make sure you have a current backup.
+
+Kein Backup, keine Gnade.
+No backup, no mercy.
+
+Continue? [y/N]
+```
+
+Only a literal `y` or `Y` continues. Enter, `n`, or any other input cancels
+without pulling images or changing containers. The appliance neither creates a
+backup nor checks backup existence or age: the administrator is responsible for
+having a suitable current backup. `vwctl update check` remains read-only and
+does not show this confirmation.
+
 `vwctl update check` is read-only. It obtains each running container's local
 repository digest and compares it with the configured image reference's remote
 manifest digest using Docker Buildx. It does not pull images, recreate or
@@ -516,7 +558,8 @@ Avahi and the appliance mDNS publisher are active; that the ready file and
 `.local` resolution match the detected LAN IPv4 address; that `/alive`
 validates with the exported Caddy root CA; that the export matches Caddy's
 persistent public root certificate; and that both data directories exist with
-at least 2048 MiB of free space.
+at least 2048 MiB of free space. The running Vaultwarden `DOMAIN` must also equal
+the configured appliance URL.
 
 The check does not modify the system. A user without access to Docker's Unix
 socket may run it with `sudo`, although it is otherwise a read-only command.
@@ -551,11 +594,12 @@ external network configuration.
 After validating the requested address and receiving explicit confirmation,
 `vwctl` records the SHA-256 hash of Caddy's persistent public root CA. It stops
 and removes only the Caddy service container, generates a complete formatted
-appliance Caddyfile, rewrites the hostname-only `.caddy-access`, removes the obsolete
-`.caddy-hostname` state and validates the new configuration with a one-off
-Caddy Compose container. It updates and verifies the appliance-managed,
-explicit Avahi hostname-to-LAN-IP publication, then creates Caddy with
-`--no-deps`, leaving the Vaultwarden container untouched.
+appliance Caddyfile, rewrites the hostname-only `.caddy-access`, and validates
+the new configuration with a one-off Caddy Compose container. It writes the
+same URL to the managed Vaultwarden `DOMAIN`, updates
+and verifies the appliance-managed explicit Avahi hostname-to-LAN-IP
+publication, applies the Vaultwarden configuration, and then creates Caddy with
+`--no-deps`. Persistent Vaultwarden data remains untouched.
 
 Success requires Caddy and Vaultwarden to be running, Caddy to use the
 `vaultwarden-appliance` network and publish only TCP 443, Vaultwarden to publish
@@ -573,7 +617,7 @@ the selected address.
 Access changes do not use automatic rollback. If formatting, validation,
 container creation or verification fails, `vwctl` reports the failing check and
 leaves the generated Caddyfile and authoritative hostname state in place for
-inspection. Vaultwarden remains running, and the administrator can correct the
+inspection. The administrator can correct the
 reported problem and rerun `sudo vwctl access hostname`.
 
 ### 12.6 Signup Management
@@ -584,11 +628,11 @@ Signup changes use the appliance-managed override file:
 /opt/vaultwarden/docker-compose.vwctl.yml
 ```
 
-This override contains only `SIGNUPS_ALLOWED`, preserving every other Compose
-setting. A candidate override is validated before it replaces the managed
-file. Compose recreates Vaultwarden only when required and the resulting
-container environment is verified. On failure, the previous override and
-signup state are restored.
+This override contains the appliance-managed `DOMAIN` and `SIGNUPS_ALLOWED`
+values, preserving every other Compose setting. A candidate override is
+validated before it replaces the managed file. Compose recreates Vaultwarden
+only when required and both resulting values are verified. On signup-change
+failure, the previous override and signup state are restored.
 
 ### 12.7 Version Information
 
@@ -616,6 +660,11 @@ validated. It never reads or displays a private key.
 `/opt/vaultwarden/certs/caddy-root-ca.crt`, sets readable permissions and
 verifies it byte-for-byte against Caddy's persistent public root certificate.
 Private CA keys are never read or exported.
+
+The installer uses the same safety properties: it rejects a symbolic-link or
+non-regular source, copies through a securely created temporary file, validates
+the copy as X.509 when OpenSSL is available, and atomically installs only the
+public root certificate. It never reads or copies Caddy's private CA key.
 
 Future backup-specific diagnostics remain part of later phases and are not
 included in `vwctl health` yet.
@@ -1049,46 +1098,26 @@ However, Version 1 development MUST avoid design choices that unnecessarily prev
 
 A migration procedure can be added after clean installation, backup and restore functionality have been proven reliable.
 
-The hostname-only mDNS architecture includes a narrowly scoped migration for
-appliance-managed Phase 3/4 access state. A legacy two-line hostname state is
-converted to `hostname=<name>` and its `.local` name is preserved. A legacy
-direct-IP state, including the Atlas reference installation, is migrated by the
-installer to `vaultwarden.local`, or to an explicitly accepted conflict-free
-alternative when that name is already advertised on the LAN.
+The supported appliance access state is one line:
 
-This access migration MUST:
+```text
+hostname=<name>.local
+```
 
-* install and configure the appliance-managed explicit Avahi
-  hostname-to-LAN-IP publication;
-* regenerate the complete Caddyfile for the selected `.local` hostname;
-* stop and recreate only the Caddy container;
-* leave the Vaultwarden container and `/opt/vaultwarden/data/vaultwarden`
-  untouched;
-* leave `/opt/vaultwarden/data/caddy` untouched;
-* verify that Caddy's internal root CA hash did not change when a root already
-  exists;
-* remove `.caddy-hostname` only after the new state is safely installed;
-* verify mDNS resolution, Docker networking, TCP 443, HTTPS with explicit root
-  CA trust, and the root CA export.
+Development-only direct-IP state, two-line access state, and `.caddy-hostname`
+fallbacks are no longer supported. A current marked appliance is reconciled in
+place: its configured hostname is preserved, the managed Vaultwarden `DOMAIN`
+is added or corrected when needed, and missing appliance-owned files or
+containers are recreated without replacing persistent Vaultwarden or Caddy
+data. An unmarked directory is never adopted automatically.
 
-Old Caddy leaf certificates do not need to be preserved. Caddy may issue a new
-leaf certificate for the `.local` hostname from the existing persistent root
-CA, keeping already installed client root certificates valid.
-
-An installer rerun MUST safely replace the obsolete appliance-owned systemd
-service that called `avahi-set-host-name`. The persistent explicit publisher
-MUST use `avahi-publish-address -R --no-fail` so the `.local` appliance name is
-an additional alias for the machine's already-published LAN IPv4 address. It
-MUST NOT modify the Linux hostname or Avahi's global hostname. Unrelated Avahi
-configuration MUST remain untouched.
-
-An address advertised by a different LAN device remains a real conflict. Local
-addresses from local Docker interfaces may be recognized as belonging to this
-host during migration, but final mDNS
-verification MUST reject every result other than the detected LAN IPv4 address.
-The publisher service MUST remain active and expose verified runtime readiness;
-on failure, installer diagnostics MUST include its recent journal so messages
-such as `Local name collision` are not hidden.
+The persistent explicit publisher uses `avahi-publish-address -R --no-fail` so
+the `.local` appliance name is an additional alias for the machine's already
+published LAN IPv4 address. It MUST NOT modify the Linux hostname or Avahi's
+global hostname. An address advertised by a different LAN device remains a real
+conflict, and final verification MUST reject every result other than the
+detected LAN IPv4 address. The publisher service remains active and exposes
+verified runtime readiness; failure diagnostics include its recent journal.
 
 ---
 

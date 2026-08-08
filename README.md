@@ -5,16 +5,20 @@ Simple LAN-only Vaultwarden appliance with Caddy, local HTTPS, mDNS, and
 
 ## Installation
 
-On a supported Debian or 64-bit Raspberry Pi OS system, run:
+Copy or clone the complete repository checkout to a supported Debian or 64-bit
+Raspberry Pi OS system, enter that directory, and run:
 
 ```bash
-sudo bash ./install.sh
+sudo ./install.sh
 ```
 
 The installer performs system checks, can install Docker Engine and Docker
 Compose v2 from Docker's official Debian repository, and deploys the appliance
 under `/opt/vaultwarden`. A working existing Docker installation is reused
 without modification.
+
+`install.sh` is not a remote bootstrap downloader. It requires the repository's
+`vwctl`, `mdns-publisher`, `VERSION`, and `lib/` files beside it.
 
 The installer installs Debian's `avahi-daemon`, `avahi-utils`, and `libnss-mdns`
 packages when needed. On a fresh configuration it asks:
@@ -42,6 +46,10 @@ Vaultwarden data is stored in `/opt/vaultwarden/data/vaultwarden` and has no
 host-published port. Caddy is the only LAN-facing container and publishes only
 TCP port 443. Its persistent data, including the internal CA, is stored below
 `/opt/vaultwarden/data/caddy`.
+
+Vaultwarden's external `DOMAIN` is managed as the same URL, for example
+`DOMAIN=https://vaultwarden.local`. The appliance stores `DOMAIN` and the
+current signup setting in `/opt/vaultwarden/docker-compose.vwctl.yml`.
 
 The selected local name is stored as human-readable, non-secret state in:
 
@@ -117,36 +125,45 @@ the command that applies updates. `vwctl cert info` reads the exported public
 root certificate and the live HTTPS leaf certificate. It never reads private
 keys.
 
+Immediately before `sudo vwctl update` pulls or changes images and containers,
+it reminds the administrator to have a current backup and asks
+`Continue? [y/N]`. Only a literal `y` or `Y` continues. The appliance does not
+check for a backup or create one automatically; backup responsibility remains
+with the administrator. `vwctl update check` stays read-only and does not ask.
+
 Read-only commands can run without `sudo` when the user has access to Docker.
 Commands that change appliance state require root and print the exact `sudo`
-command when invoked without it.
+command when invoked without it. The installer and all mutating `vwctl`
+commands use one non-blocking lock at
+`/run/lock/vaultwarden-appliance.lock`; a second operation fails clearly instead
+of waiting. Read-only commands do not take this lock.
 
 `sudo vwctl access` and `sudo vwctl access hostname` change only the local
 `.local` name. After validation, conflict detection, and confirmation, `vwctl`
 updates the explicit mDNS hostname-to-LAN-IP publication, regenerates the
-complete Caddyfile, and rebuilds only Caddy. Vaultwarden is not stopped or recreated. Caddy's
-persistent data is not deleted, and the internal root CA hash must remain
-unchanged while Caddy obtains a new leaf certificate for the new hostname.
+complete Caddyfile, updates Vaultwarden's `DOMAIN`, and rebuilds Caddy.
+Vaultwarden is recreated only when the effective `DOMAIN` changes. Persistent
+Vaultwarden data and Caddy data are not deleted, and the internal root CA hash
+must remain unchanged while Caddy obtains a new leaf certificate for the new
+hostname.
 
 Direct-IP HTTPS access is no longer supported.
 
 ## Existing installations
 
 Reruns recognize `/opt/vaultwarden/.vaultwarden-appliance` and remain
-non-destructive. A legacy hostname configuration is converted to the
-hostname-only state format. A legacy direct-IP configuration, including the
-Atlas test installation, is migrated to `vaultwarden.local` (or an accepted
-conflict-free alternative). The migration configures mDNS and rebuilds only
-Caddy while preserving Vaultwarden data and Caddy's persistent internal root CA.
+non-destructive. They reconcile missing appliance-owned files and containers,
+including a first installation interrupted during an image pull, while
+preserving Vaultwarden data and Caddy's persistent internal root CA. Existing
+installations also receive the managed `DOMAIN` setting when needed.
 
-Unknown `/opt/vaultwarden` directories without the appliance marker or the
-recognized legacy Phase 2 structure are left unchanged.
+Unknown `/opt/vaultwarden` directories without the appliance marker are left
+unchanged and are not adopted.
 
 Rerunning the installer refreshes the stored publication address from the
-current default-route LAN IPv4 address. It also automatically replaces the
-older appliance-owned `avahi-set-host-name` service, without changing unrelated
-Avahi configuration. Atlas and `Atlas.local` remain unchanged. A remote device
-using the requested alias remains a conflict.
+current default-route LAN IPv4 address without changing the Linux system
+hostname or Avahi's global hostname. A remote device using the requested alias
+remains a conflict.
 
 The systemd service runs an appliance-owned wrapper around
 `avahi-publish-address -R --no-fail`. `-R` suppresses the reverse record when
