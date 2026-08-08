@@ -62,20 +62,24 @@ selected_identity=$(storage_make_disk_identity \
     /dev/sda 8:0 62100000000 2790801320600048 'ADATA USB Flash Drive' usb \
     /sys/devices/platform/soc/usb1/1-1/block/sda)
 
-expect_equal "destructive confirmation is device-specific" 'ERASE 2790801320600048' \
+expect_equal "destructive confirmation uses the fixed phrase" 'ERASE USB' \
     "$(storage_disk_confirmation_text "${selected_identity}")"
 expect_success "exact destructive confirmation is accepted" storage_confirmation_matches \
+    "${selected_identity}" 'ERASE USB'
+expect_failure "old serial confirmation is rejected" storage_confirmation_matches \
     "${selected_identity}" 'ERASE 2790801320600048'
-expect_failure "incorrect destructive confirmation cancels" storage_confirmation_matches \
-    "${selected_identity}" 'ERASE /dev/sda'
+expect_failure "different case is rejected" storage_confirmation_matches \
+    "${selected_identity}" 'Erase USB'
+expect_failure "trailing whitespace is rejected" storage_confirmation_matches \
+    "${selected_identity}" 'ERASE USB '
 expect_failure "empty destructive confirmation cancels" storage_confirmation_matches \
     "${selected_identity}" ''
 
 fallback_identity=$(storage_make_disk_identity \
     /dev/sdb 8:16 32000000000 '' 'Unknown bridge' '' \
     /sys/devices/platform/soc/usb1/1-2/block/sdb)
-expect_equal "missing serial uses sysfs devpath and exact size for confirmation" \
-    'ERASE /sys/devices/platform/soc/usb1/1-2/block/sdb 32000000000' \
+expect_equal "missing serial still uses the fixed confirmation phrase" \
+    'ERASE USB' \
     "$(storage_disk_confirmation_text "${fallback_identity}")"
 
 safe_candidates='/dev/sda'

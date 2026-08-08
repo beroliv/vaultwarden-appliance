@@ -328,7 +328,7 @@ usb_setup_main() {
 
     usb_setup_print_warning "${USB_REVALIDATED_IDENTITY}" || \
         usb_setup_die "Unable to prepare the destructive confirmation."
-    if ! read -r confirmation </dev/tty; then
+    if ! IFS= read -r confirmation </dev/tty; then
         usb_setup_die "Unable to read destructive confirmation."
     fi
     if ! storage_confirmation_matches "${USB_REVALIDATED_IDENTITY}" "${confirmation}"; then

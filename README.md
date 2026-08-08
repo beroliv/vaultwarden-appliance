@@ -195,11 +195,11 @@ generated safe candidate list. The system disk is never numbered, and entering
 a `/dev/...` path is not accepted. The selected disk is identified by its
 major/minor number, exact size, serial/model/transport where available, and
 resolved kernel device path. The complete topology and identity are scanned
-again after selection, after the device-specific confirmation, and immediately
+again after selection, after the exact destructive confirmation, and immediately
 before each destructive step.
 
 The command displays mounted filesystems belonging to the selected simple disk
-layout. Only after the user types the exact `ERASE <device identifier>` text are
+layout. Only after the user types the exact `ERASE USB` text are
 those selected filesystems unmounted. It then replaces the partition table with
 GPT, creates one Microsoft Basic Data partition spanning the usable disk, and
 formats it as exFAT with label `VWBACKUP`. There is no default `y/N` confirmation

@@ -401,18 +401,9 @@ storage_disk_identities_match() {
 
 storage_disk_confirmation_text() {
     local identity=$1
-    local serial
-    local size
-    local sysfs_path
 
-    serial=$(storage_disk_identity_field "${identity}" serial) || return 1
-    if [[ -n "${serial}" ]]; then
-        printf 'ERASE %s\n' "${serial}"
-        return
-    fi
-    sysfs_path=$(storage_disk_identity_field "${identity}" sysfs_path) || return 1
-    size=$(storage_disk_identity_field "${identity}" size) || return 1
-    printf 'ERASE %s %s\n' "${sysfs_path}" "${size}"
+    storage_validate_disk_identity "${identity}" || return 1
+    printf 'ERASE USB\n'
 }
 
 storage_confirmation_matches() {

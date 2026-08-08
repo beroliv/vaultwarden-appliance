@@ -498,7 +498,7 @@ sudo vwctl usb setup
 
 `vwctl usb status` remains read-only. `sudo vwctl usb setup` is destructive only
 after numbered selection, repeated safety revalidation and an exact
-device-specific `ERASE` confirmation. Phase 5B initializes media but does not
+`ERASE USB` confirmation. Phase 5B initializes media but does not
 create a Vaultwarden backup.
 
 ### 12.1 Update
@@ -825,13 +825,12 @@ Device: SanDisk Ultra
 Path:   /dev/sda
 Size:   29.8 GB
 
-Type ERASE <selected-device-identifier> to continue:
+Type ERASE USB to continue:
 ```
 
 The setup command MUST cancel without modification if the exact expected text
-is not entered. A usable serial number is preferred for the confirmation. If it
-is unavailable, the freshly verified sysfs device path plus exact byte size is
-used.
+`ERASE USB` is not entered. Device identity, serial, topology, system-disk
+protection, and final destructive revalidation remain independent safety checks.
 
 After destructive work begins, failures identify the failed step and do not
 attempt to restore the old partition table or erased contents. The command does
