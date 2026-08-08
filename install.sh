@@ -18,6 +18,10 @@ readonly CADDY_ROOT_CA="${CADDY_DATA_DIR}/caddy/pki/authorities/local/root.crt"
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
 readonly VWCTL_SOURCE="${SCRIPT_DIR}/vwctl"
 readonly VWCTL_TARGET="/usr/local/bin/vwctl"
+readonly DEFAULT_MDNS_HOSTNAME="vaultwarden.local"
+readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
+readonly MDNS_SERVICE_FILE="/etc/systemd/system/vaultwarden-appliance-mdns.service"
+readonly MDNS_SERVICE="vaultwarden-appliance-mdns.service"
 readonly MIN_DISK_SPACE_MB=2048
 
 ERRORS=0
@@ -33,9 +37,9 @@ DOCKER_USER=""
 DOCKER_GROUP_CHANGED=0
 APPLIANCE_STATE="fresh"
 CADDY_STATE="absent"
-CADDY_ACCESS_MODE=""
 CADDY_ACCESS_ADDRESS=""
 CADDY_ACCESS_NEEDS_MIGRATION=0
+LEGACY_IP_ADDRESS=""
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -197,19 +201,10 @@ check_existing_installation() {
 
 validate_local_hostname() {
     local hostname=$1
-    local label
-    local -a labels
 
-    (( ${#hostname} <= 253 )) || return 1
-    [[ "${hostname}" == *.* ]] || return 1
-    [[ "${hostname}" != .* && "${hostname}" != *. ]] || return 1
-    [[ ! "${hostname}" =~ ^[0-9.]+$ ]] || return 1
-
-    IFS='.' read -r -a labels <<<"${hostname}"
-    for label in "${labels[@]}"; do
-        (( ${#label} <= 63 )) || return 1
-        [[ "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
-    done
+    (( ${#hostname} <= 69 )) || return 1
+    [[ "${hostname}" == "${hostname,,}" ]] || return 1
+    [[ "${hostname}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.local$ ]]
 }
 
 validate_ipv4_address() {
@@ -235,31 +230,42 @@ load_caddy_access_state() {
     local -a lines
 
     mapfile -t lines < "${CADDY_ACCESS_FILE}"
+
+    if (( ${#lines[@]} == 1 )) && [[ "${lines[0]}" == hostname=* ]]; then
+        address=${lines[0]#hostname=}
+        validate_local_hostname "${address}" || return 1
+        CADDY_ACCESS_ADDRESS=${address}
+        return 0
+    fi
+
     (( ${#lines[@]} == 2 )) || return 1
     [[ "${lines[0]}" == mode=* && "${lines[1]}" == address=* ]] || return 1
-
     mode=${lines[0]#mode=}
     address=${lines[1]#address=}
 
     case "${mode}" in
+        hostname)
+            if validate_local_hostname "${address}"; then
+                CADDY_ACCESS_ADDRESS=${address}
+                CADDY_ACCESS_NEEDS_MIGRATION=1
+            else
+                CADDY_ACCESS_NEEDS_MIGRATION=2
+            fi
+            ;;
         ip)
             validate_ipv4_address "${address}" || return 1
-            ;;
-        hostname)
-            validate_local_hostname "${address}" || return 1
+            LEGACY_IP_ADDRESS=${address}
+            CADDY_ACCESS_NEEDS_MIGRATION=2
             ;;
         *)
             return 1
             ;;
     esac
-
-    CADDY_ACCESS_MODE=${mode}
-    CADDY_ACCESS_ADDRESS=${address}
 }
 
 create_caddy_access_state() {
-    if ! (set -o noclobber; printf 'mode=%s\naddress=%s\n' \
-        "${CADDY_ACCESS_MODE}" "${CADDY_ACCESS_ADDRESS}" > "${CADDY_ACCESS_FILE}"); then
+    if ! (set -o noclobber; printf 'hostname=%s\n' \
+        "${CADDY_ACCESS_ADDRESS}" > "${CADDY_ACCESS_FILE}"); then
         error "Unable to create ${CADDY_ACCESS_FILE}."
         return 1
     fi
@@ -308,12 +314,13 @@ detect_caddy_configuration() {
                 return
             fi
             mapfile -t hostname_lines < "${CADDY_HOSTNAME_FILE}"
-            if (( ${#hostname_lines[@]} != 1 )) || \
-               [[ "${CADDY_ACCESS_MODE}" != "hostname" ]] || \
+            if (( CADDY_ACCESS_NEEDS_MIGRATION == 2 )) || \
+               (( ${#hostname_lines[@]} != 1 )) || \
                [[ "${hostname_lines[0]}" != "${CADDY_ACCESS_ADDRESS}" ]]; then
                 error "The current and legacy Caddy access state disagree; existing Caddy files will not be changed."
                 return
             fi
+            CADDY_ACCESS_NEEDS_MIGRATION=1
         fi
     else
         if [[ ! -f "${CADDY_HOSTNAME_FILE}" || -L "${CADDY_HOSTNAME_FILE}" ]]; then
@@ -322,21 +329,28 @@ detect_caddy_configuration() {
         fi
 
         mapfile -t hostname_lines < "${CADDY_HOSTNAME_FILE}"
-        if (( ${#hostname_lines[@]} != 1 )) || ! validate_local_hostname "${hostname_lines[0]}"; then
+        if (( ${#hostname_lines[@]} != 1 )); then
             error "The stored Caddy hostname is missing or invalid; existing Caddy files will not be changed."
             return
         fi
 
-        CADDY_ACCESS_MODE="hostname"
-        CADDY_ACCESS_ADDRESS=${hostname_lines[0]}
-        CADDY_ACCESS_NEEDS_MIGRATION=1
-        info "Legacy hostname access state detected; its HTTPS address will be preserved."
+        if validate_local_hostname "${hostname_lines[0]}"; then
+            CADDY_ACCESS_ADDRESS=${hostname_lines[0]}
+            CADDY_ACCESS_NEEDS_MIGRATION=1
+            info "Legacy hostname access state detected; its .local HTTPS address will be preserved."
+        else
+            CADDY_ACCESS_NEEDS_MIGRATION=2
+        fi
     fi
 
     CADDY_STATE="configured"
     ok "Existing Caddy configuration detected."
-    info "Configured HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
-    info "Access mode and address changes are not performed automatically."
+    if (( CADDY_ACCESS_NEEDS_MIGRATION == 2 )); then
+        info "The existing non-mDNS access configuration will be migrated to a .local hostname."
+        [[ -z "${LEGACY_IP_ADDRESS}" ]] || info "Previous IP HTTPS address: ${LEGACY_IP_ADDRESS}"
+    else
+        info "Configured HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
+    fi
 }
 
 check_docker() {
@@ -709,101 +723,315 @@ deploy_vaultwarden() {
     ok "Vaultwarden is running without a host-published HTTP port."
 }
 
-print_ip_stability_warning() {
-    printf '\nIMPORTANT:\n'
-    printf 'This IP address should not change.\n\n'
-    printf 'Recommended:\n'
-    printf 'Create a DHCP reservation for %s in your router/DHCP server.\n\n' "${CADDY_ACCESS_ADDRESS}"
-    printf 'The appliance will not modify your network configuration.\n'
+package_is_installed() {
+    dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | grep -q '^ii '
+}
+
+install_mdns_support() {
+    local package
+    local -a missing_packages=()
+
+    section "mDNS support"
+
+    command_exists apt-get || {
+        error "mDNS setup requires apt-get on this Debian-based system."
+        return 1
+    }
+    command_exists dpkg-query || {
+        error "mDNS setup requires dpkg-query on this Debian-based system."
+        return 1
+    }
+    command_exists systemctl || {
+        error "mDNS setup requires systemd."
+        return 1
+    }
+
+    for package in avahi-daemon avahi-utils libnss-mdns; do
+        package_is_installed "${package}" || missing_packages+=("${package}")
+    done
+
+    if (( ${#missing_packages[@]} > 0 )); then
+        info "Installing required Debian mDNS packages: ${missing_packages[*]}"
+        DEBIAN_FRONTEND=noninteractive apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_packages[@]}"
+    else
+        ok "Required mDNS packages are already installed."
+    fi
+
+    command_exists avahi-resolve-host-name || {
+        error "avahi-resolve-host-name is unavailable after package installation."
+        return 1
+    }
+    command_exists avahi-set-host-name || {
+        error "avahi-set-host-name is unavailable after package installation."
+        return 1
+    }
+
+    systemctl enable --now avahi-daemon.service
+    systemctl is-active --quiet avahi-daemon.service || {
+        error "Avahi did not become active."
+        return 1
+    }
+    ok "Avahi is installed and active."
+}
+
+mdns_resolved_ipv4s() {
+    local hostname=$1
+
+    timeout 4 avahi-resolve-host-name -4 "${hostname}" 2>/dev/null |
+        awk 'NF >= 2 {print $2}'
+}
+
+mdns_name_conflicts() {
+    local hostname=$1
+    local resolved=""
+
+    resolved=$(mdns_resolved_ipv4s "${hostname}" || true)
+    [[ -n "${resolved}" ]] || return 1
+    grep -Fxq "${IPV4_ADDRESS}" <<<"${resolved}" && return 1
+    return 0
+}
+
+next_available_mdns_hostname() {
+    local base=${1%.local}
+    local candidate
+    local suffix
+
+    for suffix in {2..99}; do
+        candidate="${base}-${suffix}.local"
+        if validate_local_hostname "${candidate}" && ! mdns_name_conflicts "${candidate}"; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 prompt_for_local_hostname() {
+    local default_hostname=${1:-${DEFAULT_MDNS_HOSTNAME}}
     local answer=""
+    local conflict_answer=""
+    local suggestion=""
+
+    section "Local HTTPS name"
+
+    validate_ipv4_address "${IPV4_ADDRESS}" || {
+        error "A LAN IPv4 address is required to configure and verify mDNS."
+        return 1
+    }
+
+    info "Detected LAN IPv4 address: ${IPV4_ADDRESS}"
 
     while true; do
-        if ! read -r -p "Vaultwarden hostname [vaultwarden.local]: " answer </dev/tty; then
-            error "Unable to read the Vaultwarden hostname."
+        if ! read -r -p "Local Vaultwarden name [${default_hostname}]: " answer </dev/tty; then
+            error "Unable to read the local Vaultwarden name."
             return 1
         fi
 
-        CADDY_ACCESS_ADDRESS=${answer:-vaultwarden.local}
-        if validate_local_hostname "${CADDY_ACCESS_ADDRESS}"; then
+        CADDY_ACCESS_ADDRESS=${answer:-${default_hostname}}
+        CADDY_ACCESS_ADDRESS=${CADDY_ACCESS_ADDRESS,,}
+        if ! validate_local_hostname "${CADDY_ACCESS_ADDRESS}"; then
+            warn "Invalid local name. Use one DNS label followed by .local, without spaces or underscores."
+            continue
+        fi
+
+        if ! mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
             break
         fi
-        warn "Invalid hostname. Use dot-separated DNS labels without spaces or underscores."
-    done
 
-    CADDY_ACCESS_MODE="hostname"
-    info "Required DNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
-    info "The installer will not modify DNS servers, routers, Pi-hole, AdGuard Home, or hosts files."
-}
-
-prompt_for_caddy_access() {
-    local answer=""
-
-    section "HTTPS access address"
-
-    if [[ ! -r /dev/tty ]]; then
-        error "An interactive terminal is required to choose the HTTPS access address."
-        return 1
-    fi
-
-    printf 'How should Vaultwarden be accessed?\n\n'
-    printf '1) IP address [recommended]\n'
-    printf '   https://%s\n' "${IPV4_ADDRESS}"
-    printf '   No local DNS configuration required.\n\n'
-    printf '2) Local hostname\n'
-    printf '   https://vaultwarden.local\n'
-    printf '   Requires local DNS or hosts configuration.\n\n'
-
-    while true; do
-        if ! read -r -p "Choice [1]: " answer </dev/tty; then
-            error "Unable to read the HTTPS access choice."
+        warn "The mDNS name ${CADDY_ACCESS_ADDRESS} is already advertised by another LAN device."
+        suggestion=$(next_available_mdns_hostname "${CADDY_ACCESS_ADDRESS}") || {
+            error "Unable to find an available alternative .local name."
+            return 1
+        }
+        if ! read -r -p "Use available alternative ${suggestion}? [Y/n] " conflict_answer </dev/tty; then
+            error "Unable to read the mDNS conflict choice."
             return 1
         fi
-
-        case "${answer:-1}" in
-            1)
-                if ! validate_ipv4_address "${IPV4_ADDRESS}"; then
-                    error "IP address mode requires a detected LAN IPv4 address. Choose hostname mode or correct the network configuration."
-                    return 1
-                fi
-                CADDY_ACCESS_MODE="ip"
-                CADDY_ACCESS_ADDRESS=${IPV4_ADDRESS}
-                print_ip_stability_warning
-                break
-                ;;
-            2)
-                prompt_for_local_hostname
+        case "${conflict_answer}" in
+            ""|y|Y|yes|YES|Yes)
+                CADDY_ACCESS_ADDRESS=${suggestion}
                 break
                 ;;
             *)
-                warn "Invalid choice. Enter 1 for IP address or 2 for local hostname."
+                info "Choose a different .local name."
                 ;;
         esac
     done
 
-    info "HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
+    info "mDNS name: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+    info "Vaultwarden will be available on your local network at https://${CADDY_ACCESS_ADDRESS}."
+    info "No local DNS configuration is required; this name is advertised using mDNS."
+    info "Client devices must separately trust the exported Caddy root CA."
+    info "The appliance will not change the system hostname, DNS, router, hosts files, or IP configuration."
+}
+
+write_mdns_service_configuration() {
+    local label=${CADDY_ACCESS_ADDRESS%.local}
+
+    if [[ -e "${MDNS_ENV_FILE}" ]] && \
+       { [[ ! -f "${MDNS_ENV_FILE}" || -L "${MDNS_ENV_FILE}" ]] || \
+         ! grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_ENV_FILE}" 2>/dev/null; }; then
+        error "${MDNS_ENV_FILE} exists but is not appliance-managed; it will not be overwritten."
+        return 1
+    fi
+    if [[ -e "${MDNS_SERVICE_FILE}" ]] && \
+       { [[ ! -f "${MDNS_SERVICE_FILE}" || -L "${MDNS_SERVICE_FILE}" ]] || \
+         ! grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_SERVICE_FILE}" 2>/dev/null; }; then
+        error "${MDNS_SERVICE_FILE} exists but is not appliance-managed; it will not be overwritten."
+        return 1
+    fi
+
+    cat > "${MDNS_ENV_FILE}" <<ENV
+# Vaultwarden Appliance mDNS
+VAULTWARDEN_MDNS_LABEL=${label}
+ENV
+    chmod 0644 "${MDNS_ENV_FILE}"
+
+    cat > "${MDNS_SERVICE_FILE}" <<'SERVICE'
+# Vaultwarden Appliance mDNS
+[Unit]
+Description=Advertise the Vaultwarden Appliance mDNS hostname
+Requires=avahi-daemon.service
+After=avahi-daemon.service
+PartOf=avahi-daemon.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/vaultwarden-appliance-mdns
+ExecStart=/usr/bin/avahi-set-host-name ${VAULTWARDEN_MDNS_LABEL}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    chmod 0644 "${MDNS_SERVICE_FILE}"
+
+    systemctl daemon-reload
+    systemctl enable "${MDNS_SERVICE}"
+    systemctl restart "${MDNS_SERVICE}"
+}
+
+verify_mdns() {
+    local _attempt
+    local resolved=""
+
+    systemctl is-active --quiet avahi-daemon.service || {
+        error "Avahi is not active."
+        return 1
+    }
+    systemctl is-active --quiet "${MDNS_SERVICE}" || {
+        error "The appliance mDNS hostname service is not active."
+        return 1
+    }
+
+    for _attempt in {1..30}; do
+        resolved=$(mdns_resolved_ipv4s "${CADDY_ACCESS_ADDRESS}" || true)
+        grep -Fxq "${IPV4_ADDRESS}" <<<"${resolved}" && {
+            ok "mDNS resolves ${CADDY_ACCESS_ADDRESS} to ${IPV4_ADDRESS}."
+            return 0
+        }
+        sleep 1
+    done
+
+    error "mDNS did not resolve ${CADDY_ACCESS_ADDRESS} to the detected LAN IPv4 address ${IPV4_ADDRESS}."
+    [[ -z "${resolved}" ]] || info "Resolved IPv4 address(es): ${resolved//$'\n'/, }"
+    return 1
+}
+
+configure_mdns() {
+    write_mdns_service_configuration
+    verify_mdns
 }
 
 report_configured_caddy_access() {
-    if [[ "${CADDY_ACCESS_MODE}" == "ip" ]]; then
-        info "Configured access mode: IP address."
-    else
-        info "Configured access mode: local hostname."
-    fi
+    info "Configured access: local mDNS hostname."
     info "HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
+    info "mDNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+}
 
-    if [[ "${CADDY_ACCESS_MODE}" == "ip" ]]; then
-        print_ip_stability_warning
-        if validate_ipv4_address "${IPV4_ADDRESS}" && [[ "${IPV4_ADDRESS}" != "${CADDY_ACCESS_ADDRESS}" ]]; then
-            warn "The detected LAN IPv4 address (${IPV4_ADDRESS}) differs from the configured HTTPS address (${CADDY_ACCESS_ADDRESS})."
-            warn "The configured address will not be changed automatically."
-        fi
-    else
-        info "Required DNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
-        info "The installer will not modify local DNS or hosts files."
+write_caddyfile_to() {
+    local destination=$1
+
+    cat > "${destination}" <<CADDY
+{
+	auto_https disable_redirects
+}
+
+https://${CADDY_ACCESS_ADDRESS} {
+	tls internal
+	reverse_proxy vaultwarden:80
+}
+CADDY
+    chmod 0644 "${destination}"
+}
+
+store_caddy_access_state() {
+    local candidate
+
+    candidate=$(mktemp "${INSTALL_DIR}/.caddy-access.install.XXXXXXXX") || return 1
+    if ! printf 'hostname=%s\n' "${CADDY_ACCESS_ADDRESS}" > "${candidate}" ||
+       ! chmod 0644 "${candidate}" ||
+       ! mv -f -- "${candidate}" "${CADDY_ACCESS_FILE}" ||
+       ! rm -f -- "${CADDY_HOSTNAME_FILE}"; then
+        rm -f -- "${candidate}"
+        return 1
     fi
+}
+
+migrate_caddy_to_mdns() {
+    local caddy_candidate
+    local root_hash_after=""
+    local root_hash_before=""
+    local state_candidate
+
+    section "Hostname-only access migration"
+    command_exists sha256sum || {
+        error "sha256sum is required to verify preservation of Caddy's root CA."
+        return 1
+    }
+    if [[ -e "${CADDY_ROOT_CA}" && \
+          ( ! -f "${CADDY_ROOT_CA}" || -L "${CADDY_ROOT_CA}" ) ]]; then
+        error "Caddy's root CA path exists but is not a safe regular file."
+        return 1
+    fi
+    if [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]]; then
+        root_hash_before=$(sha256sum -- "${CADDY_ROOT_CA}" | awk 'NR == 1 {print $1}')
+    fi
+
+    caddy_candidate=$(mktemp "${INSTALL_DIR}/.Caddyfile.install.XXXXXXXX") || return 1
+    state_candidate=$(mktemp "${INSTALL_DIR}/.caddy-access.install.XXXXXXXX") || {
+        rm -f -- "${caddy_candidate}"
+        return 1
+    }
+    if ! write_caddyfile_to "${caddy_candidate}" ||
+       ! printf 'hostname=%s\n' "${CADDY_ACCESS_ADDRESS}" > "${state_candidate}" ||
+       ! chmod 0644 "${state_candidate}"; then
+        rm -f -- "${caddy_candidate}" "${state_candidate}"
+        error "Unable to generate the hostname-only Caddy configuration."
+        return 1
+    fi
+
+    info "Stopping and removing only the Caddy container. Vaultwarden remains running."
+    docker compose --project-directory "${INSTALL_DIR}" rm --stop --force caddy
+    mv -f -- "${caddy_candidate}" "${CADDYFILE}"
+    mv -f -- "${state_candidate}" "${CADDY_ACCESS_FILE}"
+    rm -f -- "${CADDY_HOSTNAME_FILE}"
+
+    docker compose --project-directory "${INSTALL_DIR}" config --quiet
+    docker compose --project-directory "${INSTALL_DIR}" up -d --no-deps caddy
+
+    if [[ -n "${root_hash_before}" ]]; then
+        root_hash_after=$(sha256sum -- "${CADDY_ROOT_CA}" 2>/dev/null | awk 'NR == 1 {print $1}')
+        if [[ "${root_hash_after}" != "${root_hash_before}" ]]; then
+            error "Caddy's persistent internal root CA changed unexpectedly during migration."
+            return 1
+        fi
+        ok "Caddy's persistent internal root CA was preserved."
+    fi
+
+    CADDY_ACCESS_NEEDS_MIGRATION=0
+    ok "Migrated Caddy to hostname-only access at https://${CADDY_ACCESS_ADDRESS}."
 }
 
 create_caddy_configuration() {
@@ -817,17 +1045,7 @@ create_caddy_configuration() {
 
     install -d -m 0700 "${CADDY_DATA_DIR}" "${CADDY_CONFIG_DIR}"
 
-    if ! (set -o noclobber; cat > "${CADDYFILE}" <<CADDY
-{
-    auto_https disable_redirects
-}
-
-https://${CADDY_ACCESS_ADDRESS} {
-    tls internal
-    reverse_proxy vaultwarden:80
-}
-CADDY
-    ); then
+    if ! write_caddyfile_to "${CADDYFILE}"; then
         error "Unable to create ${CADDYFILE}."
         return 1
     fi
@@ -920,6 +1138,8 @@ verify_phase3() {
     local endpoint_ok=0
 
     section "Phase 3 verification"
+
+    verify_mdns
 
     if [[ "$(docker inspect --format '{{.State.Running}}' vaultwarden 2>/dev/null)" != "true" ]]; then
         error "Vaultwarden is not running."
@@ -1025,15 +1245,10 @@ print_completion_summary() {
     info "Compose file: ${INSTALL_DIR}/docker-compose.yml"
     info "Persistent data: ${INSTALL_DIR}/data/vaultwarden"
     info "Docker network: vaultwarden-appliance"
-    if [[ "${CADDY_ACCESS_MODE}" == "ip" ]]; then
-        info "Access mode: IP address"
-    else
-        info "Access mode: local hostname"
-    fi
+    info "Access: local mDNS hostname"
     info "HTTPS endpoint: https://${CADDY_ACCESS_ADDRESS}"
-    if [[ "${CADDY_ACCESS_MODE}" == "hostname" ]]; then
-        info "Required DNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
-    fi
+    info "mDNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+    info "No local DNS configuration is required; Avahi advertises this name using mDNS."
     info "Exported root CA: ${EXPORTED_ROOT_CA}"
     info "Management command: ${VWCTL_TARGET}"
     info "Vaultwarden remains internal-only; only Caddy publishes host TCP port 443."
@@ -1068,11 +1283,7 @@ main() {
     fi
 
     configure_docker_group
-
-    if (( CADDY_ACCESS_NEEDS_MIGRATION == 1 )); then
-        create_caddy_access_state
-        ok "Stored the existing hostname access mode without changing Caddy or its HTTPS address."
-    fi
+    install_mdns_support
 
     case "${APPLIANCE_STATE}" in
         fresh)
@@ -1093,9 +1304,39 @@ main() {
     esac
 
     if [[ "${CADDY_STATE}" == "absent" ]]; then
-        prompt_for_caddy_access
+        prompt_for_local_hostname
+        configure_mdns
         create_caddy_configuration
     else
+        if (( CADDY_ACCESS_NEEDS_MIGRATION == 2 )); then
+            CADDY_ACCESS_ADDRESS=${DEFAULT_MDNS_HOSTNAME}
+            if mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
+                warn "The default mDNS name ${CADDY_ACCESS_ADDRESS} is already in use."
+                prompt_for_local_hostname
+            else
+                info "Migrating existing access automatically to https://${CADDY_ACCESS_ADDRESS}."
+            fi
+            configure_mdns
+            migrate_caddy_to_mdns
+        else
+            if mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
+                warn "The configured mDNS name ${CADDY_ACCESS_ADDRESS} is advertised by another LAN device."
+                CADDY_ACCESS_NEEDS_MIGRATION=2
+                prompt_for_local_hostname "${CADDY_ACCESS_ADDRESS}"
+                configure_mdns
+                migrate_caddy_to_mdns
+            else
+                configure_mdns
+                if (( CADDY_ACCESS_NEEDS_MIGRATION == 1 )); then
+                    store_caddy_access_state || {
+                        error "Unable to migrate the legacy hostname state file."
+                        return 1
+                    }
+                    CADDY_ACCESS_NEEDS_MIGRATION=0
+                    ok "Stored the existing .local hostname in the hostname-only access state."
+                fi
+            fi
+        fi
         report_configured_caddy_access
     fi
 

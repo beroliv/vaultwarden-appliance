@@ -1,69 +1,86 @@
 # vaultwarden-appliance
 
-Simple LAN-first Vaultwarden appliance with Caddy and `vwctl`; USB backups are
-planned for a later phase.
+Simple LAN-only Vaultwarden appliance with Caddy, local HTTPS, mDNS, and
+`vwctl`. USB backup and restore are planned for later phases.
 
-## Phase 4: appliance management with vwctl
+## Installation
 
-The installer performs the Phase 1 system checks, optionally installs Docker
-Engine and Docker Compose v2 from Docker's official Debian repository, and
-deploys Vaultwarden and Caddy under `/opt/vaultwarden`.
-
-On a Debian-based test system, including 64-bit Raspberry Pi OS, run:
+On a supported Debian or 64-bit Raspberry Pi OS system, run:
 
 ```bash
 sudo bash ./install.sh
 ```
 
-If Docker is missing, pressing Enter at the installation prompt accepts the
-default of Yes. If Docker is already installed, its daemon must be running and
-Docker Compose v2 must work as `docker compose`; a working installation is used
+The installer performs system checks, can install Docker Engine and Docker
+Compose v2 from Docker's official Debian repository, and deploys the appliance
+under `/opt/vaultwarden`. A working existing Docker installation is reused
 without modification.
 
-Vaultwarden data is stored in `/opt/vaultwarden/data/vaultwarden`. Vaultwarden
-has no host-published port. Caddy publishes only TCP port 443 and provides local
-HTTPS through its internal CA.
-
-Direct access through the detected LAN IPv4 address is the recommended default:
+The installer installs Debian's `avahi-daemon`, `avahi-utils`, and `libnss-mdns`
+packages when needed. On a fresh configuration it asks:
 
 ```text
-https://192.168.0.192
+Local Vaultwarden name [vaultwarden.local]:
 ```
 
-This requires no local DNS, but the address should not change. Create a DHCP
-reservation for the Raspberry Pi in the router or DHCP server. The installer
-does not configure a static IP or modify any host, router, DNS or DHCP settings.
+The name must be a single valid label below `.local`. Avahi advertises it on
+the LAN, so the normal URL is:
 
-Local hostname access remains optional and defaults to `vaultwarden.local`.
-When selected, the installer prints the DNS or hosts-file mapping that the
-administrator must configure manually.
+```text
+https://vaultwarden.local
+```
 
-The selected mode and HTTPS address are stored in
-`/opt/vaultwarden/.caddy-access`. Reruns report and preserve this state. An
-existing hostname-based Phase 3 installation remains hostname-based.
+The appliance does not change the Raspberry Pi's system hostname and does not
+modify router, DNS, DHCP, static-IP, gateway, interface, or client hosts-file
+settings. If the requested mDNS name is already advertised by another device,
+the installer proposes an available alternative such as
+`vaultwarden-2.local`.
 
-Caddy's persistent data is stored below `/opt/vaultwarden/data/caddy`. Its
-public root CA certificate is exported to:
+Vaultwarden data is stored in `/opt/vaultwarden/data/vaultwarden` and has no
+host-published port. Caddy is the only LAN-facing container and publishes only
+TCP port 443. Its persistent data, including the internal CA, is stored below
+`/opt/vaultwarden/data/caddy`.
+
+The selected local name is stored as human-readable, non-secret state in:
+
+```text
+/opt/vaultwarden/.caddy-access
+```
+
+## mDNS and certificate trust are separate
+
+mDNS makes `vaultwarden.local` resolve to the appliance's current LAN address.
+It does not make the HTTPS certificate trusted. Every client must also trust
+Caddy's exported public root CA:
 
 ```text
 /opt/vaultwarden/certs/caddy-root-ca.crt
 ```
 
-Install this certificate as a trusted root CA on every client that accesses the
-appliance. The private CA key is never exported.
+The private CA key is never exported. Installing the public root certificate
+does not configure mDNS, and mDNS resolution does not install the certificate.
+Both must work on a client for a trusted `https://vaultwarden.local` connection.
 
-The installer copies the repository's `vwctl` script to
-`/usr/local/bin/vwctl` with executable permissions. Basic usage:
+mDNS is link-local multicast. It normally works only within the same LAN or
+subnet and can be blocked by guest-Wi-Fi isolation, VLAN boundaries, multicast
+filtering, VPNs, or client policy. Apple platforms include Bonjour support.
+Modern Android includes `.local` mDNS resolution, while older or vendor-modified
+devices and individual apps may vary. Windows application and policy behavior
+can vary; Bonjour-capable software may be needed on affected clients. Linux
+clients need working mDNS resolver integration, commonly `libnss-mdns` or an
+appropriately configured `systemd-resolved`.
+
+## Management
+
+The installer copies `vwctl` to `/usr/local/bin/vwctl`:
 
 ```bash
 vwctl help
 vwctl status
-vwctl logs
-vwctl logs caddy
+vwctl logs [vaultwarden|caddy]
 sudo vwctl update
 sudo vwctl restart
 sudo vwctl access
-sudo vwctl access ip
 sudo vwctl access hostname
 vwctl signup status
 sudo vwctl signup on
@@ -71,38 +88,42 @@ sudo vwctl signup off
 sudo vwctl cert export
 ```
 
-`vwctl update` pulls only the Vaultwarden and Caddy images; it does not update
-the operating system or prune unrelated images. `vwctl restart` recreates only
-the appliance containers. Both commands preserve bind-mounted application data
-and Caddy's persistent internal CA and verify HTTPS afterward.
+`sudo vwctl access` and `sudo vwctl access hostname` change only the local
+`.local` name. After validation, conflict detection, and confirmation, `vwctl`
+updates the appliance mDNS advertisement, regenerates the complete Caddyfile,
+and rebuilds only Caddy. Vaultwarden is not stopped or recreated. Caddy's
+persistent data is not deleted, and the internal root CA hash must remain
+unchanged while Caddy obtains a new leaf certificate for the new hostname.
 
-Access changes require explicit confirmation. `vwctl` removes only the Caddy
-container, generates a complete appliance-managed Caddyfile and authoritative
-`.caddy-access` state, validates the configuration and creates Caddy again
-without touching the Vaultwarden container. The persistent directories below
-`/opt/vaultwarden/data/caddy` are never removed, and the root CA hash must stay
-unchanged. The public root certificate export is refreshed after the rebuild.
+Direct-IP HTTPS access is no longer supported.
 
-Access changes do not automatically roll back. If the new Caddy configuration
-or HTTPS verification fails, the generated configuration and diagnostics remain
-available and Vaultwarden continues running. Correct the reported problem and
-rerun `sudo vwctl access ip` or `sudo vwctl access hostname`.
+## Existing installations
 
-Signup changes are isolated in
-`/opt/vaultwarden/docker-compose.vwctl.yml`, which overrides only
-`SIGNUPS_ALLOWED`. Other Compose settings remain unchanged.
+Reruns recognize `/opt/vaultwarden/.vaultwarden-appliance` and remain
+non-destructive. A legacy hostname configuration is converted to the
+hostname-only state format. A legacy direct-IP configuration, including the
+Atlas test installation, is migrated to `vaultwarden.local` (or an accepted
+conflict-free alternative). The migration configures mDNS and rebuilds only
+Caddy while preserving Vaultwarden data and Caddy's persistent internal root CA.
 
-To inspect the exit status:
+Unknown `/opt/vaultwarden` directories without the appliance marker or the
+recognized legacy Phase 2 structure are left unchanged.
+
+## Basic verification
+
+After installation:
 
 ```bash
-sudo ./install.sh
-echo "$?"
+sudo vwctl status
+systemctl is-active avahi-daemon
+systemctl is-active vaultwarden-appliance-mdns
+avahi-resolve-host-name -4 vaultwarden.local
+curl --cacert /opt/vaultwarden/certs/caddy-root-ca.crt \
+  https://vaultwarden.local/alive
+docker inspect vaultwarden --format '{{json .HostConfig.PortBindings}}'
+docker inspect caddy --format '{{json .HostConfig.PortBindings}}'
 ```
 
-The installer recognizes its own existing installations through
-`/opt/vaultwarden/.vaultwarden-appliance` and performs a non-destructive rerun.
-Unknown installations without a valid marker or recognized legacy Phase 2
-structure are left unchanged.
-
-Phase 5 and later functionality (USB handling, backup, and restore) is not
-implemented yet.
+Use the actual hostname reported by `vwctl status` if a conflict-free
+alternative was selected. Phase 5 and later USB backup and restore functionality
+is not implemented yet.

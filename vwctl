@@ -16,12 +16,16 @@ readonly LEGACY_HOSTNAME_FILE="${INSTALL_DIR}/.caddy-hostname"
 readonly CADDY_ROOT_CA="${INSTALL_DIR}/data/caddy/data/caddy/pki/authorities/local/root.crt"
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
 readonly APPLIANCE_NETWORK="vaultwarden-appliance"
+readonly DEFAULT_MDNS_HOSTNAME="vaultwarden.local"
+readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
+readonly MDNS_SERVICE_FILE="/etc/systemd/system/vaultwarden-appliance-mdns.service"
+readonly MDNS_SERVICE="vaultwarden-appliance-mdns.service"
 readonly LOG_LINES=100
 readonly ACCESS_HTTPS_TIMEOUT=60
 readonly ACCESS_HTTPS_RETRY_INTERVAL=2
 
-ACCESS_MODE=""
 ACCESS_ADDRESS=""
+ACCESS_NEEDS_MIGRATION=0
 HTTPS_LAST_ERROR=""
 
 info() {
@@ -47,7 +51,7 @@ Usage:
   vwctl logs [vaultwarden|caddy]
   sudo vwctl update
   sudo vwctl restart
-  sudo vwctl access [ip|hostname]
+  sudo vwctl access [hostname]
   vwctl signup status
   sudo vwctl signup on
   sudo vwctl signup off
@@ -58,7 +62,7 @@ Commands:
   logs               Show the last 100 log lines; optionally select one service
   update             Pull and apply appliance container image updates
   restart            Safely recreate the appliance containers
-  access             Change between IP address and local hostname HTTPS access
+  access             Change the local mDNS hostname used for HTTPS access
   signup             Show, enable, or disable account registration
   cert export        Refresh the public Caddy root CA export
 HELP
@@ -125,19 +129,10 @@ compose_with_signup_candidate() {
 
 validate_local_hostname() {
     local hostname=$1
-    local label
-    local -a labels
 
-    (( ${#hostname} <= 253 )) || return 1
-    [[ "${hostname}" == *.* ]] || return 1
-    [[ "${hostname}" != .* && "${hostname}" != *. ]] || return 1
-    [[ ! "${hostname}" =~ ^[0-9.]+$ ]] || return 1
-
-    IFS='.' read -r -a labels <<<"${hostname}"
-    for label in "${labels[@]}"; do
-        (( ${#label} <= 63 )) || return 1
-        [[ "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
-    done
+    (( ${#hostname} <= 69 )) || return 1
+    [[ "${hostname}" == "${hostname,,}" ]] || return 1
+    [[ "${hostname}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.local$ ]]
 }
 
 validate_ipv4_address() {
@@ -176,6 +171,105 @@ detect_ipv4_address() {
     return 1
 }
 
+require_mdns_runtime() {
+    command_exists avahi-resolve-host-name || die "avahi-utils is required. Rerun the appliance installer."
+    command_exists avahi-set-host-name || die "avahi-utils is required. Rerun the appliance installer."
+    command_exists systemctl || die "systemd is required for appliance mDNS."
+    [[ -f "${MDNS_ENV_FILE}" && ! -L "${MDNS_ENV_FILE}" ]] || \
+        die "The appliance mDNS state is missing or unsafe. Rerun the appliance installer."
+    [[ -f "${MDNS_SERVICE_FILE}" && ! -L "${MDNS_SERVICE_FILE}" ]] || \
+        die "The appliance mDNS service is missing or unsafe. Rerun the appliance installer."
+    grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_ENV_FILE}" || \
+        die "The mDNS state is not appliance-managed."
+    grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_SERVICE_FILE}" || \
+        die "The mDNS service is not appliance-managed."
+}
+
+mdns_resolved_ipv4s() {
+    local hostname=$1
+
+    timeout 4 avahi-resolve-host-name -4 "${hostname}" 2>/dev/null |
+        awk 'NF >= 2 {print $2}'
+}
+
+mdns_name_conflicts() {
+    local hostname=$1
+    local current_ip=""
+    local resolved=""
+
+    current_ip=$(detect_ipv4_address || true)
+    resolved=$(mdns_resolved_ipv4s "${hostname}" || true)
+    [[ -n "${resolved}" ]] || return 1
+    [[ -n "${current_ip}" ]] && grep -Fxq "${current_ip}" <<<"${resolved}" && return 1
+    return 0
+}
+
+next_available_mdns_hostname() {
+    local base=${1%.local}
+    local candidate
+    local suffix
+
+    for suffix in {2..99}; do
+        candidate="${base}-${suffix}.local"
+        if validate_local_hostname "${candidate}" && ! mdns_name_conflicts "${candidate}"; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+configure_mdns_hostname() {
+    local hostname=$1
+    local label=${hostname%.local}
+    local candidate
+
+    require_mdns_runtime
+    candidate=$(mktemp "${INSTALL_DIR}/.mdns-env.vwctl.XXXXXXXX") || \
+        die "Unable to create a temporary mDNS state file."
+    printf '# Vaultwarden Appliance mDNS\nVAULTWARDEN_MDNS_LABEL=%s\n' "${label}" > "${candidate}"
+    chmod 0644 "${candidate}"
+    if ! install -m 0644 "${candidate}" "${MDNS_ENV_FILE}"; then
+        rm -f -- "${candidate}"
+        die "Unable to update the appliance mDNS hostname state."
+    fi
+    rm -f -- "${candidate}"
+
+    systemctl restart "${MDNS_SERVICE}" || die "Unable to restart the appliance mDNS hostname service."
+}
+
+verify_mdns_hostname() {
+    local hostname=$1
+    local current_ip
+    local deadline=$((SECONDS + ACCESS_HTTPS_TIMEOUT))
+    local resolved=""
+
+    current_ip=$(detect_ipv4_address) || {
+        printf '[FAIL] Unable to detect the LAN IPv4 address for mDNS verification.\n' >&2
+        return 1
+    }
+    if ! systemctl is-active --quiet avahi-daemon.service; then
+        printf '[FAIL] Avahi is not active.\n' >&2
+        return 1
+    fi
+    if ! systemctl is-active --quiet "${MDNS_SERVICE}"; then
+        printf '[FAIL] The appliance mDNS hostname service is not active.\n' >&2
+        return 1
+    fi
+
+    while :; do
+        resolved=$(mdns_resolved_ipv4s "${hostname}" || true)
+        grep -Fxq "${current_ip}" <<<"${resolved}" && return 0
+        (( SECONDS >= deadline )) && break
+        sleep "${ACCESS_HTTPS_RETRY_INTERVAL}"
+    done
+
+    printf '[FAIL] mDNS did not resolve %s to the detected LAN IPv4 address %s.\n' \
+        "${hostname}" "${current_ip}" >&2
+    [[ -z "${resolved}" ]] || printf 'Resolved IPv4 address(es): %s\n' "${resolved//$'\n'/, }" >&2
+    return 1
+}
+
 load_access_state() {
     local address
     local mode
@@ -191,6 +285,14 @@ load_access_state() {
 
     if [[ -f "${ACCESS_FILE}" && ! -L "${ACCESS_FILE}" ]]; then
         mapfile -t lines < "${ACCESS_FILE}"
+        if (( ${#lines[@]} == 1 )) && [[ "${lines[0]}" == hostname=* ]]; then
+            address=${lines[0]#hostname=}
+            validate_local_hostname "${address}" || return 1
+            ACCESS_ADDRESS=${address}
+            ACCESS_NEEDS_MIGRATION=0
+            return 0
+        fi
+
         (( ${#lines[@]} == 2 )) || return 1
         [[ "${lines[0]}" == mode=* && "${lines[1]}" == address=* ]] || return 1
         mode=${lines[0]#mode=}
@@ -204,28 +306,24 @@ load_access_state() {
         return 1
     fi
 
-    case "${mode}" in
-        ip)
-            validate_ipv4_address "${address}" || return 1
-            ;;
-        hostname)
-            validate_local_hostname "${address}" || return 1
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    ACCESS_MODE=${mode}
-    ACCESS_ADDRESS=${address}
+    if [[ "${mode}" == "hostname" ]] && validate_local_hostname "${address}"; then
+        ACCESS_ADDRESS=${address}
+        ACCESS_NEEDS_MIGRATION=1
+        return 0
+    fi
+    if [[ "${mode}" == "ip" ]] && validate_ipv4_address "${address}"; then
+        ACCESS_ADDRESS=""
+        ACCESS_NEEDS_MIGRATION=1
+        return 0
+    fi
+    return 1
 }
 
 write_access_state_to() {
     local destination=$1
-    local mode=$2
-    local address=$3
+    local address=$2
 
-    printf 'mode=%s\naddress=%s\n' "${mode}" "${address}" > "${destination}"
+    printf 'hostname=%s\n' "${address}" > "${destination}"
     chmod 0644 "${destination}"
 }
 
@@ -461,6 +559,12 @@ verify_access_change() {
         return 1
     fi
 
+    if ! container_is_connected_to_network vaultwarden "${APPLIANCE_NETWORK}"; then
+        printf '[FAIL] Vaultwarden is not attached to %s.\n' "${APPLIANCE_NETWORK}" >&2
+        docker inspect --format '{{json .NetworkSettings.Networks}}' vaultwarden >&2 || true
+        return 1
+    fi
+
     if [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' vaultwarden 2>/dev/null)" != "0" ]]; then
         printf '[FAIL] Vaultwarden unexpectedly publishes a host port.\n' >&2
         docker inspect --format '{{json .HostConfig.PortBindings}}' vaultwarden >&2 || true
@@ -472,6 +576,10 @@ verify_access_change() {
         "${ACCESS_HTTPS_TIMEOUT}" \
         "${ACCESS_HTTPS_RETRY_INTERVAL}"; then
         printf '[FAIL] TCP port 443 is not listening.\n' >&2
+        return 1
+    fi
+
+    if ! verify_mdns_hostname "${address}"; then
         return 1
     fi
 
@@ -529,6 +637,10 @@ verify_appliance() {
         printf 'Error: The appliance access state is invalid.\n' >&2
         return 1
     fi
+    if (( ACCESS_NEEDS_MIGRATION == 1 )); then
+        printf 'Error: The appliance still has obsolete access state. Rerun the installer.\n' >&2
+        return 1
+    fi
     if ! wait_for_container vaultwarden; then
         printf 'Error: Vaultwarden is not running after the operation.\n' >&2
         return 1
@@ -552,6 +664,9 @@ verify_appliance() {
     fi
     if ! container_is_connected_to_network caddy "${APPLIANCE_NETWORK}"; then
         printf 'Error: Caddy is not connected to %s.\n' "${APPLIANCE_NETWORK}" >&2
+        return 1
+    fi
+    if ! verify_mdns_hostname "${ACCESS_ADDRESS}"; then
         return 1
     fi
     if ! verify_https "${ACCESS_ADDRESS}"; then
@@ -582,9 +697,10 @@ cleanup_operation_directory() {
 command_status() {
     local caddy_state
     local current_ip="not detected"
-    local ip_note=""
-    local mode_label
+    local mdns_name="migration required"
+    local mdns_state="inactive"
     local network_state="incomplete"
+    local resolved_ip="not resolved"
     local root_state="missing"
     local signup_label
     local vaultwarden_state
@@ -597,6 +713,20 @@ command_status() {
     caddy_state=$(container_state caddy)
     current_ip=$(detect_ipv4_address || printf 'not detected')
 
+    if (( ACCESS_NEEDS_MIGRATION == 0 )); then
+        mdns_name=${ACCESS_ADDRESS}
+        if command_exists systemctl &&
+           systemctl is-active --quiet avahi-daemon.service &&
+           systemctl is-active --quiet "${MDNS_SERVICE}"; then
+            mdns_state="active"
+        fi
+        if command_exists avahi-resolve-host-name; then
+            resolved_ip=$(mdns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
+            [[ -n "${resolved_ip}" ]] || resolved_ip="not resolved"
+            resolved_ip=${resolved_ip//$'\n'/, }
+        fi
+    fi
+
     if container_is_connected_to_network vaultwarden "${APPLIANCE_NETWORK}" &&
        container_is_connected_to_network caddy "${APPLIANCE_NETWORK}"; then
         network_state="connected"
@@ -604,15 +734,6 @@ command_status() {
 
     if [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]]; then
         root_state="present"
-    fi
-
-    if [[ "${ACCESS_MODE}" == "ip" ]]; then
-        mode_label="IP"
-        if validate_ipv4_address "${current_ip}" && [[ "${current_ip}" != "${ACCESS_ADDRESS}" ]]; then
-            ip_note=" (DIFFERS from configured IP)"
-        fi
-    else
-        mode_label="hostname"
     fi
 
     case "$(current_signup_value)" in
@@ -624,9 +745,15 @@ command_status() {
     printf 'Vaultwarden Appliance status\n\n'
     printf '%-15s %s\n' 'Vaultwarden:' "${vaultwarden_state}"
     printf '%-15s %s\n' 'Caddy:' "${caddy_state}"
-    printf '%-15s %s\n' 'Access:' "${mode_label}"
-    printf '%-15s https://%s\n' 'URL:' "${ACCESS_ADDRESS}"
-    printf '%-15s %s%s\n' 'Current IP:' "${current_ip}" "${ip_note}"
+    if (( ACCESS_NEEDS_MIGRATION == 0 )); then
+        printf '%-15s https://%s\n' 'URL:' "${ACCESS_ADDRESS}"
+    else
+        printf '%-15s %s\n' 'URL:' 'migration required (rerun install.sh)'
+    fi
+    printf '%-15s %s\n' 'mDNS:' "${mdns_state}"
+    printf '%-15s %s\n' 'mDNS name:' "${mdns_name}"
+    printf '%-15s %s\n' 'Resolved IP:' "${resolved_ip}"
+    printf '%-15s %s\n' 'Current IP:' "${current_ip}"
     printf '%-15s %s\n' 'Network:' "${network_state} (${APPLIANCE_NETWORK})"
     printf '%-15s %s\n' 'VW image:' "$(container_image vaultwarden)"
     printf '%-15s %s\n' 'Caddy image:' "$(container_image caddy)"
@@ -661,6 +788,8 @@ command_update() {
     require_appliance
     require_docker
     load_access_state || die "The appliance access state is missing or invalid."
+    (( ACCESS_NEEDS_MIGRATION == 0 )) || die "Obsolete access state detected. Rerun the appliance installer first."
+    require_mdns_runtime
     require_https_verification_ready
     compose config --quiet || die "The appliance Compose configuration is invalid."
 
@@ -693,6 +822,8 @@ command_restart() {
     require_appliance
     require_docker
     load_access_state || die "The appliance access state is missing or invalid."
+    (( ACCESS_NEEDS_MIGRATION == 0 )) || die "Obsolete access state detected. Rerun the appliance installer first."
+    require_mdns_runtime
     require_https_verification_ready
     compose config --quiet || die "The appliance Compose configuration is invalid."
 
@@ -744,24 +875,14 @@ report_access_change_failure() {
 }
 
 apply_access_change() {
-    local new_mode=$1
-    local new_address=$2
+    local new_address=$1
     local caddy_candidate
     local root_hash_before
     local state_candidate
 
-    case "${new_mode}" in
-        ip)
-            validate_ipv4_address "${new_address}" || die "The requested IPv4 address is invalid."
-            ;;
-        hostname)
-            validate_local_hostname "${new_address}" || die "The requested hostname is invalid."
-            ;;
-        *)
-            die "The requested access mode is invalid."
-            ;;
-    esac
+    validate_local_hostname "${new_address}" || die "The requested .local hostname is invalid."
 
+    require_mdns_runtime
     require_https_verification_ready
     command_exists sha256sum || die "sha256sum is required to verify Caddy's root CA."
     compose config --quiet || die "The appliance Compose configuration is invalid."
@@ -775,7 +896,7 @@ apply_access_change() {
     }
 
     if ! write_caddyfile_to "${caddy_candidate}" "${new_address}" ||
-       ! write_access_state_to "${state_candidate}" "${new_mode}" "${new_address}"; then
+       ! write_access_state_to "${state_candidate}" "${new_address}"; then
         rm -f -- "${caddy_candidate}" "${state_candidate}"
         die "Unable to generate the new access configuration."
     fi
@@ -800,6 +921,13 @@ apply_access_change() {
         return 1
     fi
 
+    info "Updating the appliance mDNS advertisement to ${new_address}..."
+    if ! configure_mdns_hostname "${new_address}"; then
+        printf '[FAIL] The appliance mDNS hostname could not be updated.\n' >&2
+        report_access_change_failure
+        return 1
+    fi
+
     info "Creating a clean Caddy container for https://${new_address}..."
     if ! compose up -d --no-deps caddy; then
         printf '[FAIL] Docker Compose could not create Caddy.\n' >&2
@@ -812,8 +940,8 @@ apply_access_change() {
         return 1
     fi
 
-    ACCESS_MODE=${new_mode}
     ACCESS_ADDRESS=${new_address}
+    ACCESS_NEEDS_MIGRATION=0
     info "Access configuration changed successfully."
     info "URL: https://${new_address}"
 }
@@ -836,44 +964,53 @@ confirm_access_change() {
     esac
 }
 
-access_ip() {
-    local current_ip
-
-    current_ip=$(detect_ipv4_address) || die "Unable to detect a usable LAN IPv4 address."
-    validate_ipv4_address "${current_ip}" || die "The detected LAN IPv4 address is invalid."
-    printf 'Detected LAN IPv4 address: %s\n' "${current_ip}"
-    printf 'New HTTPS URL: https://%s\n' "${current_ip}"
-    confirm_access_change "${current_ip}" || return 0
-
-    apply_access_change ip "${current_ip}"
-    printf '\nIMPORTANT:\nThis IP address should not change.\n\n'
-    printf 'Recommended:\nCreate a DHCP reservation for %s in your router/DHCP server.\n\n' "${current_ip}"
-    printf 'The appliance did not modify your network configuration.\n'
-}
-
 access_hostname() {
+    local conflict_answer=""
     local hostname=""
     local current_ip
+    local default_hostname=${ACCESS_ADDRESS:-${DEFAULT_MDNS_HOSTNAME}}
+    local suggestion=""
 
-    current_ip=$(detect_ipv4_address) || die "Unable to detect a usable LAN IPv4 address for the DNS mapping."
+    require_mdns_runtime
+    current_ip=$(detect_ipv4_address) || die "Unable to detect a usable LAN IPv4 address for mDNS verification."
     while true; do
-        if ! read -r -p "Vaultwarden hostname [vaultwarden.local]: " hostname </dev/tty; then
+        if ! read -r -p "Local Vaultwarden name [${default_hostname}]: " hostname </dev/tty; then
             die "Unable to read the hostname."
         fi
-        hostname=${hostname:-vaultwarden.local}
-        validate_local_hostname "${hostname}" && break
-        printf 'Invalid hostname. Use dot-separated DNS labels without spaces or underscores.\n' >&2
+        hostname=${hostname:-${default_hostname}}
+        hostname=${hostname,,}
+        if ! validate_local_hostname "${hostname}"; then
+            printf 'Invalid local name. Use one DNS label followed by .local, without spaces or underscores.\n' >&2
+            continue
+        fi
+        if [[ "${hostname}" == "${ACCESS_ADDRESS}" && ${ACCESS_NEEDS_MIGRATION} -eq 0 ]]; then
+            info "The appliance already uses https://${hostname}; no change is needed."
+            return 0
+        fi
+        if ! mdns_name_conflicts "${hostname}"; then
+            break
+        fi
+
+        printf 'The mDNS name %s is already advertised by another LAN device.\n' "${hostname}" >&2
+        suggestion=$(next_available_mdns_hostname "${hostname}") || \
+            die "Unable to find an available alternative .local name."
+        if ! read -r -p "Use available alternative ${suggestion}? [Y/n] " conflict_answer </dev/tty; then
+            die "Unable to read the mDNS conflict choice."
+        fi
+        case "${conflict_answer}" in
+            ""|y|Y|yes|YES|Yes) hostname=${suggestion}; break ;;
+            *) info "Choose a different .local name." ;;
+        esac
     done
 
-    info "Required DNS mapping: ${hostname} -> ${current_ip}"
-    info "The appliance will not modify DNS or hosts files."
+    info "mDNS mapping: ${hostname} -> ${current_ip}"
+    info "The appliance will not change the system hostname, DNS, router, hosts files, or IP configuration."
     info "New HTTPS URL: https://${hostname}"
     confirm_access_change "${hostname}" || return 0
-    apply_access_change hostname "${hostname}"
+    apply_access_change "${hostname}"
 }
 
 command_access() {
-    local choice=""
     local requested_mode=${1:-}
 
     require_root "access${requested_mode:+ ${requested_mode}}"
@@ -882,25 +1019,9 @@ command_access() {
     [[ -r /dev/tty ]] || die "An interactive terminal is required for access changes."
     load_access_state || die "The current access state is missing or invalid."
 
-    if [[ -z "${requested_mode}" ]]; then
-        printf 'Current access: %s\n' "${ACCESS_MODE}"
-        printf 'Current URL:    https://%s\n\n' "${ACCESS_ADDRESS}"
-        printf '1) IP address\n2) Local hostname\n3) Cancel\n\n'
-        if ! read -r -p "Choice [3]: " choice </dev/tty; then
-            die "Unable to read the access choice."
-        fi
-        case "${choice:-3}" in
-            1) requested_mode="ip" ;;
-            2) requested_mode="hostname" ;;
-            3) info "Access configuration was not changed."; return 0 ;;
-            *) die "Invalid choice."
-        esac
-    fi
-
     case "${requested_mode}" in
-        ip) access_ip ;;
-        hostname) access_hostname ;;
-        *) die "Usage: sudo vwctl access [ip|hostname]" ;;
+        ""|hostname) access_hostname ;;
+        *) die "Usage: sudo vwctl access [hostname]" ;;
     esac
 }
 
@@ -1057,7 +1178,7 @@ main() {
             command_restart
             ;;
         access)
-            (( $# <= 2 )) || die "Usage: sudo vwctl access [ip|hostname]"
+            (( $# <= 2 )) || die "Usage: sudo vwctl access [hostname]"
             command_access "${2:-}"
             ;;
         signup)

@@ -12,6 +12,7 @@ Core components:
 * Caddy
 * Docker
 * Docker Compose
+* Avahi/mDNS
 * `vwctl` management utility
 * Automated USB backups
 
@@ -44,7 +45,7 @@ The appliance is intended for users who:
 
 The appliance is **not intended to completely hide Linux or networking concepts**.
 
-Users who expose the appliance to the Internet are expected to understand DNS, DynDNS, firewalls, port forwarding and the associated security implications.
+The appliance is LAN-only. Public Internet exposure is outside the project scope.
 
 ---
 
@@ -81,6 +82,8 @@ Version 1 will NOT automatically configure:
 * public DNS providers;
 * Cloudflare;
 * router port forwarding;
+* router or local DNS configuration;
+* static IP or DHCP reservation configuration;
 * VPN services;
 * NAS backup targets;
 * cloud backup services;
@@ -134,6 +137,16 @@ The final directory structure may evolve during implementation, but `/opt/vaultw
 
 The management command is installed separately as `/usr/local/bin/vwctl`.
 
+The hostname-only access state contains one non-secret line:
+
+```text
+hostname=vaultwarden.local
+```
+
+The appliance also owns `/etc/default/vaultwarden-appliance-mdns` and
+`/etc/systemd/system/vaultwarden-appliance-mdns.service`. These files persist
+the Avahi hostname advertisement without changing the Linux system hostname.
+
 ---
 
 ## 6. Installer
@@ -163,6 +176,11 @@ Before making changes, the installer MUST check:
 * availability of required TCP port 443;
 * existing `/opt/vaultwarden` installation;
 * relevant network configuration.
+
+Before Caddy is configured, the installer MUST ensure that Debian's
+`avahi-daemon`, `avahi-utils`, and `libnss-mdns` packages are installed and that
+Avahi is active. The appliance mDNS service MUST be enabled and active after a
+hostname has been selected.
 
 ARM64 Raspberry Pi systems MUST be supported.
 
@@ -225,8 +243,7 @@ A user should normally be able to accept the defaults by pressing Enter.
 Example:
 
 ```text
-Access mode [IP address]:
-IP address [automatically detected]:
+Local Vaultwarden name [vaultwarden.local]:
 HTTPS [Caddy internal]:
 Account registration [Enabled]:
 Automatic USB backup [Enabled]:
@@ -252,15 +269,15 @@ The default deployment MUST NOT require:
 Caddy MUST provide HTTPS using its internal certificate authority.
 
 The appliance publishes only Caddy's TCP port 443. TCP port 80 is not
-published or required. Direct HTTPS access through the detected LAN IPv4
-address is the recommended default and does not require local DNS. A local
-hostname remains available as an optional alternative; the installer displays
-the hostname-to-address mapping that the administrator must configure.
+published or required. The single supported access architecture is HTTPS using
+a `.local` hostname advertised with mDNS. The default and recommended URL is
+`https://vaultwarden.local`. Direct-IP HTTPS access is not supported.
 
-For IP address access, the installer MUST explain that the address should not
-change and SHOULD recommend a DHCP reservation in the router or DHCP server.
-It MUST NOT configure a static IP or modify NetworkManager, dhcpcd,
-systemd-networkd, interfaces, DNS, gateways, routers or DHCP settings.
+The installer MUST NOT configure a static IP or modify NetworkManager, dhcpcd,
+systemd-networkd, interfaces, DNS, gateways, routers, DHCP settings, or client
+hosts files. The appliance's Avahi hostname is independent of the Linux system
+hostname; configuring or changing appliance access MUST NOT call `hostnamectl`
+or otherwise rename the host operating system.
 
 A typical architecture is:
 
@@ -275,12 +292,29 @@ Vaultwarden
 Vaultwarden MUST NOT publish its HTTP port on the host. Vaultwarden and Caddy
 must communicate through the `vaultwarden-appliance` Docker network.
 
-On first Caddy configuration, the installer prompts for either the detected LAN
-IPv4 address or a valid dot-separated hostname. IP address access is the
-default. The optional hostname defaults to `vaultwarden.local`. The selected
-mode and address are stored in `/opt/vaultwarden/.caddy-access` as non-secret,
-human-readable state. Existing `.caddy-hostname` state from the original Phase
-3 implementation is migrated without changing its hostname.
+On first Caddy configuration, the installer prompts `Local Vaultwarden name
+[vaultwarden.local]:`. The value MUST be a single valid, lowercase DNS label
+followed by `.local`. The installer checks whether the requested name is already
+advertised by another LAN device. On conflict it MUST refuse to claim that name
+and SHOULD offer a conflict-free alternative such as `vaultwarden-2.local`.
+
+The selected hostname is stored in `/opt/vaultwarden/.caddy-access` as
+non-secret, human-readable state. Avahi advertises the name and the installer
+verifies that it resolves to the detected appliance LAN IPv4 address. The
+obsolete `.caddy-hostname` file is removed only after safe state migration.
+
+mDNS name resolution and HTTPS certificate trust are separate mechanisms.
+mDNS maps the `.local` name to the appliance's current address. Caddy's internal
+root CA must still be installed as trusted on each client. Neither mechanism
+configures the other.
+
+mDNS is link-local multicast and may not cross subnets, VLANs, guest-network
+isolation, VPNs, or multicast-filtering access points. Apple platforms normally
+provide Bonjour support. Modern Android provides `.local` mDNS resolution, but
+older or customized devices and individual apps may vary. Windows support can
+vary by application and policy, and Bonjour-capable software may be required on
+affected clients. Linux clients require mDNS resolver integration such as
+`libnss-mdns` or appropriately configured `systemd-resolved`.
 
 ---
 
@@ -295,16 +329,7 @@ joins the same `vaultwarden-appliance` network as Vaultwarden, publishes only
 host TCP port 443 and persists its `/data` and `/config` directories below
 `/opt/vaultwarden/data/caddy`. Vaultwarden remains unpublished on the host.
 
-IP address example:
-
-```caddy
-https://192.168.0.192 {
-    tls internal
-    reverse_proxy vaultwarden:80
-}
-```
-
-Optional hostname example:
+Hostname configuration:
 
 ```caddy
 https://vaultwarden.local {
@@ -315,18 +340,18 @@ https://vaultwarden.local {
 
 The final Caddy configuration must be generated by the installer based on the appliance configuration.
 
-The generated Caddyfile uses the selected IP address or local hostname, `tls internal`, and
+The generated Caddyfile uses the selected local hostname, `tls internal`, and
 `reverse_proxy vaultwarden:80`. Caddy's reverse proxy provides WebSocket
 upgrade support without a separate route. Automatic HTTP-to-HTTPS redirects
 are disabled so that host TCP port 80 is not required.
 
-On reruns, the installer reports and preserves the stored access mode, address,
-Caddy configuration, persistent data and internal CA. It does not silently
-switch modes, change an IP address or hostname, or regenerate the CA.
+On reruns, the installer reports and preserves the stored hostname, Caddy
+configuration, persistent data and internal CA. It does not silently change a
+current `.local` hostname or regenerate the CA.
 
 The Phase 4 `vwctl access` command replaces the complete appliance-managed
 Caddyfile and `.caddy-access` state, then rebuilds only the Caddy container so
-Caddy can obtain a server certificate for the selected IP address or hostname.
+Caddy can obtain a server certificate for the selected hostname.
 It never removes `/opt/vaultwarden/data/caddy`, so the existing internal root
 CA continues to be used. Old Caddyfile content and container-local state are
 not migrated to the rebuilt configuration.
@@ -408,7 +433,7 @@ vwctl status
 vwctl logs [vaultwarden|caddy]
 sudo vwctl update
 sudo vwctl restart
-sudo vwctl access [ip|hostname]
+sudo vwctl access [hostname]
 vwctl signup status
 sudo vwctl signup on
 sudo vwctl signup off
@@ -437,15 +462,18 @@ An update MUST NOT silently destroy existing data or configuration.
 
 ### 12.2 Status
 
-`vwctl status` presents human-readable container state, configured access mode
-and URL, current LAN IPv4 address and any configured-IP mismatch, Docker
-network status, container images, signup state and root CA export state.
+`vwctl status` presents human-readable Vaultwarden and Caddy state, configured
+HTTPS URL, mDNS service state, advertised name, resolved LAN IPv4 address,
+current appliance IPv4 address, Docker network status, container images, signup
+state and root CA export state.
 
 ```text
 Vaultwarden:       Running
 Caddy:             Running
-Access:            IP
-URL:               https://192.168.0.192
+mDNS:              active
+mDNS name:         vaultwarden.local
+URL:               https://vaultwarden.local
+Resolved IP:       192.168.0.192
 Current IP:        192.168.0.192
 Signup:            enabled
 Root CA:           /opt/vaultwarden/certs/caddy-root-ca.crt
@@ -462,24 +490,28 @@ both containers and HTTPS. It preserves the internal root CA.
 
 ### 12.4 Access Configuration
 
-`sudo vwctl access` interactively offers IP address, local hostname or cancel.
-The `ip` and `hostname` arguments select a mode directly but still request the
-new address or confirmation. Address changes never modify host or external
-network configuration.
+`sudo vwctl access` and `sudo vwctl access hostname` both prompt for a new local
+`.local` hostname, validate it, check for a conflicting mDNS advertisement and
+request explicit confirmation. Direct-IP access is not supported. Hostname
+changes never modify the Linux system hostname or any
+external network configuration.
 
 After validating the requested address and receiving explicit confirmation,
 `vwctl` records the SHA-256 hash of Caddy's persistent public root CA. It stops
 and removes only the Caddy service container, generates a complete formatted
-appliance Caddyfile, rewrites `.caddy-access`, removes the obsolete
+appliance Caddyfile, rewrites the hostname-only `.caddy-access`, removes the obsolete
 `.caddy-hostname` state and validates the new configuration with a one-off
-Caddy Compose container. It then creates Caddy with `--no-deps`, leaving the
-Vaultwarden container untouched.
+Caddy Compose container. It updates and verifies the appliance-managed Avahi
+hostname, then creates Caddy with `--no-deps`, leaving the Vaultwarden container
+untouched.
 
 Success requires Caddy and Vaultwarden to be running, Caddy to use the
 `vaultwarden-appliance` network and publish only TCP 443, Vaultwarden to publish
 no host ports, and the new HTTPS endpoint to validate using the exported root
-CA. The persistent root CA hash must remain unchanged. The public root
-certificate export is refreshed and checked against the persistent root.
+CA. Avahi and the appliance mDNS service must be active, and the selected name
+must resolve through mDNS to the current LAN IPv4 address. The persistent root
+CA hash must remain unchanged. The public root certificate export is refreshed
+and checked against the persistent root.
 
 The access command never removes `/opt/vaultwarden/data/caddy/data` or
 `/opt/vaultwarden/data/caddy/config`. This preserves the internal root CA while
@@ -488,10 +520,9 @@ the selected address.
 
 Access changes do not use automatic rollback. If formatting, validation,
 container creation or verification fails, `vwctl` reports the failing check and
-leaves the generated Caddyfile and authoritative access state in place for
+leaves the generated Caddyfile and authoritative hostname state in place for
 inspection. Vaultwarden remains running, and the administrator can correct the
-reported problem and rerun `sudo vwctl access ip` or
-`sudo vwctl access hostname`.
+reported problem and rerun `sudo vwctl access hostname`.
 
 ### 12.5 Signup Management
 
@@ -935,6 +966,8 @@ Run installer
         ↓
 Accept recommended defaults
         ↓
+Avahi advertises vaultwarden.local
+        ↓
 Vaultwarden starts
         ↓
 HTTPS works
@@ -965,6 +998,31 @@ Migration support does not need to be fully automated in the first implementatio
 However, Version 1 development MUST avoid design choices that unnecessarily prevent later migration.
 
 A migration procedure can be added after clean installation, backup and restore functionality have been proven reliable.
+
+The hostname-only mDNS architecture includes a narrowly scoped migration for
+appliance-managed Phase 3/4 access state. A legacy two-line hostname state is
+converted to `hostname=<name>` and its `.local` name is preserved. A legacy
+direct-IP state, including the Atlas reference installation, is migrated by the
+installer to `vaultwarden.local`, or to an explicitly accepted conflict-free
+alternative when that name is already advertised on the LAN.
+
+This access migration MUST:
+
+* install and configure the appliance-managed Avahi hostname advertisement;
+* regenerate the complete Caddyfile for the selected `.local` hostname;
+* stop and recreate only the Caddy container;
+* leave the Vaultwarden container and `/opt/vaultwarden/data/vaultwarden`
+  untouched;
+* leave `/opt/vaultwarden/data/caddy` untouched;
+* verify that Caddy's internal root CA hash did not change when a root already
+  exists;
+* remove `.caddy-hostname` only after the new state is safely installed;
+* verify mDNS resolution, Docker networking, TCP 443, HTTPS with explicit root
+  CA trust, and the root CA export.
+
+Old Caddy leaf certificates do not need to be preserved. Caddy may issue a new
+leaf certificate for the `.local` hostname from the existing persistent root
+CA, keeping already installed client root certificates valid.
 
 ---
 
