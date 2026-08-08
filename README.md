@@ -116,7 +116,18 @@ recognized legacy Phase 2 structure are left unchanged.
 Rerunning the installer refreshes the stored publication address from the
 current default-route LAN IPv4 address. It also automatically replaces the
 older appliance-owned `avahi-set-host-name` service, without changing unrelated
-Avahi configuration.
+Avahi configuration. If that obsolete service left the appliance name as
+Avahi's runtime hostname, the installer identifies it through Avahi's D-Bus
+state and the appliance-owned environment file, then restores Avahi to the
+unchanged machine hostname before starting the explicit publisher. A remote
+device using the requested name remains a conflict.
+
+The systemd service runs an appliance-owned wrapper around
+`avahi-publish-address`. The wrapper remains active with the publisher, confirms
+that the hostname resolves exclusively to the configured LAN IPv4 address, and
+turns an early successful publisher exit into a service failure. Consequently,
+errors such as `Failed to add address: Local name collision` are visible in the
+service journal instead of leaving an apparently successful inactive service.
 
 ## Basic verification
 

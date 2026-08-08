@@ -22,6 +22,9 @@ readonly DEFAULT_MDNS_HOSTNAME="vaultwarden.local"
 readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
 readonly MDNS_SERVICE_FILE="/etc/systemd/system/vaultwarden-appliance-mdns.service"
 readonly MDNS_SERVICE="vaultwarden-appliance-mdns.service"
+readonly MDNS_WRAPPER_SOURCE="${SCRIPT_DIR}/mdns-publisher"
+readonly MDNS_WRAPPER_FILE="/usr/local/libexec/vaultwarden-appliance-mdns"
+readonly MDNS_READY_FILE="/run/vaultwarden-appliance-mdns/ready"
 readonly MIN_DISK_SPACE_MB=2048
 
 ERRORS=0
@@ -40,7 +43,6 @@ CADDY_STATE="absent"
 CADDY_ACCESS_ADDRESS=""
 CADDY_ACCESS_NEEDS_MIGRATION=0
 LEGACY_IP_ADDRESS=""
-LEGACY_MDNS_SERVICE=0
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -750,6 +752,10 @@ install_mdns_support() {
         error "mDNS setup requires systemd."
         return 1
     }
+    command_exists busctl || {
+        error "mDNS migration requires busctl from systemd."
+        return 1
+    }
 
     for package in avahi-daemon avahi-utils libnss-mdns; do
         package_is_installed "${package}" || missing_packages+=("${package}")
@@ -771,6 +777,11 @@ install_mdns_support() {
         error "avahi-publish-address is unavailable after package installation."
         return 1
     }
+    if [[ ! -f "${MDNS_WRAPPER_SOURCE}" || -L "${MDNS_WRAPPER_SOURCE}" ]] ||
+       ! grep -Fxq '# Vaultwarden Appliance mDNS publisher' "${MDNS_WRAPPER_SOURCE}"; then
+        error "The appliance mDNS publisher wrapper is missing or unsafe at ${MDNS_WRAPPER_SOURCE}."
+        return 1
+    fi
 
     systemctl enable --now avahi-daemon.service
     systemctl is-active --quiet avahi-daemon.service || {
@@ -798,6 +809,90 @@ mdns_resolution_matches() {
     local resolved=$2
 
     [[ "${resolved}" == "${expected}" ]]
+}
+
+avahi_runtime_hostname() {
+    local output
+
+    output=$(busctl --system call \
+        org.freedesktop.Avahi \
+        / \
+        org.freedesktop.Avahi.Server \
+        GetHostName 2>/dev/null) || return 1
+
+    if [[ "${output}" =~ ^s[[:space:]]+\"([^\"]+)\"$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+system_hostname_label() {
+    local hostname_label
+
+    hostname_label=$(hostname --short 2>/dev/null || true)
+    hostname_label=${hostname_label%%.*}
+    [[ "${hostname_label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+    printf '%s\n' "${hostname_label}"
+}
+
+mdns_state_claims_hostname() {
+    local hostname=$1
+    local label=${hostname%.local}
+
+    [[ -f "${MDNS_ENV_FILE}" && ! -L "${MDNS_ENV_FILE}" ]] || return 1
+    grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_ENV_FILE}" || return 1
+    grep -Fxq "VAULTWARDEN_MDNS_HOSTNAME=${hostname}" "${MDNS_ENV_FILE}" && return 0
+    grep -Fxq "VAULTWARDEN_MDNS_LABEL=${label}" "${MDNS_ENV_FILE}"
+}
+
+clear_legacy_avahi_hostname() {
+    local avahi_hostname
+    local desired_label=${CADDY_ACCESS_ADDRESS%.local}
+    local restored_hostname
+    local system_hostname
+    local _attempt
+
+    avahi_hostname=$(avahi_runtime_hostname) || {
+        error "Unable to query Avahi's current runtime hostname."
+        return 1
+    }
+    system_hostname=$(system_hostname_label) || {
+        error "Unable to determine a valid machine hostname for Avahi migration."
+        return 1
+    }
+
+    if [[ "${avahi_hostname,,}" != "${desired_label,,}" ]]; then
+        return 0
+    fi
+    if [[ "${avahi_hostname,,}" == "${system_hostname,,}" ]]; then
+        error "The requested mDNS name is already Avahi's normal machine hostname; explicit publication would collide locally."
+        return 1
+    fi
+    if ! mdns_state_claims_hostname "${CADDY_ACCESS_ADDRESS}"; then
+        error "Avahi locally owns ${CADDY_ACCESS_ADDRESS}, but that ownership cannot be attributed to appliance-managed legacy state."
+        return 1
+    fi
+
+    info "Detected appliance-created legacy Avahi hostname ownership for ${CADDY_ACCESS_ADDRESS}."
+    info "Restoring Avahi's runtime hostname to the unchanged machine hostname '${system_hostname}'."
+    busctl --system call \
+        org.freedesktop.Avahi \
+        / \
+        org.freedesktop.Avahi.Server \
+        SetHostName s "${system_hostname}" >/dev/null
+
+    for _attempt in {1..10}; do
+        restored_hostname=$(avahi_runtime_hostname || true)
+        if [[ "${restored_hostname,,}" == "${system_hostname,,}" ]]; then
+            ok "Cleared the appliance-created legacy Avahi hostname ownership."
+            return 0
+        fi
+        sleep 1
+    done
+
+    error "Avahi did not return to the machine hostname '${system_hostname}'."
+    return 1
 }
 
 mdns_name_conflicts() {
@@ -893,6 +988,8 @@ prompt_for_local_hostname() {
 }
 
 write_mdns_service_configuration() {
+    local wrapper_dir
+
     if [[ -e "${MDNS_ENV_FILE}" ]] && \
        { [[ ! -f "${MDNS_ENV_FILE}" || -L "${MDNS_ENV_FILE}" ]] || \
          ! grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_ENV_FILE}" 2>/dev/null; }; then
@@ -905,13 +1002,34 @@ write_mdns_service_configuration() {
         error "${MDNS_SERVICE_FILE} exists but is not appliance-managed; it will not be overwritten."
         return 1
     fi
+    if [[ -e "${MDNS_WRAPPER_FILE}" ]] &&
+       { [[ ! -f "${MDNS_WRAPPER_FILE}" || -L "${MDNS_WRAPPER_FILE}" ]] ||
+         ! grep -Fxq '# Vaultwarden Appliance mDNS publisher' "${MDNS_WRAPPER_FILE}" 2>/dev/null; }; then
+        error "${MDNS_WRAPPER_FILE} exists but is not appliance-managed; it will not be overwritten."
+        return 1
+    fi
 
     if [[ -f "${MDNS_SERVICE_FILE}" && ! -L "${MDNS_SERVICE_FILE}" ]] &&
        grep -Fq 'avahi-set-host-name' "${MDNS_SERVICE_FILE}"; then
-        LEGACY_MDNS_SERVICE=1
         info "Replacing the obsolete appliance mDNS hostname service."
+    fi
+    if [[ -f "${MDNS_SERVICE_FILE}" && ! -L "${MDNS_SERVICE_FILE}" ]]; then
         systemctl stop "${MDNS_SERVICE}" || true
     fi
+
+    clear_legacy_avahi_hostname
+    if mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
+        error "The mDNS name ${CADDY_ACCESS_ADDRESS} is advertised by another LAN device."
+        return 1
+    fi
+
+    wrapper_dir=${MDNS_WRAPPER_FILE%/*}
+    if [[ -e "${wrapper_dir}" && ( ! -d "${wrapper_dir}" || -L "${wrapper_dir}" ) ]]; then
+        error "The mDNS wrapper directory ${wrapper_dir} is unsafe."
+        return 1
+    fi
+    install -d -m 0755 "${wrapper_dir}"
+    install -m 0755 "${MDNS_WRAPPER_SOURCE}" "${MDNS_WRAPPER_FILE}"
 
     cat > "${MDNS_ENV_FILE}" <<ENV
 # Vaultwarden Appliance mDNS
@@ -931,7 +1049,9 @@ After=network-online.target avahi-daemon.service
 [Service]
 Type=simple
 EnvironmentFile=/etc/default/vaultwarden-appliance-mdns
-ExecStart=/usr/bin/avahi-publish-address --no-fail ${VAULTWARDEN_MDNS_HOSTNAME} ${VAULTWARDEN_MDNS_IPV4}
+RuntimeDirectory=vaultwarden-appliance-mdns
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/libexec/vaultwarden-appliance-mdns ${VAULTWARDEN_MDNS_HOSTNAME} ${VAULTWARDEN_MDNS_IPV4}
 Restart=on-failure
 RestartSec=5s
 
@@ -941,12 +1061,23 @@ SERVICE
     chmod 0644 "${MDNS_SERVICE_FILE}"
 
     systemctl daemon-reload
-    if (( LEGACY_MDNS_SERVICE == 1 )); then
-        info "Restarting Avahi once to clear the obsolete appliance hostname override."
-        systemctl restart avahi-daemon.service
-    fi
     systemctl enable "${MDNS_SERVICE}"
     systemctl restart "${MDNS_SERVICE}"
+}
+
+show_mdns_service_logs() {
+    printf 'Recent %s log:\n' "${MDNS_SERVICE}" >&2
+    if command_exists journalctl; then
+        journalctl --unit "${MDNS_SERVICE}" --no-pager --lines 30 >&2 || true
+    else
+        systemctl status "${MDNS_SERVICE}" --no-pager >&2 || true
+    fi
+}
+
+mdns_service_is_ready() {
+    [[ -f "${MDNS_READY_FILE}" && ! -L "${MDNS_READY_FILE}" ]] || return 1
+    grep -Fxq "hostname=${CADDY_ACCESS_ADDRESS}" "${MDNS_READY_FILE}" &&
+        grep -Fxq "address=${IPV4_ADDRESS}" "${MDNS_READY_FILE}"
 }
 
 verify_mdns() {
@@ -958,14 +1089,11 @@ verify_mdns() {
         error "Avahi is not active."
         return 1
     }
-    systemctl is-active --quiet "${MDNS_SERVICE}" || {
-        error "The appliance mDNS hostname service is not active."
-        return 1
-    }
-
     for _attempt in {1..30}; do
         resolved=$(mdns_resolved_ipv4s "${CADDY_ACCESS_ADDRESS}" || true)
-        mdns_resolution_matches "${IPV4_ADDRESS}" "${resolved}" && {
+        if systemctl is-active --quiet "${MDNS_SERVICE}" &&
+           mdns_service_is_ready &&
+           mdns_resolution_matches "${IPV4_ADDRESS}" "${resolved}"; then
             ok "mDNS resolves ${CADDY_ACCESS_ADDRESS} to ${IPV4_ADDRESS}."
             if command_exists getent; then
                 getent_resolved=$(timeout 4 getent hosts "${CADDY_ACCESS_ADDRESS}" 2>/dev/null |
@@ -978,12 +1106,18 @@ verify_mdns() {
                 fi
             fi
             return 0
-        }
+        fi
         sleep 1
     done
 
+    if ! systemctl is-active --quiet "${MDNS_SERVICE}"; then
+        error "The appliance mDNS publisher service is not active."
+    elif ! mdns_service_is_ready; then
+        error "The appliance mDNS publisher did not confirm that the explicit mapping is active."
+    fi
     error "mDNS did not resolve ${CADDY_ACCESS_ADDRESS} exclusively to the detected LAN IPv4 address ${IPV4_ADDRESS}."
     [[ -z "${resolved}" ]] || info "Resolved IPv4 address(es): ${resolved//$'\n'/, }"
+    show_mdns_service_logs
     return 1
 }
 

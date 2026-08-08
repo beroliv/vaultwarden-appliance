@@ -20,6 +20,8 @@ readonly DEFAULT_MDNS_HOSTNAME="vaultwarden.local"
 readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
 readonly MDNS_SERVICE_FILE="/etc/systemd/system/vaultwarden-appliance-mdns.service"
 readonly MDNS_SERVICE="vaultwarden-appliance-mdns.service"
+readonly MDNS_WRAPPER_FILE="/usr/local/libexec/vaultwarden-appliance-mdns"
+readonly MDNS_READY_FILE="/run/vaultwarden-appliance-mdns/ready"
 readonly LOG_LINES=100
 readonly ACCESS_HTTPS_TIMEOUT=60
 readonly ACCESS_HTTPS_RETRY_INTERVAL=2
@@ -187,7 +189,11 @@ require_mdns_runtime() {
         die "The mDNS state is not appliance-managed."
     grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_SERVICE_FILE}" || \
         die "The mDNS service is not appliance-managed."
-    grep -Fq 'ExecStart=/usr/bin/avahi-publish-address' "${MDNS_SERVICE_FILE}" || \
+    [[ -f "${MDNS_WRAPPER_FILE}" && ! -L "${MDNS_WRAPPER_FILE}" ]] || \
+        die "The appliance mDNS publisher wrapper is missing or unsafe. Rerun the appliance installer."
+    grep -Fxq '# Vaultwarden Appliance mDNS publisher' "${MDNS_WRAPPER_FILE}" || \
+        die "The mDNS publisher wrapper is not appliance-managed."
+    grep -Fq 'ExecStart=/usr/local/libexec/vaultwarden-appliance-mdns' "${MDNS_SERVICE_FILE}" || \
         die "The appliance mDNS service is obsolete. Rerun the appliance installer."
 }
 
@@ -268,6 +274,24 @@ configure_mdns_hostname() {
     systemctl restart "${MDNS_SERVICE}" || die "Unable to restart the appliance mDNS hostname service."
 }
 
+show_mdns_service_logs() {
+    printf 'Recent %s log:\n' "${MDNS_SERVICE}" >&2
+    if command_exists journalctl; then
+        journalctl --unit "${MDNS_SERVICE}" --no-pager --lines 30 >&2 || true
+    else
+        systemctl status "${MDNS_SERVICE}" --no-pager >&2 || true
+    fi
+}
+
+mdns_service_is_ready() {
+    local hostname=$1
+    local current_ip=$2
+
+    [[ -f "${MDNS_READY_FILE}" && ! -L "${MDNS_READY_FILE}" ]] || return 1
+    grep -Fxq "hostname=${hostname}" "${MDNS_READY_FILE}" &&
+        grep -Fxq "address=${current_ip}" "${MDNS_READY_FILE}"
+}
+
 verify_mdns_hostname() {
     local hostname=$1
     local current_ip
@@ -283,14 +307,11 @@ verify_mdns_hostname() {
         printf '[FAIL] Avahi is not active.\n' >&2
         return 1
     fi
-    if ! systemctl is-active --quiet "${MDNS_SERVICE}"; then
-        printf '[FAIL] The appliance mDNS hostname service is not active.\n' >&2
-        return 1
-    fi
-
     while :; do
         resolved=$(mdns_resolved_ipv4s "${hostname}" || true)
-        if mdns_resolution_matches "${current_ip}" "${resolved}"; then
+        if systemctl is-active --quiet "${MDNS_SERVICE}" &&
+           mdns_service_is_ready "${hostname}" "${current_ip}" &&
+           mdns_resolution_matches "${current_ip}" "${resolved}"; then
             if command_exists getent; then
                 getent_resolved=$(timeout 4 getent hosts "${hostname}" 2>/dev/null |
                     awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ && !seen[$1]++ {print $1}' || true)
@@ -307,9 +328,15 @@ verify_mdns_hostname() {
         sleep "${ACCESS_HTTPS_RETRY_INTERVAL}"
     done
 
+    if ! systemctl is-active --quiet "${MDNS_SERVICE}"; then
+        printf '[FAIL] The appliance mDNS publisher service is not active.\n' >&2
+    elif ! mdns_service_is_ready "${hostname}" "${current_ip}"; then
+        printf '[FAIL] The appliance mDNS publisher did not confirm that the explicit mapping is active.\n' >&2
+    fi
     printf '[FAIL] mDNS did not resolve %s exclusively to the detected LAN IPv4 address %s.\n' \
         "${hostname}" "${current_ip}" >&2
     [[ -z "${resolved}" ]] || printf 'Resolved IPv4 address(es): %s\n' "${resolved//$'\n'/, }" >&2
+    show_mdns_service_logs
     return 1
 }
 
