@@ -57,7 +57,7 @@ main() {
     trap stop_cleanly HUP INT TERM
     rm -f -- "${READY_FILE}"
 
-    /usr/bin/avahi-publish-address --no-fail "${MDNS_HOSTNAME}" "${IPV4_ADDRESS}" &
+    /usr/bin/avahi-publish-address -R --no-fail "${MDNS_HOSTNAME}" "${IPV4_ADDRESS}" &
     PUBLISHER_PID=$!
 
     for _attempt in {1..15}; do

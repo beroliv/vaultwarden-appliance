@@ -147,8 +147,10 @@ The appliance also owns `/etc/default/vaultwarden-appliance-mdns` and
 `/etc/systemd/system/vaultwarden-appliance-mdns.service`. These files persist
 an explicit mDNS hostname-to-LAN-IPv4 publication without changing either the
 Linux system hostname or Avahi's global hostname. The service runs
-`avahi-publish-address` continuously and stores the validated `.local` hostname
-and detected LAN IPv4 address in the environment file. An appliance-owned
+`avahi-publish-address -R --no-fail` continuously and stores the validated
+`.local` hostname and detected LAN IPv4 address in the environment file. The
+no-reverse option makes the name an additional alias without competing for the
+reverse record of the machine's existing LAN address. An appliance-owned
 wrapper MUST keep the publisher attached to systemd, verify the exact published
 mapping and return a failure status if the publisher exits before or after
 publication, including when the underlying utility reports a collision but
@@ -284,9 +286,8 @@ The installer MUST NOT configure a static IP or modify NetworkManager, dhcpcd,
 systemd-networkd, interfaces, DNS, gateways, routers, DHCP settings, or client
 hosts files. The appliance's published mDNS mapping is independent of the Linux
 system hostname and Avahi's global hostname. Configuring or changing appliance
-access MUST NOT call `hostnamectl` or `avahi-set-host-name`, permanently set an
-Avahi hostname, or rename the host operating system. The narrowly scoped legacy
-migration may reset Avahi's runtime hostname to the unchanged machine hostname.
+access MUST NOT call `hostnamectl` or `avahi-set-host-name`, modify Avahi's
+global hostname, or rename the host operating system.
 
 A typical architecture is:
 
@@ -1039,18 +1040,15 @@ leaf certificate for the `.local` hostname from the existing persistent root
 CA, keeping already installed client root certificates valid.
 
 An installer rerun MUST safely replace the obsolete appliance-owned systemd
-service that called `avahi-set-host-name`. The installer MUST query Avahi's
-actual runtime hostname rather than relying on the current unit file to detect
-this stale state. If the runtime hostname equals the appliance hostname,
-differs from the machine hostname and matches appliance-managed legacy state,
-the installer resets Avahi's runtime hostname to the unchanged machine
-hostname through Avahi's D-Bus API. It then starts the persistent explicit
-publisher with the current detected LAN IPv4 address. Unrelated Avahi
+service that called `avahi-set-host-name`. The persistent explicit publisher
+MUST use `avahi-publish-address -R --no-fail` so the `.local` appliance name is
+an additional alias for the machine's already-published LAN IPv4 address. It
+MUST NOT modify the Linux hostname or Avahi's global hostname. Unrelated Avahi
 configuration MUST remain untouched.
 
 An address advertised by a different LAN device remains a real conflict. Local
-addresses from stale appliance ownership or local Docker interfaces may be
-recognized as belonging to this host during migration, but final mDNS
+addresses from local Docker interfaces may be recognized as belonging to this
+host during migration, but final mDNS
 verification MUST reject every result other than the detected LAN IPv4 address.
 The publisher service MUST remain active and expose verified runtime readiness;
 on failure, installer diagnostics MUST include its recent journal so messages

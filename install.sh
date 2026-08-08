@@ -752,11 +752,6 @@ install_mdns_support() {
         error "mDNS setup requires systemd."
         return 1
     }
-    command_exists busctl || {
-        error "mDNS migration requires busctl from systemd."
-        return 1
-    }
-
     for package in avahi-daemon avahi-utils libnss-mdns; do
         package_is_installed "${package}" || missing_packages+=("${package}")
     done
@@ -809,90 +804,6 @@ mdns_resolution_matches() {
     local resolved=$2
 
     [[ "${resolved}" == "${expected}" ]]
-}
-
-avahi_runtime_hostname() {
-    local output
-
-    output=$(busctl --system call \
-        org.freedesktop.Avahi \
-        / \
-        org.freedesktop.Avahi.Server \
-        GetHostName 2>/dev/null) || return 1
-
-    if [[ "${output}" =~ ^s[[:space:]]+\"([^\"]+)\"$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-        return 0
-    fi
-    return 1
-}
-
-system_hostname_label() {
-    local hostname_label
-
-    hostname_label=$(hostname --short 2>/dev/null || true)
-    hostname_label=${hostname_label%%.*}
-    [[ "${hostname_label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
-    printf '%s\n' "${hostname_label}"
-}
-
-mdns_state_claims_hostname() {
-    local hostname=$1
-    local label=${hostname%.local}
-
-    [[ -f "${MDNS_ENV_FILE}" && ! -L "${MDNS_ENV_FILE}" ]] || return 1
-    grep -Fxq '# Vaultwarden Appliance mDNS' "${MDNS_ENV_FILE}" || return 1
-    grep -Fxq "VAULTWARDEN_MDNS_HOSTNAME=${hostname}" "${MDNS_ENV_FILE}" && return 0
-    grep -Fxq "VAULTWARDEN_MDNS_LABEL=${label}" "${MDNS_ENV_FILE}"
-}
-
-clear_legacy_avahi_hostname() {
-    local avahi_hostname
-    local desired_label=${CADDY_ACCESS_ADDRESS%.local}
-    local restored_hostname
-    local system_hostname
-    local _attempt
-
-    avahi_hostname=$(avahi_runtime_hostname) || {
-        error "Unable to query Avahi's current runtime hostname."
-        return 1
-    }
-    system_hostname=$(system_hostname_label) || {
-        error "Unable to determine a valid machine hostname for Avahi migration."
-        return 1
-    }
-
-    if [[ "${avahi_hostname,,}" != "${desired_label,,}" ]]; then
-        return 0
-    fi
-    if [[ "${avahi_hostname,,}" == "${system_hostname,,}" ]]; then
-        error "The requested mDNS name is already Avahi's normal machine hostname; explicit publication would collide locally."
-        return 1
-    fi
-    if ! mdns_state_claims_hostname "${CADDY_ACCESS_ADDRESS}"; then
-        error "Avahi locally owns ${CADDY_ACCESS_ADDRESS}, but that ownership cannot be attributed to appliance-managed legacy state."
-        return 1
-    fi
-
-    info "Detected appliance-created legacy Avahi hostname ownership for ${CADDY_ACCESS_ADDRESS}."
-    info "Restoring Avahi's runtime hostname to the unchanged machine hostname '${system_hostname}'."
-    busctl --system call \
-        org.freedesktop.Avahi \
-        / \
-        org.freedesktop.Avahi.Server \
-        SetHostName s "${system_hostname}" >/dev/null
-
-    for _attempt in {1..10}; do
-        restored_hostname=$(avahi_runtime_hostname || true)
-        if [[ "${restored_hostname,,}" == "${system_hostname,,}" ]]; then
-            ok "Cleared the appliance-created legacy Avahi hostname ownership."
-            return 0
-        fi
-        sleep 1
-    done
-
-    error "Avahi did not return to the machine hostname '${system_hostname}'."
-    return 1
 }
 
 mdns_name_conflicts() {
@@ -1017,7 +928,6 @@ write_mdns_service_configuration() {
         systemctl stop "${MDNS_SERVICE}" || true
     fi
 
-    clear_legacy_avahi_hostname
     if mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
         error "The mDNS name ${CADDY_ACCESS_ADDRESS} is advertised by another LAN device."
         return 1
