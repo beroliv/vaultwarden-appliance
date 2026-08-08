@@ -13,7 +13,7 @@ else
     LIB_DIR="/usr/local/lib/vaultwarden-appliance"
 fi
 readonly LIB_DIR
-for library in common network docker caddy mdns; do
+for library in common network docker caddy mdns storage; do
     library_path="${LIB_DIR}/${library}.sh"
     if [[ ! -f "${library_path}" || -L "${library_path}" ]]; then
         printf 'Error: Required vwctl library is missing or unsafe: %s\n' "${library_path}" >&2
@@ -52,6 +52,10 @@ HTTPS_LAST_ERROR=""
 HEALTH_FAILURES=0
 UPDATE_CHECK_AVAILABLE=0
 UPDATE_CHECK_UNDETERMINED=0
+USB_TOPOLOGY=""
+USB_SYSTEM_MOUNTS=""
+USB_PROTECTED_DISKS=""
+USB_CANDIDATES=()
 
 info() {
     printf '%s\n' "$*"
@@ -83,6 +87,8 @@ Usage:
   sudo vwctl signup off
   vwctl cert info
   sudo vwctl cert export
+  vwctl usb status
+  sudo vwctl usb setup
 
 Commands:
   status             Show appliance and access information
@@ -98,6 +104,8 @@ Commands:
   signup             Show, enable, or disable account registration
   cert info          Show public root and HTTPS server certificate information
   cert export        Refresh the public Caddy root CA export
+  usb status         Discover block devices without modifying them
+  usb setup          Select a safe candidate for a Phase 5A discovery test only
 HELP
 }
 
@@ -1451,6 +1459,226 @@ command_signup() {
     esac
 }
 
+require_storage_discovery() {
+    command_exists lsblk || die "lsblk is required for block-device discovery. Rerun the installer."
+    command_exists findmnt || die "findmnt is required for system-device protection. Rerun the installer."
+}
+
+discover_storage_devices() {
+    local candidates=""
+
+    require_storage_discovery
+    USB_TOPOLOGY=$(storage_collect_topology) || return 1
+    USB_SYSTEM_MOUNTS=$(storage_collect_system_mounts "${USB_TOPOLOGY}") || return 1
+    USB_PROTECTED_DISKS=$(storage_protected_disks_from_mounts \
+        "${USB_TOPOLOGY}" "${USB_SYSTEM_MOUNTS}") || return 1
+    candidates=$(storage_candidate_disks "${USB_TOPOLOGY}" "${USB_PROTECTED_DISKS}") || return 1
+    USB_CANDIDATES=()
+    if [[ -n "${candidates}" ]]; then
+        mapfile -t USB_CANDIDATES <<<"${candidates}"
+    fi
+}
+
+usb_disk_label() {
+    local disk=$1
+    local model=""
+    local vendor=""
+
+    vendor=$(storage_lsblk_property "${disk}" VENDOR || true)
+    model=$(storage_lsblk_property "${disk}" MODEL || true)
+    if [[ -n "${vendor}${model}" ]]; then
+        storage_sanitize_text "${vendor} ${model}"
+    else
+        printf '%s\n' "${disk##*/}"
+    fi
+}
+
+usb_disk_size() {
+    local disk=$1
+    local bytes
+
+    bytes=$(storage_inventory_node_field "${USB_TOPOLOGY}" "${disk}" size) || return 1
+    storage_format_bytes "${bytes}"
+}
+
+usb_disk_partitions() {
+    local disk=$1
+    local node
+    local type
+
+    while IFS= read -r node; do
+        [[ "${node}" != "${disk}" ]] || continue
+        type=$(storage_inventory_node_field "${USB_TOPOLOGY}" "${node}" type) || continue
+        [[ "${type}" == "part" ]] && printf '%s\n' "${node}"
+    done < <(storage_disk_nodes "${USB_TOPOLOGY}" "${disk}") | storage_join_lines
+}
+
+usb_disk_filesystems() {
+    storage_disk_property_values "${USB_TOPOLOGY}" "$1" FSTYPE | storage_join_lines
+}
+
+usb_disk_mountpoints() {
+    storage_disk_property_values "${USB_TOPOLOGY}" "$1" MOUNTPOINTS | storage_join_lines
+}
+
+usb_print_system_devices() {
+    local disk
+    local filesystems
+    local label
+    local model
+    local mountpoints
+    local partitions
+    local reason
+    local removable
+    local serial
+    local size
+    local transport
+    local vendor
+
+    printf 'System device%s:\n\n' "$([[ "${USB_PROTECTED_DISKS}" == *$'\n'* ]] && printf s)"
+    while IFS='|' read -r disk reason; do
+        label=$(usb_disk_label "${disk}" || printf '%s' "${disk##*/}")
+        size=$(usb_disk_size "${disk}" || printf unknown)
+        vendor=$(storage_lsblk_property "${disk}" VENDOR || true)
+        model=$(storage_lsblk_property "${disk}" MODEL || true)
+        serial=$(storage_lsblk_property "${disk}" SERIAL || true)
+        transport=$(storage_lsblk_property "${disk}" TRAN || true)
+        removable=$(storage_lsblk_property "${disk}" RM || true)
+        partitions=$(usb_disk_partitions "${disk}" || true)
+        filesystems=$(usb_disk_filesystems "${disk}" || true)
+        mountpoints=$(usb_disk_mountpoints "${disk}" || true)
+
+        printf '  %s\n' "${label}"
+        printf '  Device: %s\n' "${disk}"
+        [[ -z "${vendor}" ]] || printf '  Vendor: %s\n' "${vendor}"
+        [[ -z "${model}" ]] || printf '  Model: %s\n' "${model}"
+        [[ -z "${serial}" ]] || printf '  Serial: %s\n' "${serial}"
+        printf '  Size: %s\n' "${size}"
+        printf '  Transport: %s\n' "${transport:-unknown}"
+        case "${removable}" in
+            1) printf '  Removable: yes\n' ;;
+            0) printf '  Removable: no\n' ;;
+            *) printf '  Removable: unknown\n' ;;
+        esac
+        printf '  Partitions: %s\n' "${partitions:-none}"
+        printf '  Filesystem(s): %s\n' "${filesystems:-none}"
+        printf '  Mounted: %s\n' "${mountpoints:-no}"
+        printf '  Protected: yes (contains %s)\n\n' "${reason}"
+    done <<<"${USB_PROTECTED_DISKS}"
+}
+
+usb_print_candidate() {
+    local disk=$1
+    local number=$2
+    local filesystems
+    local label
+    local model
+    local mountpoints
+    local partitions
+    local removable
+    local serial
+    local size
+    local transport
+    local vendor
+
+    label=$(usb_disk_label "${disk}" || printf '%s' "${disk##*/}")
+    size=$(usb_disk_size "${disk}" || printf unknown)
+    vendor=$(storage_lsblk_property "${disk}" VENDOR || true)
+    model=$(storage_lsblk_property "${disk}" MODEL || true)
+    serial=$(storage_lsblk_property "${disk}" SERIAL || true)
+    transport=$(storage_lsblk_property "${disk}" TRAN || true)
+    removable=$(storage_lsblk_property "${disk}" RM || true)
+    partitions=$(usb_disk_partitions "${disk}" || true)
+    filesystems=$(usb_disk_filesystems "${disk}" || true)
+    mountpoints=$(usb_disk_mountpoints "${disk}" || true)
+
+    printf '%d) %s\n' "${number}" "${label}"
+    printf '   Device: %s\n' "${disk}"
+    [[ -z "${vendor}" ]] || printf '   Vendor: %s\n' "${vendor}"
+    [[ -z "${model}" ]] || printf '   Model: %s\n' "${model}"
+    [[ -z "${serial}" ]] || printf '   Serial: %s\n' "${serial}"
+    printf '   Size: %s\n' "${size}"
+    printf '   Transport: %s\n' "${transport:-unknown}"
+    case "${removable}" in
+        1) printf '   Removable: yes\n' ;;
+        0) printf '   Removable: no\n' ;;
+        *) printf '   Removable: unknown\n' ;;
+    esac
+    printf '   Partitions: %s\n' "${partitions:-none}"
+    printf '   Filesystem(s): %s\n' "${filesystems:-none}"
+    printf '   Mounted: %s\n' "${mountpoints:-no}"
+    printf '   Protected: no\n\n'
+}
+
+usb_print_candidates() {
+    local index
+
+    for index in "${!USB_CANDIDATES[@]}"; do
+        usb_print_candidate "${USB_CANDIDATES[${index}]}" "$((index + 1))"
+    done
+}
+
+command_usb_status() {
+    require_appliance
+    discover_storage_devices || \
+        die "Unable to establish the system block-device topology safely; no backup device can be offered."
+
+    printf 'Backup media\n\n'
+    usb_print_system_devices
+    if ((${#USB_CANDIDATES[@]} == 0)); then
+        printf 'No suitable external backup devices detected.\n'
+        return 0
+    fi
+    printf 'Available backup devices:\n\n'
+    usb_print_candidates
+    printf 'Phase 5A discovery only. No block device was modified.\n'
+}
+
+command_usb_setup() {
+    local index
+    local selected_disk
+    local selection=""
+
+    require_root "usb setup"
+    require_operation_lock
+    require_appliance
+    [[ -r /dev/tty ]] || die "An interactive terminal is required for USB device selection."
+    discover_storage_devices || \
+        die "Unable to establish the system block-device topology safely; no backup device can be offered."
+
+    printf 'Backup media setup — Phase 5A discovery test\n\n'
+    usb_print_system_devices
+    if ((${#USB_CANDIDATES[@]} == 0)); then
+        printf 'No suitable external backup devices detected.\n\n'
+        printf 'Phase 5A discovery test only.\nNo changes were made to any device.\n'
+        return 0
+    fi
+
+    printf 'Available backup devices:\n\n'
+    usb_print_candidates
+    if ! read -r -p "Select backup device [1-${#USB_CANDIDATES[@]}]: " selection </dev/tty; then
+        die "Unable to read the backup-device selection."
+    fi
+    index=$(storage_selection_index "${selection}" "${#USB_CANDIDATES[@]}") ||
+        die "Invalid selection. Enter only one of the displayed device numbers."
+    selected_disk=${USB_CANDIDATES[${index}]}
+
+    printf '\nSelected backup device:\n'
+    printf '  %s\n' "${selected_disk}"
+    printf '  %s\n' "$(usb_disk_label "${selected_disk}" || printf '%s' "${selected_disk##*/}")"
+    printf '  %s\n\n' "$(usb_disk_size "${selected_disk}" || printf unknown)"
+    printf 'Phase 5A discovery test only.\n'
+    printf 'No changes were made to the device.\n'
+}
+
+command_usb() {
+    case "${1:-}" in
+        status) command_usb_status ;;
+        setup) command_usb_setup ;;
+        *) die "Usage: vwctl usb status | sudo vwctl usb setup" ;;
+    esac
+}
+
 command_cert_export() {
     require_root "cert export"
     require_operation_lock
@@ -1598,6 +1826,10 @@ main() {
             else
                 die "Usage: vwctl cert info | sudo vwctl cert export"
             fi
+            ;;
+        usb)
+            (( $# == 2 )) || die "Usage: vwctl usb status | sudo vwctl usb setup"
+            command_usb "${2}"
             ;;
         *)
             die "Unknown command '${command}'. Run 'vwctl help'."

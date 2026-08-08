@@ -9,7 +9,7 @@ readonly SCRIPT_DIR
 readonly LIB_SOURCE_DIR="${SCRIPT_DIR}/lib"
 readonly LIB_TARGET_DIR="/usr/local/lib/vaultwarden-appliance"
 
-for library in common network docker caddy mdns; do
+for library in common network docker caddy mdns storage; do
     library_path="${LIB_SOURCE_DIR}/${library}.sh"
     if [[ ! -f "${library_path}" || -L "${library_path}" ]]; then
         printf '[FAIL] Required installer library is missing or unsafe: %s\n' "${library_path}" >&2
@@ -142,7 +142,7 @@ check_required_basic_tools() {
     local -a missing=()
 
     section "Required basic tools"
-    for command in curl ip timeout sha256sum cmp flock; do
+    for command in curl ip timeout sha256sum cmp flock lsblk findmnt; do
         if ! command_exists "${command}"; then
             missing+=("${command}")
         fi
@@ -1270,7 +1270,7 @@ install_vwctl() {
         return 1
     fi
     install -d -m 0755 "${LIB_TARGET_DIR}"
-    for library in common network docker caddy mdns; do
+    for library in common network docker caddy mdns storage; do
         source_library="${LIB_SOURCE_DIR}/${library}.sh"
         target_library="${LIB_TARGET_DIR}/${library}.sh"
         if [[ ! -f "${source_library}" || -L "${source_library}" ]]; then

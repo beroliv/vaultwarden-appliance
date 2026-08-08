@@ -104,6 +104,8 @@ sudo vwctl signup on
 sudo vwctl signup off
 vwctl cert info
 sudo vwctl cert export
+vwctl usb status
+sudo vwctl usb setup
 ```
 
 `vwctl health` performs read-only checks of Docker, both containers and their
@@ -172,6 +174,29 @@ The wrapper remains active with the publisher, confirms that the hostname
 resolves exclusively to the configured LAN IPv4 address, and turns an early
 successful publisher exit into a service failure.
 
+## Phase 5A block-device discovery
+
+`vwctl usb status` performs read-only block-device discovery. It inspects the
+devices backing `/`, `/boot`, and `/boot/firmware` where present, follows
+partitions and supported device-mapper stacks to their complete physical disks,
+and marks every such disk as protected. Protection does not depend on whether
+the operating system boots from SD, USB SSD, USB flash storage, SATA, or NVMe.
+
+Other writable whole-disk devices are listed with available model, vendor,
+serial, size, transport, removable, partition, filesystem, and mount
+information. `TRAN=usb` is informative but is not required because some bridges
+do not report it reliably. Loop, RAM, zram, optical, and device-mapper pseudo
+devices are not selectable. If the system topology cannot be established
+safely, discovery fails closed and offers no device.
+
+`sudo vwctl usb setup` uses the global appliance operation lock and lets the
+administrator select only a number from the internally generated safe candidate
+list. The system disk is never numbered, and entering a `/dev/...` path is not
+accepted. In Phase 5A the command only prints the selected device and exits.
+It does not partition, format, wipe, mount, unmount, label, repair, or otherwise
+modify any block device. Destructive media setup will be implemented and tested
+separately.
+
 ## Basic verification
 
 After installation, a concise end-to-end check is:
@@ -182,6 +207,7 @@ vwctl status
 vwctl health
 vwctl cert info
 vwctl update check
+vwctl usb status
 systemctl is-active avahi-daemon
 systemctl is-active vaultwarden-appliance-mdns
 avahi-resolve-host-name -4 vaultwarden.local
@@ -192,5 +218,5 @@ docker inspect caddy --format '{{json .HostConfig.PortBindings}}'
 ```
 
 Use the actual hostname reported by `vwctl status` if a conflict-free
-alternative was selected. Phase 5 and later USB backup and restore functionality
-is not implemented yet.
+alternative was selected. Phase 5A provides discovery only; formatting, backup,
+restore, retention, and scheduling are not implemented yet.

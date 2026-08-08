@@ -188,10 +188,10 @@ Before making changes, the installer MUST check:
 * relevant network configuration.
 
 Before significant changes, the installer MUST also require the basic commands
-`curl`, `ip`, `timeout`, `sha256sum`, `cmp`, and `flock`. On Debian it may
-install the corresponding normal packages where appropriate; otherwise it MUST
-fail with clear package guidance. Docker Buildx, OpenSSL, and `journalctl` remain
-optional or command-specific dependencies.
+`curl`, `ip`, `timeout`, `sha256sum`, `cmp`, `flock`, `lsblk`, and `findmnt`.
+On Debian it may install the corresponding normal packages where appropriate;
+otherwise it MUST fail with clear package guidance. Docker Buildx, OpenSSL, and
+`journalctl` remain optional or command-specific dependencies.
 
 Before Caddy is configured, the installer MUST ensure that Debian's
 `avahi-daemon`, `avahi-utils`, and `libnss-mdns` packages are installed and that
@@ -461,9 +461,10 @@ and print the corresponding `sudo vwctl ...` command instead of invoking sudo.
 The installer and every mutating `vwctl` command use the same non-blocking,
 root-owned runtime lock at `/run/lock/vaultwarden-appliance.lock`. If another
 operation holds it, the new operation fails clearly without waiting. The lock
-applies to install, start, stop, restart, update, access, signup changes, and
-certificate export. Status, health, logs, version, update check, signup status,
-certificate info, and help do not acquire it.
+applies to install, start, stop, restart, update, access, signup changes,
+certificate export, and `usb setup`. Status, health, logs, version, update
+check, signup status, certificate info, `usb status`, and help do not acquire
+it.
 
 Phase 4 provides:
 
@@ -486,6 +487,18 @@ sudo vwctl cert export
 ```
 
 Backup and restore commands remain future phases.
+
+Phase 5A adds read-only block-device discovery and a non-destructive selection
+test:
+
+```bash
+vwctl usb status
+sudo vwctl usb setup
+```
+
+Neither command formats, partitions, wipes, mounts, unmounts, labels, repairs,
+or otherwise writes to a block device. A later phase must separately implement
+and revalidate any destructive backup-media setup.
 
 ### 12.1 Update
 
@@ -685,33 +698,43 @@ Other backup targets are outside Version 1 scope.
 
 ## 14. USB Device Detection
 
-During installation, the appliance SHOULD detect suitable attached USB storage devices.
+Phase 5A provides block-device discovery through `vwctl usb status` and a
+non-destructive selection test through `sudo vwctl usb setup`. It does not yet
+configure backup media.
 
-Example:
+Discovery uses `lsblk`, `findmnt`, and the Linux block-device topology. The
+physical disk or disks backing `/`, `/boot`, and `/boot/firmware` MUST be
+resolved and marked as protected. Parent traversal MUST handle normal
+partitions and conservatively resolve device-mapper or LVM stacks to all
+physical backing disks. The protection is transport-independent: an SD card,
+USB flash drive, USB SSD, SATA disk, or NVMe disk containing a protected system
+mount MUST never be offered as a candidate.
 
-```text
-Configure external USB backup? [Yes]
+If the backing physical disk cannot be established with confidence, discovery
+MUST fail closed rather than expose a possibly destructive choice. Known
+multi-device layouts that cannot be proven safe from the available topology,
+including multi-device Btrfs system filesystems, MUST also fail closed.
 
-Detected devices:
+Only writable, non-zero-size, whole real disks may be candidates. Partitions,
+loop, RAM, zram, device-mapper, and similar pseudo or composition devices MUST
+not be offered. Candidate detection MUST NOT require `TRAN=usb`, because USB
+bridges and other legitimate external storage may omit or report misleading
+transport metadata.
 
-1) SanDisk Ultra
-   /dev/sda
-   29.8 GB
-   Filesystem: exFAT
+For protected disks and candidates, the command SHOULD report the device path,
+vendor/model, serial number, size, transport, removable flag, partitions,
+filesystems, and mount points where available. It MUST NOT assume a fixed
+device name such as `/dev/sda`.
 
-2) Kingston
-   /dev/sdb
-   57.7 GB
-   Filesystem: FAT32
+`sudo vwctl usb setup` uses the normal global appliance operation lock. It
+numbers only the safe candidate list and accepts only a number generated for
+that invocation. A raw device path such as `/dev/sdb`, an out-of-range value,
+or a protected system disk is rejected. Selecting a candidate only reports the
+selection and makes no device or configuration change.
 
-Backup device [1]:
-```
-
-The installer MUST provide enough information to minimize the risk of selecting the wrong disk.
-
-The appliance MUST NOT assume a fixed USB device name such as `/dev/sda`.
-
-Persistent identification SHOULD use filesystem UUIDs or an equivalent stable identifier.
+Persistent device identification by filesystem UUID or an equivalent stable
+identifier remains a requirement for the later backup-media implementation;
+Phase 5A stores no selected device.
 
 ---
 
@@ -729,11 +752,16 @@ Existing suitable filesystems may be retained if supported by the implementation
 
 The installer SHOULD offer to format the selected USB storage device as exFAT.
 
+Filesystem selection and formatting are not implemented in Phase 5A.
+
 ---
 
 ## 16. USB Formatting Safety
 
 Formatting a storage device is destructive.
+
+Formatting is not implemented in Phase 5A. Its discovery and selection commands
+MUST remain entirely non-destructive.
 
 The installer MUST NOT format any device without explicit confirmation.
 
@@ -1042,7 +1070,8 @@ Phase 1  System detection and installer framework
 Phase 2  Docker Compose + Vaultwarden
 Phase 3  Caddy + internal HTTPS
 Phase 4  vwctl basic management
-Phase 5  USB detection and formatting
+Phase 5A Read-only block-device discovery and selection
+Phase 5B Destructive backup-media setup and formatting
 Phase 6  Backup + retention + overflow protection
 Phase 7  Restore
 Phase 8  Diagnostics and polish
