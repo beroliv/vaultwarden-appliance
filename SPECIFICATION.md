@@ -10,10 +10,11 @@ The implemented appliance includes installation, local HTTPS, mDNS access,
 `vwctl` lifecycle management, verified local-first backups, optional USB
 replication, automatic retention, restore, and complete local removal.
 
-Restore is implemented for the appliance's schema-1 backup format and covered
-by non-destructive fixture tests. Its final destructive end-to-end validation
-on a fresh Raspberry Pi using real backup media remains pending and MUST be
-completed before a production-ready restore release is claimed.
+Restore is implemented for the appliance's schema-1 backup format, covered by
+non-destructive fixture tests, and validated through a real appliance-backup
+restore on the Atlas reference Raspberry Pi. A complete disaster-recovery
+exercise starting from a freshly flashed SD card remains pending and MUST NOT be
+claimed as validated for release 0.1.0.
 
 ## 2. Supported platform
 
@@ -752,8 +753,11 @@ other required data rather than pretending a foreign archive is an appliance
 restore.
 
 The implementation has automated non-destructive security and workflow tests.
-Destructive end-to-end restore validation on a freshly installed reference
-Raspberry Pi with real local and USB backups remains a release-readiness task.
+A real restore from an appliance backup has been validated on Atlas: restored
+Vaultwarden account login succeeded, the restored Caddy root CA fingerprint
+exactly matched its pre-removal fingerprint, and the post-restore health check
+passed. A complete disaster-recovery exercise starting from a freshly flashed
+SD card remains a release-readiness task.
 
 ## 19. Error handling and safety
 
@@ -786,12 +790,13 @@ Required validation for changes includes:
 - targeted audits for prohibited destructive commands when storage, bootstrap,
   or removal behavior changes.
 
-The reference end-to-end environment remains a clean supported Raspberry Pi.
-Installation, mDNS, trusted HTTPS, Vaultwarden account creation, health checks,
-manual/automatic backup, USB behavior, source updates, container updates,
-restore, and removal require real-system validation. Restore code is complete,
-but its destructive fresh-Pi validation remains pending as stated in section
-18.
+Release 0.1.0 is the first tested release. Real-system validation on the Atlas
+reference Raspberry Pi includes the public `curl` bootstrap, installation,
+complete removal, reinstallation, manual backup, USB backup replication,
+restore from an appliance backup, restored Vaultwarden account login, exact
+Caddy root CA fingerprint continuity across removal and restore, and a passing
+post-restore health check. Complete disaster recovery starting from a freshly
+flashed SD card remains pending as stated in section 18.
 
 ## 21. Project principles
 

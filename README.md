@@ -4,9 +4,14 @@ A LAN-only Vaultwarden appliance for Debian and Raspberry Pi OS using Docker,
 Caddy HTTPS, mDNS, simple `vwctl` management, verified local-first backups, and
 an appliance-format restore workflow.
 
-Restore is implemented and fixture-tested. Its final destructive validation on
-a fresh reference Raspberry Pi is still pending, so retain independent verified
-backup copies.
+Version 0.1.0 is the first tested release. Real-system validation on Atlas, a
+Raspberry Pi, covers the public `curl` bootstrap, installation, complete
+removal, reinstallation, manual backup, USB backup replication, restore from an
+appliance backup, restored account login, exact Caddy root CA fingerprint
+continuity, and the post-restore health check.
+
+A complete disaster-recovery exercise starting from a freshly flashed SD card
+remains pending. Retain independent verified backup copies.
 
 ## What it does
 
@@ -314,8 +319,11 @@ transfer any other required data instead of feeding foreign files to this
 restore command.
 
 The restore implementation has non-destructive fixture coverage, including
-malicious archive cases. A destructive end-to-end restore on a clean reference
-Raspberry Pi with real media remains the final release-validation step.
+malicious archive cases. A real restore from an appliance backup has also been
+validated on Atlas: the restored account login succeeded, the Caddy root CA
+fingerprint exactly matched its pre-removal value, and the post-restore health
+check passed. A complete disaster-recovery exercise starting from a freshly
+flashed SD card remains pending.
 
 ## Security and scope
 
