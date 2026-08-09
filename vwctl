@@ -53,6 +53,12 @@ else
     USB_SETUP_HELPER="/usr/local/libexec/vaultwarden-appliance-usb-setup"
 fi
 readonly USB_SETUP_HELPER
+if [[ -f "${SCRIPT_DIR}/libexec/backup" && ! -L "${SCRIPT_DIR}/libexec/backup" ]]; then
+    BACKUP_HELPER="${SCRIPT_DIR}/libexec/backup"
+else
+    BACKUP_HELPER="/usr/local/libexec/vaultwarden-appliance-backup"
+fi
+readonly BACKUP_HELPER
 
 ACCESS_ADDRESS=""
 HTTPS_LAST_ERROR=""
@@ -96,6 +102,7 @@ Usage:
   sudo vwctl cert export
   vwctl usb status
   sudo vwctl usb setup
+  sudo vwctl backup
 
 Commands:
   status             Show appliance and access information
@@ -113,6 +120,7 @@ Commands:
   cert export        Refresh the public Caddy root CA export
   usb status         Discover block devices without modifying them
   usb setup          ERASE and initialize one explicitly selected backup disk
+  backup             Create and verify one manual backup on configured media
 HELP
 }
 
@@ -1761,6 +1769,18 @@ command_usb() {
     esac
 }
 
+command_backup() {
+    require_root "backup"
+    require_operation_lock
+    require_appliance
+    require_docker
+    [[ -f "${BACKUP_HELPER}" && ! -L "${BACKUP_HELPER}" ]] || \
+        die "The appliance backup helper is missing or unsafe. Rerun the installer."
+    grep -Fxq '# Vaultwarden Appliance manual backup' "${BACKUP_HELPER}" || \
+        die "The appliance backup helper is not recognized. Rerun the installer."
+    bash "${BACKUP_HELPER}"
+}
+
 command_cert_export() {
     require_root "cert export"
     require_operation_lock
@@ -1912,6 +1932,10 @@ main() {
         usb)
             (( $# == 2 )) || die "Usage: vwctl usb status | sudo vwctl usb setup"
             command_usb "${2}"
+            ;;
+        backup)
+            (( $# == 1 )) || die "Usage: sudo vwctl backup"
+            command_backup
             ;;
         *)
             die "Unknown command '${command}'. Run 'vwctl help'."

@@ -35,6 +35,8 @@ readonly VWCTL_SOURCE="${SCRIPT_DIR}/vwctl"
 readonly VWCTL_TARGET="/usr/local/bin/vwctl"
 readonly USB_SETUP_SOURCE="${SCRIPT_DIR}/libexec/usb-setup"
 readonly USB_SETUP_TARGET="/usr/local/libexec/vaultwarden-appliance-usb-setup"
+readonly BACKUP_SOURCE="${SCRIPT_DIR}/libexec/backup"
+readonly BACKUP_TARGET="/usr/local/libexec/vaultwarden-appliance-backup"
 readonly VERSION_SOURCE="${SCRIPT_DIR}/VERSION"
 readonly VERSION_TARGET="${INSTALL_DIR}/.appliance-version"
 readonly OPERATION_LOCK="/run/lock/vaultwarden-appliance.lock"
@@ -51,6 +53,12 @@ if [[ ! -f "${USB_SETUP_SOURCE}" || -L "${USB_SETUP_SOURCE}" ]] ||
    ! grep -Fxq '# Vaultwarden Appliance USB setup' "${USB_SETUP_SOURCE}"; then
     printf '[FAIL] Required USB setup helper is missing or unsafe: %s\n' \
         "${USB_SETUP_SOURCE}" >&2
+    exit 1
+fi
+if [[ ! -f "${BACKUP_SOURCE}" || -L "${BACKUP_SOURCE}" ]] ||
+   ! grep -Fxq '# Vaultwarden Appliance manual backup' "${BACKUP_SOURCE}"; then
+    printf '[FAIL] Required backup helper is missing or unsafe: %s\n' \
+        "${BACKUP_SOURCE}" >&2
     exit 1
 fi
 
@@ -772,6 +780,43 @@ install_usb_setup_support() {
     ok "GPT and exFAT setup tools are available."
 }
 
+install_backup_support() {
+    local command
+    local -a missing_packages=()
+
+    section "Manual backup tools"
+
+    command_exists tar || missing_packages+=(tar)
+    command_exists gzip || missing_packages+=(gzip)
+    if ! command_exists sha256sum || ! command_exists sync ||
+       ! command_exists df || ! command_exists du; then
+        missing_packages+=(coreutils)
+    fi
+    command_exists find || missing_packages+=(findutils)
+    if ! command_exists mount || ! command_exists umount; then
+        missing_packages+=(mount)
+    fi
+    if ((${#missing_packages[@]} > 0)); then
+        command_exists apt-get || {
+            error "Manual backup support requires apt-get on this Debian-based system."
+            return 1
+        }
+        info "Installing required manual backup packages: ${missing_packages[*]}"
+        DEBIAN_FRONTEND=noninteractive apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_packages[@]}"
+    else
+        ok "Required manual backup tools are already installed."
+    fi
+
+    for command in tar gzip sha256sum sync df du find mount umount; do
+        command_exists "${command}" || {
+            error "Required manual backup command '${command}' is unavailable after package installation."
+            return 1
+        }
+    done
+    ok "Manual archive, checksum, and temporary-mount tools are available."
+}
+
 install_mdns_support() {
     local package
     local -a missing_packages=()
@@ -1347,7 +1392,18 @@ install_vwctl() {
         return 1
     fi
 
-    ok "Installed the appliance management command and USB setup helper."
+    if [[ -e "${BACKUP_TARGET}" &&
+          ( ! -f "${BACKUP_TARGET}" || -L "${BACKUP_TARGET}" ) ]]; then
+        error "The backup helper target is unsafe: ${BACKUP_TARGET}."
+        return 1
+    fi
+    install -m 0755 "${BACKUP_SOURCE}" "${BACKUP_TARGET}"
+    if [[ ! -x "${BACKUP_TARGET}" ]]; then
+        error "The backup helper was copied but is not executable at ${BACKUP_TARGET}."
+        return 1
+    fi
+
+    ok "Installed the appliance management command, USB setup helper, and backup helper."
 }
 
 install_appliance_version() {
@@ -1425,6 +1481,7 @@ main() {
     configure_docker_group
     install_mdns_support
     install_usb_setup_support
+    install_backup_support
 
     case "${APPLIANCE_STATE}" in
         fresh|existing) create_appliance_files ;;

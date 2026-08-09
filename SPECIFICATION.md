@@ -462,7 +462,7 @@ The installer and every mutating `vwctl` command use the same non-blocking,
 root-owned runtime lock at `/run/lock/vaultwarden-appliance.lock`. If another
 operation holds it, the new operation fails clearly without waiting. The lock
 applies to install, start, stop, restart, update, access, signup changes,
-certificate export, and `usb setup`. Status, health, logs, version, update
+certificate export, `usb setup`, and manual `backup`. Status, health, logs, version, update
 check, signup status, certificate info, `usb status`, and help do not acquire
 it.
 
@@ -883,7 +883,17 @@ The backup process must preserve all information required for a reliable restore
 
 The restore process MUST explicitly restore appropriate ownership and permissions on the Linux system.
 
-The exact archive format may change if testing demonstrates a technically superior solution, but portability must remain a goal.
+Phase 5C uses gzip-compressed POSIX tar archives under `backups/` on the
+configured `VWBACKUP` filesystem. Filenames use UTC:
+
+```text
+vaultwarden-appliance-YYYYMMDD-HHMMSS.tar.gz
+vaultwarden-appliance-YYYYMMDD-HHMMSS.tar.gz.sha256
+```
+
+Collisions receive a numeric suffix. Existing archives are never overwritten or
+deleted. Every archive is read-tested, checked for required members and unsafe
+paths, and accompanied by a verified `sha256sum`-compatible checksum.
 
 ---
 
@@ -898,6 +908,50 @@ Configuration required for appliance recovery SHOULD also be backed up where app
 The implementation must determine the correct procedure for safely backing up the Vaultwarden database.
 
 A backup MUST NOT simply assume that copying a live database file always produces a valid backup.
+
+Phase 5C provides one manual operation:
+
+```bash
+sudo vwctl backup
+```
+
+It requires root, holds the global appliance mutation lock, and reuses the
+Phase 5B UUID, filesystem, physical-topology, virtual-device, and system-disk
+checks. An existing unique safe mount is reused and never unmounted by the
+appliance. Otherwise the filesystem is temporarily mounted at
+`/run/vaultwarden-appliance/backup` and unmounted on success or best-effort
+cleanup. No `/etc/fstab` entry is created.
+
+Vaultwarden 1.37.x's supported built-in `backup` command creates the SQLite
+snapshot using `VACUUM INTO`. Only the newly generated snapshot is moved into
+root-only runtime staging; live `db.sqlite3`, WAL, and SHM files are excluded
+from the archive. Vaultwarden remains running. The archive layout is:
+
+```text
+vaultwarden-appliance-backup/
+  manifest
+  vaultwarden/
+    db.sqlite3
+    data/
+  caddy/
+  appliance/
+```
+
+The manifest uses independent `backup_schema=1` and records the appliance
+version, UTC timestamp, access hostname, signup state, configured/running image
+versions where available, source architecture, CA inclusion, and expected
+contents. It contains no passwords, tokens, or private-key contents.
+
+Persistent Caddy state is included so a future restore can preserve the
+internal root CA and existing client trust. This includes sensitive CA private
+key material as opaque files. Phase 5C adds no encryption, so the backup medium
+MUST be physically protected. Private keys are never printed or parsed.
+
+Before writing, Phase 5C requires a conservative estimate of source size plus
+25 percent and 64 MiB overhead to fit in currently available space. It never
+deletes older backups to make room. Failed artifacts may remain for diagnosis.
+Restore, automatic backup, scheduling, retention, and backup listing remain out
+of scope.
 
 ---
 
@@ -1129,7 +1183,8 @@ Phase 3  Caddy + internal HTTPS
 Phase 4  vwctl basic management
 Phase 5A Read-only block-device discovery and selection
 Phase 5B Destructive backup-media setup and formatting
-Phase 6  Backup + retention + overflow protection
+Phase 5C Manual verified backup
+Phase 6  Automatic backup + retention + overflow protection
 Phase 7  Restore
 Phase 8  Diagnostics and polish
 ```

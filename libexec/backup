@@ -1,0 +1,717 @@
+#!/usr/bin/env bash
+# Vaultwarden Appliance manual backup
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIR
+if [[ -f "${SCRIPT_DIR}/../lib/common.sh" && ! -L "${SCRIPT_DIR}/../lib/common.sh" ]]; then
+    LIB_DIR=$(cd -- "${SCRIPT_DIR}/../lib" && pwd -P)
+else
+    LIB_DIR="/usr/local/lib/vaultwarden-appliance"
+fi
+readonly LIB_DIR
+for library in common network docker storage; do
+    library_path="${LIB_DIR}/${library}.sh"
+    if [[ ! -f "${library_path}" || -L "${library_path}" ]]; then
+        printf 'Error: Required backup library is missing or unsafe: %s\n' \
+            "${library_path}" >&2
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    . "${library_path}"
+done
+unset library library_path
+
+readonly INSTALL_DIR="/opt/vaultwarden"
+readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
+readonly APPLIANCE_VERSION_FILE="${INSTALL_DIR}/.appliance-version"
+readonly ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
+readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
+readonly VAULTWARDEN_DATA_DIR="${INSTALL_DIR}/data/vaultwarden"
+readonly CADDY_DATA_DIR="${INSTALL_DIR}/data/caddy"
+readonly CADDY_ROOT_CA_RELATIVE="data/caddy/pki/authorities/local/root.crt"
+readonly CADDY_ROOT_KEY_RELATIVE="data/caddy/pki/authorities/local/root.key"
+readonly RUNTIME_DIR="/run/vaultwarden-appliance"
+readonly BACKUP_MOUNTPOINT="${RUNTIME_DIR}/backup"
+readonly BACKUP_SCHEMA="1"
+readonly BACKUP_LABEL="VWBACKUP"
+readonly BACKUP_OVERHEAD_BYTES=$((64 * 1024 * 1024))
+
+BACKUP_TOPOLOGY=""
+BACKUP_SYSTEM_MOUNTS=""
+BACKUP_PROTECTED_DISKS=""
+BACKUP_DEVICE=""
+BACKUP_DISK=""
+BACKUP_UUID=""
+BACKUP_ACTIVE_MOUNTPOINT=""
+BACKUP_WORK_DIR=""
+BACKUP_TEMP_DATABASE=""
+BACKUP_MOUNTED_BY_APPLIANCE=0
+BACKUP_MOUNTPOINT_CREATED=0
+
+backup_ok() {
+    printf '[ OK ] %s\n' "$1"
+}
+
+backup_error() {
+    printf 'Error: %s\n' "$*" >&2
+}
+
+backup_remove_work_directory() {
+    local directory=$1
+    local runtime_root=$2
+
+    [[ "${runtime_root}" == /* && "${runtime_root}" != "/" &&
+       "${directory}" == "${runtime_root}"/backup-work.* &&
+       -d "${directory}" && ! -L "${directory}" ]] || return 1
+    rm -rf -- "${directory}"
+}
+
+backup_cleanup() {
+    local original_status=$1
+    local final_status=${original_status}
+
+    trap - EXIT INT TERM
+    if (( BACKUP_MOUNTED_BY_APPLIANCE == 1 )); then
+        sync -f "${BACKUP_ACTIVE_MOUNTPOINT}" >/dev/null 2>&1 || true
+        if umount -- "${BACKUP_ACTIVE_MOUNTPOINT}"; then
+            BACKUP_MOUNTED_BY_APPLIANCE=0
+        else
+            backup_error "Unable to unmount backup filesystem during cleanup."
+            final_status=1
+        fi
+    fi
+    if [[ -n "${BACKUP_TEMP_DATABASE}" &&
+          "${BACKUP_TEMP_DATABASE}" == "${VAULTWARDEN_DATA_DIR}"/db_[0-9]*_[0-9]*.sqlite3 &&
+          -f "${BACKUP_TEMP_DATABASE}" && ! -L "${BACKUP_TEMP_DATABASE}" ]]; then
+        rm -f -- "${BACKUP_TEMP_DATABASE}" || {
+            backup_error "Unable to remove the temporary Vaultwarden database snapshot."
+            final_status=1
+        }
+    fi
+    if [[ -n "${BACKUP_WORK_DIR}" && -d "${BACKUP_WORK_DIR}" ]]; then
+        backup_remove_work_directory "${BACKUP_WORK_DIR}" "${RUNTIME_DIR}" || {
+            backup_error "Unable to remove sensitive backup staging data."
+            final_status=1
+        }
+    fi
+    if (( BACKUP_MOUNTPOINT_CREATED == 1 )) &&
+       [[ -d "${BACKUP_MOUNTPOINT}" && ! -L "${BACKUP_MOUNTPOINT}" ]]; then
+        rmdir -- "${BACKUP_MOUNTPOINT}" 2>/dev/null || true
+    fi
+    exit "${final_status}"
+}
+
+backup_die() {
+    backup_error "$*"
+    exit 1
+}
+
+backup_require_environment() {
+    local command
+
+    (( EUID == 0 )) || backup_die "Backup must run as root through sudo vwctl backup."
+    [[ -d "${INSTALL_DIR}" && ! -L "${INSTALL_DIR}" ]] || \
+        backup_die "The appliance installation directory is missing or unsafe."
+    [[ -f "${APPLIANCE_MARKER}" && ! -L "${APPLIANCE_MARKER}" ]] || \
+        backup_die "The appliance marker is missing or unsafe."
+    [[ -f "${APPLIANCE_VERSION_FILE}" && ! -L "${APPLIANCE_VERSION_FILE}" ]] || \
+        backup_die "The appliance version state is missing or unsafe."
+    [[ -f "${ACCESS_FILE}" && ! -L "${ACCESS_FILE}" ]] || \
+        backup_die "The appliance access state is missing or unsafe."
+    [[ -d "${VAULTWARDEN_DATA_DIR}" && ! -L "${VAULTWARDEN_DATA_DIR}" ]] || \
+        backup_die "Vaultwarden persistent data is missing or unsafe."
+    [[ -d "${CADDY_DATA_DIR}" && ! -L "${CADDY_DATA_DIR}" ]] || \
+        backup_die "Caddy persistent data is missing or unsafe."
+    [[ -f "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" &&
+       ! -L "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" ]] || \
+        backup_die "Caddy's persistent internal root CA is missing or unsafe."
+    [[ -f "${CADDY_DATA_DIR}/${CADDY_ROOT_KEY_RELATIVE}" &&
+       ! -L "${CADDY_DATA_DIR}/${CADDY_ROOT_KEY_RELATIVE}" ]] || \
+        backup_die "Caddy's persistent internal CA private key is missing or unsafe."
+    for command in docker lsblk findmnt readlink stat mount umount tar gzip \
+        sha256sum sync df du find install mktemp date uname awk grep mv rm \
+        mkdir rmdir chmod dirname; do
+        command_exists "${command}" || \
+            backup_die "Required backup command '${command}' is unavailable. Rerun the installer."
+    done
+    docker info >/dev/null 2>&1 || backup_die "The Docker daemon is unavailable."
+    container_is_running vaultwarden || backup_die "The Vaultwarden container is not running."
+}
+
+backup_refresh_storage() {
+    BACKUP_TOPOLOGY=$(storage_collect_topology) || return 1
+    BACKUP_SYSTEM_MOUNTS=$(storage_collect_system_mounts "${BACKUP_TOPOLOGY}") || return 1
+    BACKUP_PROTECTED_DISKS=$(storage_protected_disks_from_mounts \
+        "${BACKUP_TOPOLOGY}" "${BACKUP_SYSTEM_MOUNTS}") || return 1
+}
+
+backup_read_state() {
+    local label
+    local owner
+    local permissions
+    local state
+
+    [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || \
+        backup_die "No safe configured backup-media state was found. Run sudo vwctl usb setup first."
+    owner=$(stat -c '%u' "${BACKUP_STATE_FILE}" 2>/dev/null) || \
+        backup_die "Unable to verify backup-media state ownership."
+    permissions=$(stat -c '%a' "${BACKUP_STATE_FILE}" 2>/dev/null) || \
+        backup_die "Unable to verify backup-media state permissions."
+    [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || \
+        backup_die "The configured backup-media state ownership or permissions are invalid."
+    (( (8#${permissions} & 8#022) == 0 )) || \
+        backup_die "The configured backup-media state file must not be group- or world-writable."
+    state=$(storage_read_backup_state "${BACKUP_STATE_FILE}") || \
+        backup_die "The configured backup-media state is invalid."
+    BACKUP_UUID=${state%%|*}
+    label=${state#*|}
+    [[ "${label}" == "${BACKUP_LABEL}" ]] || \
+        backup_die "The configured backup-media label is invalid."
+}
+
+backup_resolve_media() {
+    local lookup
+    local result
+    local -a fields=()
+
+    backup_refresh_storage || backup_die "Unable to establish safe block-device topology."
+    if lookup=$(storage_lookup_configured_backup \
+        "${BACKUP_TOPOLOGY}" "${BACKUP_PROTECTED_DISKS}" \
+        "${BACKUP_UUID}" "${BACKUP_LABEL}"); then
+        mapfile -t fields <<<"${lookup}"
+    else
+        result=$?
+        case "${result}" in
+            2) backup_die "Backup device is not connected; configured UUID ${BACKUP_UUID} was not found." ;;
+            3) backup_die "Multiple filesystems report configured backup UUID ${BACKUP_UUID}." ;;
+            4) backup_die "The configured backup filesystem is not exFAT." ;;
+            5) backup_die "The configured backup filesystem is not labeled ${BACKUP_LABEL}." ;;
+            6) backup_die "The configured backup filesystem changed during validation." ;;
+            8) backup_die "The configured backup filesystem is backed by a protected system disk." ;;
+            9) backup_die "The configured backup filesystem is backed by a virtual device." ;;
+            *) backup_die "Configured backup filesystem failed safety validation." ;;
+        esac
+    fi
+    ((${#fields[@]} == 2)) || backup_die "Configured backup filesystem lookup was ambiguous."
+    BACKUP_DEVICE=${fields[0]}
+    BACKUP_DISK=${fields[1]}
+}
+
+backup_existing_mountpoint() {
+    local device=$1
+    local output
+    local -a mountpoints=()
+
+    output=$(findmnt --noheadings --raw --output TARGET --source "${device}" 2>/dev/null || true)
+    [[ -n "${output}" ]] || return 1
+    mapfile -t mountpoints <<<"${output}"
+    ((${#mountpoints[@]} == 1)) || return 2
+    [[ "${mountpoints[0]}" == /* && "${mountpoints[0]}" != *'\x'* &&
+       "${mountpoints[0]}" != *$'\n'* ]] || return 2
+    printf '%s\n' "${mountpoints[0]}"
+}
+
+backup_prepare_runtime_root() {
+    local owner
+    local permissions
+
+    if [[ ! -e "${RUNTIME_DIR}" ]]; then
+        install -d -m 0700 "${RUNTIME_DIR}" || return 1
+    fi
+    [[ -d "${RUNTIME_DIR}" && ! -L "${RUNTIME_DIR}" ]] || return 1
+    owner=$(stat -c '%u' "${RUNTIME_DIR}") || return 1
+    permissions=$(stat -c '%a' "${RUNTIME_DIR}") || return 1
+    [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${permissions} & 8#022) == 0 )) || return 1
+}
+
+backup_prepare_runtime_directory() {
+    local permissions
+
+    backup_prepare_runtime_root || return 1
+
+    if [[ ! -e "${BACKUP_MOUNTPOINT}" ]]; then
+        mkdir -m 0700 -- "${BACKUP_MOUNTPOINT}" || return 1
+        BACKUP_MOUNTPOINT_CREATED=1
+    fi
+    [[ -d "${BACKUP_MOUNTPOINT}" && ! -L "${BACKUP_MOUNTPOINT}" ]] || return 1
+    [[ "$(stat -c '%u' "${BACKUP_MOUNTPOINT}")" == "0" ]] || return 1
+    permissions=$(stat -c '%a' "${BACKUP_MOUNTPOINT}") || return 1
+    [[ "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${permissions} & 8#022) == 0 )) || return 1
+    findmnt --mountpoint "${BACKUP_MOUNTPOINT}" >/dev/null 2>&1 && return 1
+    [[ -z "$(find "${BACKUP_MOUNTPOINT}" -mindepth 1 -maxdepth 1 -print -quit)" ]] || return 1
+}
+
+backup_verify_mounted_media() {
+    local expected_device=$1
+    local expected_disk=$2
+    local mountpoint=$3
+    local lookup
+    local mounted_source
+    local mounted_uuid
+
+    [[ -d "${mountpoint}" && ! -L "${mountpoint}" ]] || return 1
+    mounted_source=$(findmnt --noheadings --raw --output SOURCE \
+        --target "${mountpoint}" 2>/dev/null) || return 1
+    [[ "${mounted_source}" == "${expected_device}" ]] || return 2
+    mounted_uuid=$(storage_lsblk_property "${expected_device}" UUID) || return 1
+    [[ "${mounted_uuid}" == "${BACKUP_UUID}" ]] || return 2
+    backup_refresh_storage || return 1
+    lookup=$(storage_lookup_configured_backup \
+        "${BACKUP_TOPOLOGY}" "${BACKUP_PROTECTED_DISKS}" \
+        "${BACKUP_UUID}" "${BACKUP_LABEL}") || return 1
+    [[ "${lookup}" == "${expected_device}"$'\n'"${expected_disk}" ]]
+}
+
+backup_prepare_mount() {
+    local mount_status
+    local mounted=""
+
+    if mounted=$(backup_existing_mountpoint "${BACKUP_DEVICE}"); then
+        BACKUP_ACTIVE_MOUNTPOINT=${mounted}
+        BACKUP_MOUNTED_BY_APPLIANCE=0
+    else
+        mount_status=$?
+        (( mount_status == 1 )) || \
+            backup_die "The configured backup filesystem has multiple or unsafe mountpoints."
+        backup_prepare_runtime_directory || \
+            backup_die "The appliance runtime mountpoint is unsafe or unavailable."
+        mount --types exfat --options rw,nosuid,nodev,noexec \
+            --source "${BACKUP_DEVICE}" --target "${BACKUP_MOUNTPOINT}" || \
+            backup_die "Unable to mount backup filesystem."
+        BACKUP_ACTIVE_MOUNTPOINT=${BACKUP_MOUNTPOINT}
+        BACKUP_MOUNTED_BY_APPLIANCE=1
+    fi
+    backup_verify_mounted_media \
+        "${BACKUP_DEVICE}" "${BACKUP_DISK}" "${BACKUP_ACTIVE_MOUNTPOINT}" || \
+        backup_die "Configured backup filesystem failed validation after mounting."
+}
+
+backup_estimated_required_bytes() {
+    local source_bytes=$1
+
+    [[ "${source_bytes}" =~ ^[0-9]+$ ]] || return 1
+    printf '%d\n' "$((source_bytes + source_bytes / 4 + BACKUP_OVERHEAD_BYTES))"
+}
+
+backup_has_sufficient_space() {
+    local required=$1
+    local available=$2
+
+    [[ "${required}" =~ ^[0-9]+$ && "${available}" =~ ^[0-9]+$ ]] || return 1
+    (( available >= required ))
+}
+
+backup_source_bytes() {
+    local vaultwarden_directory=$1
+    local caddy_directory=$2
+    local total
+    local vaultwarden_bytes
+    local caddy_bytes
+
+    vaultwarden_bytes=$(du --summarize --bytes "${vaultwarden_directory}" | awk '{print $1}') || return 1
+    caddy_bytes=$(du --summarize --bytes "${caddy_directory}" | awk '{print $1}') || return 1
+    [[ "${vaultwarden_bytes}" =~ ^[0-9]+$ && "${caddy_bytes}" =~ ^[0-9]+$ ]] || return 1
+    total=$((vaultwarden_bytes + caddy_bytes))
+    printf '%d\n' "${total}"
+}
+
+backup_available_bytes() {
+    local mountpoint=$1
+    local available
+
+    available=$(df --block-size=1 --output=avail "${mountpoint}" 2>/dev/null |
+        awk 'NR == 2 {print $1}') || return 1
+    [[ "${available}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${available}"
+}
+
+backup_create_work_directory() {
+    backup_prepare_runtime_root || return 1
+    BACKUP_WORK_DIR=$(mktemp -d "${RUNTIME_DIR}/backup-work.XXXXXXXX") || return 1
+    [[ "${BACKUP_WORK_DIR}" == "${RUNTIME_DIR}"/backup-work.* &&
+       -d "${BACKUP_WORK_DIR}" && ! -L "${BACKUP_WORK_DIR}" ]] || return 1
+    chmod 0700 "${BACKUP_WORK_DIR}" || return 1
+    install -d -m 0700 \
+        "${BACKUP_WORK_DIR}/vaultwarden-appliance-backup/vaultwarden" \
+        "${BACKUP_WORK_DIR}/vaultwarden-appliance-backup/appliance"
+}
+
+backup_copy_appliance_configuration() {
+    local appliance_directory=$1
+    local destination=$2
+    local source
+    local -a files=(
+        .vaultwarden-appliance
+        .appliance-version
+        .caddy-access
+        .backup-device
+        docker-compose.yml
+        docker-compose.override.yml
+        docker-compose.vwctl.yml
+        Caddyfile
+    )
+
+    for source in "${files[@]}"; do
+        [[ -e "${appliance_directory}/${source}" || -L "${appliance_directory}/${source}" ]] || continue
+        [[ -f "${appliance_directory}/${source}" && ! -L "${appliance_directory}/${source}" ]] || return 1
+        install -m 0600 -- "${appliance_directory}/${source}" "${destination}/${source}" || return 1
+    done
+    [[ -f "${destination}/.appliance-version" &&
+       -f "${destination}/.caddy-access" &&
+       -f "${destination}/docker-compose.yml" &&
+       -f "${destination}/docker-compose.override.yml" ]]
+}
+
+backup_manifest_value() {
+    local value
+
+    value=$(storage_sanitize_text "$1") || return 1
+    [[ -n "${value}" && "${value}" == "$1" &&
+       "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || return 1
+    printf '%s\n' "${value}"
+}
+
+backup_write_manifest() {
+    local destination=$1
+    local appliance_version=$2
+    local created_at=$3
+    local hostname=$4
+    local signup_allowed=$5
+    local vaultwarden_image=$6
+    local vaultwarden_version=$7
+    local caddy_image=$8
+    local caddy_version=$9
+    local architecture=${10}
+    local value
+
+    for value in "${appliance_version}" "${created_at}" "${hostname}" \
+        "${signup_allowed}" "${vaultwarden_image}" "${vaultwarden_version}" \
+        "${caddy_image}" "${caddy_version}" "${architecture}"; do
+        backup_manifest_value "${value}" >/dev/null || return 1
+    done
+    printf '%s\n' \
+        "backup_schema=${BACKUP_SCHEMA}" \
+        "appliance_version=${appliance_version}" \
+        "created_at_utc=${created_at}" \
+        "access_hostname=${hostname}" \
+        "signup_allowed=${signup_allowed}" \
+        "vaultwarden_image=${vaultwarden_image}" \
+        "vaultwarden_version=${vaultwarden_version}" \
+        "caddy_image=${caddy_image}" \
+        "caddy_version=${caddy_version}" \
+        "source_architecture=${architecture}" \
+        'caddy_ca_included=yes' \
+        'top_level_contents=manifest,vaultwarden,caddy,appliance' > "${destination}" || return 1
+    chmod 0600 "${destination}"
+}
+
+backup_builtin_database_snapshots() {
+    local data_directory=$1
+    local candidate
+    local name
+
+    for candidate in "${data_directory}"/db_*.sqlite3; do
+        [[ -e "${candidate}" || -L "${candidate}" ]] || continue
+        name=${candidate##*/}
+        [[ "${name}" =~ ^db_[0-9]{8}_[0-9]{6}\.sqlite3$ ]] || continue
+        printf '%s\n' "${candidate}"
+    done
+}
+
+backup_create_database_snapshot() {
+    local data_directory=$1
+    local destination=$2
+    local candidate
+    local command_status=0
+    local output
+    local -a new_snapshots=()
+    local -A before=()
+
+    while IFS= read -r candidate; do
+        before["${candidate}"]=1
+    done < <(backup_builtin_database_snapshots "${data_directory}")
+
+    output=$(docker exec vaultwarden /vaultwarden backup 2>&1) || command_status=$?
+    while IFS= read -r candidate; do
+        [[ -z "${before[${candidate}]:-}" ]] || continue
+        new_snapshots+=("${candidate}")
+    done < <(backup_builtin_database_snapshots "${data_directory}")
+    if (( command_status != 0 )); then
+        if ((${#new_snapshots[@]} == 1)); then
+            candidate=${new_snapshots[0]}
+            [[ ! -L "${candidate}" ]] && BACKUP_TEMP_DATABASE=${candidate}
+        fi
+        [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
+        return 1
+    fi
+    ((${#new_snapshots[@]} == 1)) || return 1
+    candidate=${new_snapshots[0]}
+    BACKUP_TEMP_DATABASE=${candidate}
+    [[ -f "${candidate}" && ! -L "${candidate}" && -s "${candidate}" ]] || return 1
+    mv -- "${candidate}" "${destination}" || return 1
+    BACKUP_TEMP_DATABASE=""
+    [[ -f "${destination}" && ! -L "${destination}" && -s "${destination}" ]]
+}
+
+backup_sources_are_safe() {
+    local vaultwarden_directory=$1
+    local caddy_directory=$2
+    local unexpected
+
+    [[ -d "${vaultwarden_directory}" && ! -L "${vaultwarden_directory}" &&
+       -d "${caddy_directory}" && ! -L "${caddy_directory}" ]] || return 1
+    unexpected=$(find "${vaultwarden_directory}" "${caddy_directory}" \
+        \( ! -type f ! -type d \) -print -quit) || return 1
+    [[ -z "${unexpected}" ]]
+}
+
+backup_create_archive() {
+    local work_directory=$1
+    local archive=$2
+    local data_directory=$3
+
+    backup_sources_are_safe "${data_directory}/vaultwarden" "${data_directory}/caddy" || return 1
+    tar --create --gzip --file "${archive}" \
+        --anchored \
+        --exclude='vaultwarden/db.sqlite3' \
+        --exclude='vaultwarden/db.sqlite3-wal' \
+        --exclude='vaultwarden/db.sqlite3-shm' \
+        --exclude='vaultwarden/db_*.sqlite3' \
+        --exclude='vaultwarden/tmp' \
+        --exclude='vaultwarden/tmp/*' \
+        --transform='s,^vaultwarden$,vaultwarden-appliance-backup/vaultwarden/data,' \
+        --transform='s,^vaultwarden/,vaultwarden-appliance-backup/vaultwarden/data/,' \
+        --transform='s,^caddy$,vaultwarden-appliance-backup/caddy,' \
+        --transform='s,^caddy/,vaultwarden-appliance-backup/caddy/,' \
+        --directory "${work_directory}" vaultwarden-appliance-backup \
+        --directory "${data_directory}" vaultwarden caddy
+}
+
+backup_verify_archive() {
+    local archive=$1
+    local listing=$2
+
+    [[ -f "${archive}" && ! -L "${archive}" && -s "${archive}" ]] || return 1
+    tar --list --gzip --file "${archive}" > "${listing}" || return 1
+    [[ -s "${listing}" ]] || return 1
+    awk '
+        /^\// {bad=1}
+        /(^|\/)\.\.($|\/)/ {bad=1}
+        END {exit bad}
+    ' "${listing}" || return 1
+    grep -Fxq 'vaultwarden-appliance-backup/manifest' "${listing}" || return 2
+    grep -Fxq 'vaultwarden-appliance-backup/vaultwarden/db.sqlite3' "${listing}" || return 3
+    grep -Eq '^vaultwarden-appliance-backup/vaultwarden/data/?$' "${listing}" || return 4
+    grep -Eq '^vaultwarden-appliance-backup/caddy/?$' "${listing}" || return 5
+    grep -Fxq \
+        "vaultwarden-appliance-backup/caddy/${CADDY_ROOT_CA_RELATIVE}" \
+        "${listing}" || return 5
+    grep -Fxq \
+        "vaultwarden-appliance-backup/caddy/${CADDY_ROOT_KEY_RELATIVE}" \
+        "${listing}" || return 5
+}
+
+backup_choose_archive_path() {
+    local backup_directory=$1
+    local timestamp=$2
+    local archive
+    local suffix
+    local index
+
+    [[ "${timestamp}" =~ ^[0-9]{8}-[0-9]{6}$ ]] || return 1
+    for ((index = 0; index <= 99; index++)); do
+        if (( index == 0 )); then
+            suffix=""
+        else
+            printf -v suffix -- '-%02d' "${index}"
+        fi
+        archive="${backup_directory}/vaultwarden-appliance-${timestamp}${suffix}.tar.gz"
+        if [[ ! -e "${archive}" && ! -L "${archive}" &&
+              ! -e "${archive}.sha256" && ! -L "${archive}.sha256" ]]; then
+            printf '%s\n' "${archive}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+backup_write_checksum() {
+    local archive=$1
+    local checksum="${archive}.sha256"
+    local directory
+    local filename
+    local hash
+    local temporary
+
+    directory=$(dirname -- "${archive}") || return 1
+    filename=${archive##*/}
+    temporary=$(mktemp "${directory}/.${filename}.sha256.partial.XXXXXXXX") || return 1
+    if ! (cd -- "${directory}" && sha256sum -- "${filename}") > "${temporary}"; then
+        return 2
+    fi
+    if ! (cd -- "${directory}" && sha256sum --check --strict "${temporary##*/}") >/dev/null; then
+        return 3
+    fi
+    hash=$(awk 'NR == 1 {print $1}' "${temporary}") || return 1
+    [[ "${hash}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    mv -n -- "${temporary}" "${checksum}" || return 1
+    [[ ! -e "${temporary}" && -f "${checksum}" && ! -L "${checksum}" ]] || return 1
+    printf '%s\n' "${hash}"
+}
+
+backup_finish_mount() {
+    sync -f "${BACKUP_ACTIVE_MOUNTPOINT}" || return 1
+    sync || return 1
+    if (( BACKUP_MOUNTED_BY_APPLIANCE == 1 )); then
+        umount -- "${BACKUP_ACTIVE_MOUNTPOINT}" || return 1
+        BACKUP_MOUNTED_BY_APPLIANCE=0
+        backup_ok "Backup media unmounted"
+    else
+        backup_ok "Pre-existing backup-media mount preserved"
+    fi
+}
+
+backup_main() {
+    local appliance_version
+    local archive
+    local archive_partial
+    local archive_size
+    local available_bytes
+    local backup_directory
+    local caddy_image
+    local caddy_version
+    local checksum_hash
+    local created_at
+    local hostname
+    local required_bytes
+    local signup_allowed
+    local source_bytes
+    local timestamp
+    local vaultwarden_image
+    local vaultwarden_version
+    local verification_result
+    local -a version_lines=()
+
+    umask 077
+    trap 'backup_cleanup $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    printf 'Vaultwarden Appliance backup\n\n'
+    backup_require_environment
+    backup_read_state
+    backup_resolve_media
+    backup_ok "Backup media: ${BACKUP_LABEL} (${BACKUP_UUID})"
+    backup_prepare_mount
+
+    backup_directory="${BACKUP_ACTIVE_MOUNTPOINT}/backups"
+    if [[ ! -e "${backup_directory}" ]]; then
+        mkdir -m 0700 -- "${backup_directory}" || backup_die "Unable to create backup directory."
+    fi
+    [[ -d "${backup_directory}" && ! -L "${backup_directory}" ]] || \
+        backup_die "The backup destination directory is unsafe."
+
+    source_bytes=$(backup_source_bytes "${VAULTWARDEN_DATA_DIR}" "${CADDY_DATA_DIR}") || \
+        backup_die "Unable to estimate backup source size."
+    required_bytes=$(backup_estimated_required_bytes "${source_bytes}") || \
+        backup_die "Unable to calculate required backup space."
+    available_bytes=$(backup_available_bytes "${BACKUP_ACTIVE_MOUNTPOINT}") || \
+        backup_die "Unable to determine available backup space."
+    printf '[INFO] Required estimate: %s\n' "$(storage_format_bytes "${required_bytes}")"
+    printf '[INFO] Available: %s\n' "$(storage_format_bytes "${available_bytes}")"
+    backup_has_sufficient_space "${required_bytes}" "${available_bytes}" || \
+        backup_die "Insufficient free space."
+    backup_ok "Available space checked"
+
+    backup_create_work_directory || backup_die "Unable to create secure runtime staging."
+    backup_copy_appliance_configuration "${INSTALL_DIR}" \
+        "${BACKUP_WORK_DIR}/vaultwarden-appliance-backup/appliance" || \
+        backup_die "Unable to stage appliance configuration."
+
+    mapfile -t version_lines < "${APPLIANCE_VERSION_FILE}"
+    ((${#version_lines[@]} == 1)) || backup_die "The appliance version state is invalid."
+    appliance_version=${version_lines[0]}
+    hostname=$(read_access_hostname "${ACCESS_FILE}") || backup_die "The access state is invalid."
+    signup_allowed=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' vaultwarden |
+        awk -F= '$1 == "SIGNUPS_ALLOWED" {print tolower(substr($0, index($0, "=") + 1)); exit}') || true
+    [[ "${signup_allowed}" == "true" || "${signup_allowed}" == "false" ]] || signup_allowed=unknown
+    vaultwarden_image=$(docker inspect --format '{{.Config.Image}}' vaultwarden 2>/dev/null || printf unknown)
+    caddy_image=$(docker inspect --format '{{.Config.Image}}' caddy 2>/dev/null || printf unknown)
+    vaultwarden_version=$(docker exec vaultwarden /vaultwarden --version 2>/dev/null |
+        awk 'NF {print; exit}' || true)
+    caddy_version=$(docker exec caddy caddy version 2>/dev/null |
+        awk 'NF {print; exit}' || true)
+    [[ -n "${vaultwarden_version}" ]] || vaultwarden_version=${vaultwarden_image}
+    [[ -n "${caddy_version}" ]] || caddy_version=${caddy_image}
+    created_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    backup_write_manifest \
+        "${BACKUP_WORK_DIR}/vaultwarden-appliance-backup/manifest" \
+        "${appliance_version}" "${created_at}" "${hostname}" "${signup_allowed}" \
+        "${vaultwarden_image}" "${vaultwarden_version}" \
+        "${caddy_image}" "${caddy_version}" "$(uname -m)" || \
+        backup_die "Unable to create backup manifest."
+
+    backup_create_database_snapshot "${VAULTWARDEN_DATA_DIR}" \
+        "${BACKUP_WORK_DIR}/vaultwarden-appliance-backup/vaultwarden/db.sqlite3" || \
+        backup_die "Vaultwarden database backup failed."
+    backup_ok "Vaultwarden database snapshot created"
+
+    timestamp=$(date -u '+%Y%m%d-%H%M%S')
+    archive=$(backup_choose_archive_path "${backup_directory}" "${timestamp}") || \
+        backup_die "Unable to choose a collision-free backup filename."
+    archive_partial=$(mktemp "${backup_directory}/.${archive##*/}.partial.XXXXXXXX") || \
+        backup_die "Unable to create the backup archive safely."
+    backup_create_archive "${BACKUP_WORK_DIR}" "${archive_partial}" "${INSTALL_DIR}/data" || \
+        backup_die "Unable to create archive; the partial artifact was preserved."
+    backup_ok "Backup archive created"
+
+    if backup_verify_archive "${archive_partial}" "${BACKUP_WORK_DIR}/archive.list"; then
+        :
+    else
+        verification_result=$?
+        case "${verification_result}" in
+            2) backup_die "Archive integrity verification failed: manifest is missing." ;;
+            3) backup_die "Archive integrity verification failed: database snapshot is missing." ;;
+            4) backup_die "Archive integrity verification failed: Vaultwarden data is missing." ;;
+            5) backup_die "Archive integrity verification failed: Caddy CA data is missing." ;;
+            *) backup_die "Archive integrity verification failed." ;;
+        esac
+    fi
+    mv -n -- "${archive_partial}" "${archive}" || \
+        backup_die "Unable to install the verified archive."
+    [[ ! -e "${archive_partial}" && -f "${archive}" && ! -L "${archive}" ]] || \
+        backup_die "The final backup filename collided with another file."
+    backup_ok "Archive integrity verified"
+
+    if checksum_hash=$(backup_write_checksum "${archive}"); then
+        :
+    else
+        verification_result=$?
+        case "${verification_result}" in
+            2) backup_die "Unable to write checksum." ;;
+            3) backup_die "Checksum verification failed." ;;
+            *) backup_die "Unable to install checksum safely." ;;
+        esac
+    fi
+    backup_ok "SHA-256 checksum verified"
+    archive_size=$(stat -c '%s' "${archive}") || backup_die "Unable to read final archive size."
+    backup_finish_mount || backup_die "Unable to unmount backup filesystem."
+
+    printf '\nBackup complete.\n\n'
+    printf 'File:\n  %s\n\n' "${archive##*/}"
+    printf 'Size:\n  %s\n\n' "$(storage_format_bytes "${archive_size}")"
+    printf 'SHA-256:\n  %s\n\n' "${checksum_hash}"
+    printf 'Security: this unencrypted backup contains Caddy internal CA private material.\n'
+    printf 'Physically protect the backup medium.\n'
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    (( $# == 0 )) || backup_die "Usage: backup"
+    backup_main
+fi

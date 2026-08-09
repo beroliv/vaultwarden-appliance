@@ -1,7 +1,7 @@
 # vaultwarden-appliance
 
-Simple LAN-only Vaultwarden appliance with Caddy, local HTTPS, mDNS, and
-`vwctl`. USB backup and restore are planned for later phases.
+Simple LAN-only Vaultwarden appliance with Caddy, local HTTPS, mDNS, `vwctl`,
+and manual USB backup. Restore, scheduling, and retention remain later phases.
 
 ## Installation
 
@@ -18,7 +18,7 @@ under `/opt/vaultwarden`. A working existing Docker installation is reused
 without modification.
 
 `install.sh` is not a remote bootstrap downloader. It requires the repository's
-`vwctl`, `mdns-publisher`, `VERSION`, and `lib/` files beside it.
+`vwctl`, `mdns-publisher`, `VERSION`, `lib/`, and `libexec/` files beside it.
 
 The installer installs Debian's `avahi-daemon`, `avahi-utils`, and `libnss-mdns`
 packages when needed. On a fresh configuration it asks:
@@ -106,6 +106,7 @@ vwctl cert info
 sudo vwctl cert export
 vwctl usb status
 sudo vwctl usb setup
+sudo vwctl backup
 ```
 
 `vwctl health` performs read-only checks of Docker, both containers and their
@@ -219,6 +220,55 @@ configured medium is reported normally. Phase 5B does not mount the filesystem,
 add an `/etc/fstab` entry, create a backup, restore data, schedule jobs, or
 implement retention.
 
+## Phase 5C manual backup
+
+After Phase 5B has configured the medium, create one backup with:
+
+```bash
+sudo vwctl backup
+```
+
+The command holds the global appliance operation lock and rediscovers the exFAT
+`VWBACKUP` filesystem by UUID. If it is already mounted at exactly one safe
+location, that mount is reused and left mounted. Otherwise the appliance mounts
+it temporarily at `/run/vaultwarden-appliance/backup` with `nodev`, `nosuid`,
+and `noexec`, verifies the UUID and topology again, and unmounts it afterward.
+No `/etc/fstab` entry is created.
+
+Backups are written under `backups/` using UTC filenames:
+
+```text
+vaultwarden-appliance-20260808-233000.tar.gz
+vaultwarden-appliance-20260808-233000.tar.gz.sha256
+```
+
+The archive has a predictable restore-oriented layout:
+
+```text
+vaultwarden-appliance-backup/
+├── manifest
+├── vaultwarden/
+│   ├── db.sqlite3
+│   └── data/
+├── caddy/
+└── appliance/
+```
+
+Vaultwarden's supported built-in `backup` command creates the consistent SQLite
+snapshot with `VACUUM INTO`; the live database, WAL, and SHM files are never
+copied blindly. Remaining persistent Vaultwarden files, selected appliance
+configuration, and complete persistent Caddy state are included. The archive is
+read-tested, required members are checked, and a SHA-256 checksum is created and
+verified before success. Filename collisions receive a numeric suffix; existing
+backups are never deleted. Failed archive/checksum artifacts are preserved for
+diagnosis.
+
+The Caddy state includes the internal CA private key so a future restore can
+preserve client trust. Phase 5C does not encrypt backups: possession of the
+backup can expose the appliance's internal CA private key. Physically protect
+the backup medium. Restore, retention, scheduling, and automatic backups are not
+implemented in Phase 5C.
+
 ## Basic verification
 
 After installation, a concise end-to-end check is:
@@ -241,5 +291,5 @@ docker inspect caddy --format '{{json .HostConfig.PortBindings}}'
 
 Use the actual hostname reported by `vwctl status` if a conflict-free
 alternative was selected. Phase 5B initializes explicitly selected backup
-media; backup creation, automatic mounting, restore, retention, and scheduling
-are not implemented yet.
+media. Phase 5C adds `sudo vwctl backup`; restore, retention, scheduling, and
+automatic backups are not implemented yet.
