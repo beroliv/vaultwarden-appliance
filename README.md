@@ -317,6 +317,29 @@ S3, or remote SSH targets. Administrators may independently replicate
 `/opt/vaultwarden/backups/` with appropriately secured tools. Restore and backup
 encryption are not implemented yet.
 
+## Removal
+
+Verify a usable backup before removal, then run the separate repository script:
+
+```bash
+sudo ./remove.sh
+```
+
+Removal is deliberately not available from `vwctl` or its interactive menu.
+The script requires the exact, case-sensitive confirmation
+`REMOVE VAULTWARDEN` and permanently deletes **all** local appliance state below
+`/opt/vaultwarden`, including Vaultwarden data, the Caddy internal CA and private
+keys, exported certificates, configuration, and local backup generations. There
+is no keep-data option.
+
+Only positively identified appliance containers, its Compose network, systemd
+units, and installed management files are removed. Docker, Docker Compose,
+Avahi, packages, Docker images, users, and group memberships remain unchanged.
+The uninstaller never mounts, unmounts, partitions, formats, or deletes from USB
+backup media; a configured `VWBACKUP` filesystem and its backups are preserved.
+
+Kein Backup, keine Gnade. No backup, no mercy.
+
 ## Basic verification
 
 After installation, a concise end-to-end check is:

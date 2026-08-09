@@ -1101,6 +1101,53 @@ Private CA keys MUST NOT be exported together with the public root certificate.
 
 ---
 
+## 24A. Appliance Removal
+
+Complete appliance removal is provided only by the executable repository script:
+
+```bash
+sudo ./remove.sh
+```
+
+It is deliberately not integrated into `vwctl` or its interactive menu. There
+is no keep-data mode. The administrator MUST verify a usable backup first;
+successful removal permanently deletes `/opt/vaultwarden`, including all local
+Vaultwarden data, Caddy persistent CA data and private keys, exported
+certificates, configuration/state, and local backup generations.
+
+Before any change, the script MUST require root, acquire the common non-blocking
+appliance lock, positively validate the exact root-owned appliance marker, and
+positively validate existing same-named Docker resources and installed files as
+appliance-owned. Unknown directories, foreign same-named containers/networks,
+unsafe paths, or uncertain ownership MUST fail closed without any pre-confirmation
+change. The exact, case-sensitive confirmation is:
+
+```text
+REMOVE VAULTWARDEN
+```
+
+Any other input cancels without destructive changes. After confirmation, the
+script stops and disables the appliance backup timer, stops the backup service,
+stops and disables the appliance mDNS publisher, and removes only the positively
+identified `vaultwarden` and `caddy` containers and
+`vaultwarden-appliance` Compose network. It removes only the explicitly known
+appliance systemd units, `/usr/local/bin/vwctl`, and installed appliance helper
+and library files. It runs `systemctl daemon-reload` and deletes the installation
+tree only after its ownership is revalidated and the appliance services and
+containers are stopped. Already absent owned resources are accepted so a safe
+partial-removal rerun can continue.
+
+Removal MUST NOT prune Docker, delete images, uninstall Docker, Docker Compose,
+Avahi or any other package, change Docker daemon configuration, or modify users
+or groups. It MUST NOT mount, unmount, partition, format, erase, or delete data
+from USB media. The `.backup-device` state is deleted with the local appliance,
+but the physical `VWBACKUP` filesystem and its backup contents remain untouched.
+No automatic backup is created during removal.
+
+Kein Backup, keine Gnade. No backup, no mercy.
+
+---
+
 ## 25. Restore
 
 Version 1 MUST provide a usable restore procedure.
