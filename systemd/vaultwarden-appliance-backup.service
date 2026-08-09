@@ -1,0 +1,13 @@
+# Vaultwarden Appliance automatic backup
+[Unit]
+Description=Vaultwarden Appliance local backup and optional USB replication
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vwctl backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+

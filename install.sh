@@ -37,6 +37,13 @@ readonly USB_SETUP_SOURCE="${SCRIPT_DIR}/libexec/usb-setup"
 readonly USB_SETUP_TARGET="/usr/local/libexec/vaultwarden-appliance-usb-setup"
 readonly BACKUP_SOURCE="${SCRIPT_DIR}/libexec/backup"
 readonly BACKUP_TARGET="/usr/local/libexec/vaultwarden-appliance-backup"
+readonly LOCAL_BACKUP_DIR="${INSTALL_DIR}/backups"
+readonly BACKUP_SERVICE_SOURCE="${SCRIPT_DIR}/systemd/vaultwarden-appliance-backup.service"
+readonly BACKUP_TIMER_SOURCE="${SCRIPT_DIR}/systemd/vaultwarden-appliance-backup.timer"
+readonly BACKUP_SERVICE_FILE="/etc/systemd/system/vaultwarden-appliance-backup.service"
+readonly BACKUP_TIMER_FILE="/etc/systemd/system/vaultwarden-appliance-backup.timer"
+readonly BACKUP_TIMER="vaultwarden-appliance-backup.timer"
+readonly BACKUP_LABEL="VWBACKUP"
 readonly VERSION_SOURCE="${SCRIPT_DIR}/VERSION"
 readonly VERSION_TARGET="${INSTALL_DIR}/.appliance-version"
 readonly OPERATION_LOCK="/run/lock/vaultwarden-appliance.lock"
@@ -61,6 +68,15 @@ if [[ ! -f "${BACKUP_SOURCE}" || -L "${BACKUP_SOURCE}" ]] ||
         "${BACKUP_SOURCE}" >&2
     exit 1
 fi
+for unit_source in "${BACKUP_SERVICE_SOURCE}" "${BACKUP_TIMER_SOURCE}"; do
+    if [[ ! -f "${unit_source}" || -L "${unit_source}" ]] ||
+       ! grep -Fxq '# Vaultwarden Appliance automatic backup' "${unit_source}"; then
+        printf '[FAIL] Required automatic-backup unit is missing or unsafe: %s\n' \
+            "${unit_source}" >&2
+        exit 1
+    fi
+done
+unset unit_source
 
 ERRORS=0
 WARNINGS=0
@@ -784,12 +800,13 @@ install_backup_support() {
     local command
     local -a missing_packages=()
 
-    section "Manual backup tools"
+    section "Backup tools"
 
     command_exists tar || missing_packages+=(tar)
     command_exists gzip || missing_packages+=(gzip)
     if ! command_exists sha256sum || ! command_exists sync ||
-       ! command_exists df || ! command_exists du; then
+       ! command_exists df || ! command_exists du || ! command_exists cp ||
+       ! command_exists sort; then
         missing_packages+=(coreutils)
     fi
     command_exists find || missing_packages+=(findutils)
@@ -798,23 +815,87 @@ install_backup_support() {
     fi
     if ((${#missing_packages[@]} > 0)); then
         command_exists apt-get || {
-            error "Manual backup support requires apt-get on this Debian-based system."
+            error "Backup support requires apt-get on this Debian-based system."
             return 1
         }
-        info "Installing required manual backup packages: ${missing_packages[*]}"
+        info "Installing required backup packages: ${missing_packages[*]}"
         DEBIAN_FRONTEND=noninteractive apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_packages[@]}"
     else
-        ok "Required manual backup tools are already installed."
+        ok "Required backup tools are already installed."
     fi
 
-    for command in tar gzip sha256sum sync df du find mount umount; do
+    for command in tar gzip sha256sum sync df du find mount umount cp sort; do
         command_exists "${command}" || {
-            error "Required manual backup command '${command}' is unavailable after package installation."
+            error "Required backup command '${command}' is unavailable after package installation."
             return 1
         }
     done
-    ok "Manual archive, checksum, and temporary-mount tools are available."
+    ok "Archive, checksum, copy, and temporary-mount tools are available."
+}
+
+configure_local_backup_directory() {
+    section "Local backup storage"
+
+    if [[ -e "${LOCAL_BACKUP_DIR}" || -L "${LOCAL_BACKUP_DIR}" ]]; then
+        [[ -d "${LOCAL_BACKUP_DIR}" && ! -L "${LOCAL_BACKUP_DIR}" ]] || {
+            error "The local backup path is unsafe: ${LOCAL_BACKUP_DIR}."
+            return 1
+        }
+    fi
+    getent group docker >/dev/null 2>&1 || {
+        error "The standard docker group is required for administrator-readable backup status."
+        return 1
+    }
+    install -d -o root -g docker -m 0750 "${LOCAL_BACKUP_DIR}"
+    [[ "$(stat -c '%u' "${LOCAL_BACKUP_DIR}")" == "0" ]] || {
+        error "The local backup directory is not owned by root."
+        return 1
+    }
+    (( (8#$(stat -c '%a' "${LOCAL_BACKUP_DIR}") & 8#002) == 0 )) || {
+        error "The local backup directory is world-writable."
+        return 1
+    }
+    ok "Local backups use ${LOCAL_BACKUP_DIR} with root:docker 0750 permissions."
+}
+
+install_backup_automation() {
+    local source
+    local target
+
+    section "Automatic daily backup"
+    command_exists systemctl || {
+        error "Automatic backup requires systemd."
+        return 1
+    }
+    for source in "${BACKUP_SERVICE_SOURCE}" "${BACKUP_TIMER_SOURCE}"; do
+        [[ -f "${source}" && ! -L "${source}" ]] || {
+            error "Automatic-backup unit source is missing or unsafe: ${source}."
+            return 1
+        }
+    done
+    for target in "${BACKUP_SERVICE_FILE}" "${BACKUP_TIMER_FILE}"; do
+        if [[ -e "${target}" || -L "${target}" ]]; then
+            if [[ ! -f "${target}" || -L "${target}" ]] ||
+               ! grep -Fxq '# Vaultwarden Appliance automatic backup' "${target}"; then
+                error "Existing systemd unit is not appliance-managed: ${target}."
+                return 1
+            fi
+        fi
+    done
+    install -m 0644 "${BACKUP_SERVICE_SOURCE}" "${BACKUP_SERVICE_FILE}"
+    install -m 0644 "${BACKUP_TIMER_SOURCE}" "${BACKUP_TIMER_FILE}"
+    systemctl daemon-reload
+    systemctl enable --now "${BACKUP_TIMER}"
+    systemctl is-enabled --quiet "${BACKUP_TIMER}" || {
+        error "The automatic-backup timer is not enabled."
+        return 1
+    }
+    systemctl is-active --quiet "${BACKUP_TIMER}" || {
+        error "The automatic-backup timer is not active."
+        return 1
+    }
+    ok "Daily backups are scheduled for 02:30 local time with Persistent=true."
 }
 
 install_mdns_support() {
@@ -1435,7 +1516,7 @@ install_appliance_version() {
 }
 
 print_completion_summary() {
-    section "Phase 4 complete"
+    section "Phase 5D complete"
     info "Installation directory: ${INSTALL_DIR}"
     info "Compose file: ${INSTALL_DIR}/docker-compose.yml"
     info "Persistent data: ${INSTALL_DIR}/data/vaultwarden"
@@ -1447,6 +1528,9 @@ print_completion_summary() {
     info "No local DNS configuration is required; Avahi advertises this name using mDNS."
     info "Exported root CA: ${EXPORTED_ROOT_CA}"
     info "Management command: ${VWCTL_TARGET}"
+    info "Local backups: ${LOCAL_BACKUP_DIR} (newest 7 valid generations)"
+    info "Optional USB copies: ${BACKUP_LABEL} backups/ (newest 30 valid generations)"
+    info "Automatic backup: daily at 02:30 local time"
     info "Vaultwarden remains internal-only; only Caddy publishes host TCP port 443."
     info "Appliance-owned files and containers were reconciled idempotently; persistent Vaultwarden data was preserved."
     if (( DOCKER_GROUP_CHANGED == 1 )); then
@@ -1516,6 +1600,8 @@ main() {
     verify_phase3
     install_appliance_version
     install_vwctl
+    configure_local_backup_directory
+    install_backup_automation
 
     print_completion_summary
 }

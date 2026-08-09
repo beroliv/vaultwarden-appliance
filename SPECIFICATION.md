@@ -138,6 +138,12 @@ The final directory structure may evolve during implementation, but `/opt/vaultw
 
 The management command is installed separately as `/usr/local/bin/vwctl`.
 
+Phase 5D also owns
+`/etc/systemd/system/vaultwarden-appliance-backup.service` and
+`/etc/systemd/system/vaultwarden-appliance-backup.timer`. The timer invokes the
+same `/usr/local/bin/vwctl backup` command used manually. Primary backup storage
+is `/opt/vaultwarden/backups`.
+
 The hostname-only access state contains one non-secret line:
 
 ```text
@@ -883,17 +889,20 @@ The backup process must preserve all information required for a reliable restore
 
 The restore process MUST explicitly restore appropriate ownership and permissions on the Linux system.
 
-Phase 5C uses gzip-compressed POSIX tar archives under `backups/` on the
-configured `VWBACKUP` filesystem. Filenames use UTC:
+Phase 5D uses gzip-compressed POSIX tar archives. Primary copies are under
+`/opt/vaultwarden/backups`; optional copies use `backups/` on the configured
+`VWBACKUP` filesystem. Filenames use UTC:
 
 ```text
 vaultwarden-appliance-YYYYMMDD-HHMMSS.tar.gz
 vaultwarden-appliance-YYYYMMDD-HHMMSS.tar.gz.sha256
 ```
 
-Collisions receive a numeric suffix. Existing archives are never overwritten or
-deleted. Every archive is read-tested, checked for required members and unsafe
-paths, and accompanied by a verified `sha256sum`-compatible checksum.
+Collisions receive a numeric suffix. Existing archives are never overwritten.
+Every archive is read-tested, checked for required members and unsafe paths, and
+accompanied by a verified `sha256sum`-compatible checksum. Archive and checksum
+form one valid generation only when both are regular non-symlink files, the
+checksum verifies, and archive integrity verifies.
 
 ---
 
@@ -909,18 +918,22 @@ The implementation must determine the correct procedure for safely backing up th
 
 A backup MUST NOT simply assume that copying a live database file always produces a valid backup.
 
-Phase 5C provides one manual operation:
+Phase 5D keeps the manual operation:
 
 ```bash
 sudo vwctl backup
 ```
 
-It requires root, holds the global appliance mutation lock, and reuses the
-Phase 5B UUID, filesystem, physical-topology, virtual-device, and system-disk
-checks. An existing unique safe mount is reused and never unmounted by the
-appliance. Otherwise the filesystem is temporarily mounted at
-`/run/vaultwarden-appliance/backup` and unmounted on success or best-effort
-cleanup. No `/etc/fstab` entry is created.
+It requires root and holds the global appliance mutation lock. Every run first
+checks local free space, creates a complete backup in root-only staging beneath
+`/run`, verifies the archive and SHA-256 checksum, atomically installs both
+files through temporary names under `/opt/vaultwarden/backups`, and verifies
+the installed copy again. The local directory is root-owned, `root:docker`
+group-accessible, mode `0750`, and not world-writable; managed archive and
+checksum files are mode `0640`.
+
+The scheduled service invokes the same `vwctl backup` path, including the same
+global lock and backup helper. No independent automatic-backup path exists.
 
 Vaultwarden 1.37.x's supported built-in `backup` command creates the SQLite
 snapshot using `VACUUM INTO`. Only the newly generated snapshot is moved into
@@ -944,60 +957,65 @@ contents. It contains no passwords, tokens, or private-key contents.
 
 Persistent Caddy state is included so a future restore can preserve the
 internal root CA and existing client trust. This includes sensitive CA private
-key material as opaque files. Phase 5C adds no encryption, so the backup medium
+key material as opaque files. Backups add no encryption, so local and USB copies
 MUST be physically protected. Private keys are never printed or parsed.
 
-Before writing, Phase 5C requires a conservative estimate of source size plus
-25 percent and 64 MiB overhead to fit in currently available space. It never
-deletes older backups to make room. Failed artifacts may remain for diagnosis.
-Restore, automatic backup, scheduling, retention, and backup listing remain out
-of scope.
+Before writing locally, Phase 5D requires a conservative estimate of source
+size plus 25 percent and 64 MiB overhead to fit in currently available space.
+It never deletes older backups first to make room. Once the local generation is
+valid, optional USB replication reuses the Phase 5B UUID, filesystem,
+physical-topology, virtual-device, and system-disk checks. An existing unique
+safe mount is reused and left mounted; otherwise the appliance temporarily
+mounts at `/run/vaultwarden-appliance/backup` with `nodev`, `nosuid`, and
+`noexec`, then unmounts it. No `/etc/fstab` entry is created. The verified local
+pair is copied through temporary USB filenames, flushed, renamed, and verified;
+no second archive is generated.
+
+No configured USB medium and a disconnected configured medium are informational
+skip conditions after local success. A configured-and-present USB replication
+or retention failure returns non-zero, explicitly preserves the valid local
+backup, and reports the secondary failure. Restore remains out of scope.
 
 ---
 
 ## 20. Backup Retention
 
-Automatic backups MUST include retention management.
-
-Users should not need to design their own backup rotation strategy.
-
-Recommended initial defaults:
+Phase 5D uses fixed Version 1 defaults in one backup engine:
 
 ```text
-Automatic backup:      Enabled
-Backup time:           03:00
-
-Daily backups:         7
-Weekly backups:        4
-Monthly backups:       6
+Automatic backup:       Enabled
+Backup time:            02:30 local system time
+Local generations:      7
+USB generations:        30
 ```
 
-These values should remain configurable.
+`vaultwarden-appliance-backup.timer` uses
+`OnCalendar=*-*-* 02:30:00` and `Persistent=true`. Its service calls
+`/usr/local/bin/vwctl backup`, so scheduled and manual runs have identical
+consistency, validation, replication, retention, and locking behavior.
 
-The exact implementation of daily/weekly/monthly retention must avoid unnecessary duplicate archives where possible.
+Retention runs only after the new generation at that destination is fully
+valid. It sorts exact managed UTC filenames, retains the newest valid pairs,
+and removes older verified archive/checksum pairs only from the applicable
+managed `backups` directory. It never follows symlinks, recursively deletes a
+backup directory, removes incomplete or unrelated files, or removes the newly
+created generation. Ambiguous parsing or validation fails closed and preserves
+extra backups. A retention failure is non-zero but does not destroy the new
+valid generation.
 
 ---
 
 ## 21. Backup Overflow Protection
 
-The backup system MUST protect the USB storage device from filling completely.
+The backup system MUST protect local and USB storage from uncontrolled writes.
+Phase 5D bases admission on actual available capacity plus a conservative
+source-size estimate rather than a fixed device size or usage percentage.
 
-Protection SHOULD be based primarily on the actual capacity of the selected storage device rather than a fixed number of gigabytes.
-
-Initial proposed defaults:
-
-```text
-Maximum backup usage: 80 %
-Reserve free space:   10 %
-```
-
-The final values may be refined during testing.
-
-Before creating a backup, the system MUST check available storage.
-
-Old backups should be removed according to the configured retention policy when appropriate.
-
-If sufficient safe storage cannot be made available, the backup MUST fail cleanly rather than fill the filesystem.
+Before creating the local archive, and again before copying it to USB, the
+system checks available capacity conservatively. Retention is post-success
+cleanup only: old generations MUST NOT be deleted first to manufacture free
+space. Insufficient local space fails before a new archive; insufficient USB
+space fails only optional replication and leaves the local result valid.
 
 ---
 
@@ -1005,9 +1023,11 @@ If sufficient safe storage cannot be made available, the backup MUST fail cleanl
 
 The appliance MUST verify that the configured USB filesystem is actually mounted before writing a backup.
 
-If the USB device is missing or not mounted, the backup MUST NOT write into an empty mount directory on the Raspberry Pi's system disk.
-
-Instead, the backup must abort and clearly report the problem.
+If the configured USB device is missing, the backup MUST NOT write into an empty
+mount directory on the Raspberry Pi's system disk. Phase 5D reports that the
+verified local backup succeeded and skips optional USB replication. If the
+medium is present, it must pass the complete Phase 5B validation before a
+pre-existing mount is reused or the appliance creates a temporary mount.
 
 This is a critical safety requirement.
 
@@ -1015,22 +1035,23 @@ This is a critical safety requirement.
 
 ## 23. Backup Directory Structure
 
-A possible USB layout is:
+Phase 5D uses one understandable `backups/` directory at the root of
+`VWBACKUP`. It contains the same
+`vaultwarden-appliance-YYYYMMDD-HHMMSS.tar.gz` archive/checksum pairs as local
+storage. Existing Phase 5C generations using that name and schema remain valid
+and are recognized by retention and status. USB storage remains unencrypted
+exFAT and must be physically protected.
 
-```text
-VW-BACKUP/
-├── backups/
-│   ├── daily/
-│   ├── weekly/
-│   └── monthly/
-├── certificate/
-│   └── vaultwarden-root-ca.crt
-└── README.txt
-```
+`vwctl backup status` is read-only. It validates and counts readable local
+generations, reports configured USB label/UUID/presence, and reports timer
+enablement plus available last/next-run metadata. It never mounts USB. If the
+safe configured medium is already mounted, its generations may be inspected;
+otherwise USB counts are reported unavailable. The administrator's active
+login normally uses the `docker` group to read local backup files.
 
-The exact layout may be adjusted during implementation if this improves retention handling or restore reliability.
-
-It should remain understandable when the USB device is connected to another computer.
+The appliance implements no Synology, Syncthing, rsync, SMB, NFS, cloud, S3,
+remote SSH, or other external target. Administrators may independently and
+securely replicate `/opt/vaultwarden/backups/` with their own tools.
 
 ---
 
@@ -1184,7 +1205,8 @@ Phase 4  vwctl basic management
 Phase 5A Read-only block-device discovery and selection
 Phase 5B Destructive backup-media setup and formatting
 Phase 5C Manual verified backup
-Phase 6  Automatic backup + retention + overflow protection
+Phase 5D Local retention, optional USB replication, status, and daily timer
+Phase 6  Reserved for further backup policy work
 Phase 7  Restore
 Phase 8  Diagnostics and polish
 ```

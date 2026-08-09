@@ -1,7 +1,8 @@
 # vaultwarden-appliance
 
 Simple LAN-only Vaultwarden appliance with Caddy, local HTTPS, mDNS, `vwctl`,
-and manual USB backup. Restore, scheduling, and retention remain later phases.
+verified local backups, optional USB replication, and automatic retention.
+Restore remains a later phase.
 
 ## Installation
 
@@ -18,7 +19,8 @@ under `/opt/vaultwarden`. A working existing Docker installation is reused
 without modification.
 
 `install.sh` is not a remote bootstrap downloader. It requires the repository's
-`vwctl`, `mdns-publisher`, `VERSION`, `lib/`, and `libexec/` files beside it.
+`vwctl`, `mdns-publisher`, `VERSION`, `lib/`, `libexec/`, and `systemd/` files
+beside it.
 
 The installer installs Debian's `avahi-daemon`, `avahi-utils`, and `libnss-mdns`
 packages when needed. On a fresh configuration it asks:
@@ -107,6 +109,7 @@ sudo vwctl cert export
 vwctl usb status
 sudo vwctl usb setup
 sudo vwctl backup
+vwctl backup status
 ```
 
 `vwctl health` performs read-only checks of Docker, both containers and their
@@ -220,22 +223,21 @@ configured medium is reported normally. Phase 5B does not mount the filesystem,
 add an `/etc/fstab` entry, create a backup, restore data, schedule jobs, or
 implement retention.
 
-## Phase 5C manual backup
+## Phase 5D local-first backup
 
-After Phase 5B has configured the medium, create one backup with:
+Create one backup with:
 
 ```bash
 sudo vwctl backup
 ```
 
-The command holds the global appliance operation lock and rediscovers the exFAT
-`VWBACKUP` filesystem by UUID. If it is already mounted at exactly one safe
-location, that mount is reused and left mounted. Otherwise the appliance mounts
-it temporarily at `/run/vaultwarden-appliance/backup` with `nodev`, `nosuid`,
-and `noexec`, verifies the UUID and topology again, and unmounts it afterward.
-No `/etc/fstab` entry is created.
+The command holds the global appliance operation lock and always creates and
+verifies the primary generation under `/opt/vaultwarden/backups` first. This
+directory is root-owned, group-readable by the standard `docker` administrator
+group, mode `0750`, and not world-writable. Archives and checksums are installed
+as `root:docker` mode `0640`. Backup staging remains root-only under `/run`.
 
-Backups are written under `backups/` using UTC filenames:
+Generations use UTC filenames:
 
 ```text
 vaultwarden-appliance-20260808-233000.tar.gz
@@ -260,14 +262,53 @@ copied blindly. Remaining persistent Vaultwarden files, selected appliance
 configuration, and complete persistent Caddy state are included. The archive is
 read-tested, required members are checked, and a SHA-256 checksum is created and
 verified before success. Filename collisions receive a numeric suffix; existing
-backups are never deleted. Failed archive/checksum artifacts are preserved for
-diagnosis.
+backups are never overwritten. Incomplete or invalid pairs are not counted as
+generations and are never selected by retention.
 
 The Caddy state includes the internal CA private key so a future restore can
-preserve client trust. Phase 5C does not encrypt backups: possession of the
-backup can expose the appliance's internal CA private key. Physically protect
-the backup medium. Restore, retention, scheduling, and automatic backups are not
-implemented in Phase 5C.
+preserve client trust. Backups are not encrypted: possession of a local archive
+or USB medium can expose Vaultwarden data and the appliance's internal CA
+private key.
+
+After the new local archive and checksum have both passed checksum and archive
+integrity checks, the appliance keeps the newest 7 valid local generations.
+Only exact appliance archive/checksum pairs inside the managed backup directory
+can be removed. Unrelated files, directories, symlinks, incomplete pairs, and
+ambiguous names are preserved; retention fails closed. Older generations are
+never removed to make room before a new backup succeeds.
+
+USB is optional. With no configured medium, or with the configured medium
+disconnected, the local backup remains successful and replication is skipped.
+When the configured exFAT `VWBACKUP` medium is present and passes the existing
+UUID/topology/system-disk checks, the appliance copies the completed local pair
+through temporary filenames into its root-level `backups/` directory, flushes
+and verifies the copy, then keeps the newest 30 valid USB generations. It does
+not create a second archive. A configured-and-present USB copy or retention
+failure returns non-zero but never removes the successful local backup. A mount
+created by the appliance is unmounted; an existing safe mount is left intact.
+
+Automatic backups are enabled by `install.sh` through
+`vaultwarden-appliance-backup.timer`, scheduled every day at 02:30 local time
+with `Persistent=true`. Its one-shot service invokes `/usr/local/bin/vwctl
+backup`, so manual and scheduled runs use the same engine and global lock.
+
+Inspect backup state without changing or mounting storage:
+
+```bash
+vwctl backup status
+```
+
+It fully validates readable local generations. It reports configured USB
+identity and presence, but only counts USB generations when that medium is
+already mounted at one unique safe mountpoint; otherwise counts are shown as
+unavailable. It also shows timer enablement and available last/next-run data.
+The command normally works for an administrator whose current login session is
+in the `docker` group; `sudo vwctl backup status` may be used otherwise.
+
+The appliance does not implement Synology, Syncthing, rsync, SMB, NFS, cloud,
+S3, or remote SSH targets. Administrators may independently replicate
+`/opt/vaultwarden/backups/` with appropriately secured tools. Restore and backup
+encryption are not implemented yet.
 
 ## Basic verification
 
@@ -280,6 +321,8 @@ vwctl health
 vwctl cert info
 vwctl update check
 vwctl usb status
+vwctl backup status
+systemctl status vaultwarden-appliance-backup.timer
 systemctl is-active avahi-daemon
 systemctl is-active vaultwarden-appliance-mdns
 avahi-resolve-host-name -4 vaultwarden.local
@@ -291,5 +334,6 @@ docker inspect caddy --format '{{json .HostConfig.PortBindings}}'
 
 Use the actual hostname reported by `vwctl status` if a conflict-free
 alternative was selected. Phase 5B initializes explicitly selected backup
-media. Phase 5C adds `sudo vwctl backup`; restore, retention, scheduling, and
-automatic backups are not implemented yet.
+media. Phase 5D uses local-first verified backups, optional USB copies, fixed
+7/30-generation retention, and the daily 02:30 timer. Restore is not implemented
+yet.

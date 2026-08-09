@@ -1,0 +1,11 @@
+# Vaultwarden Appliance automatic backup
+[Unit]
+Description=Daily Vaultwarden Appliance backup at 02:30
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+Unit=vaultwarden-appliance-backup.service
+
+[Install]
+WantedBy=timers.target

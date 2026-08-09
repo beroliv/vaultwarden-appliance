@@ -30,6 +30,7 @@ readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
 readonly APPLIANCE_VERSION_FILE="${INSTALL_DIR}/.appliance-version"
 readonly ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
 readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
+readonly LOCAL_BACKUP_DIR="${INSTALL_DIR}/backups"
 readonly VAULTWARDEN_DATA_DIR="${INSTALL_DIR}/data/vaultwarden"
 readonly CADDY_DATA_DIR="${INSTALL_DIR}/data/caddy"
 readonly CADDY_ROOT_CA_RELATIVE="data/caddy/pki/authorities/local/root.crt"
@@ -39,6 +40,11 @@ readonly BACKUP_MOUNTPOINT="${RUNTIME_DIR}/backup"
 readonly BACKUP_SCHEMA="1"
 readonly BACKUP_LABEL="VWBACKUP"
 readonly BACKUP_OVERHEAD_BYTES=$((64 * 1024 * 1024))
+readonly LOCAL_RETENTION_GENERATIONS=7
+readonly USB_RETENTION_GENERATIONS=30
+readonly BACKUP_ARCHIVE_PATTERN='^vaultwarden-appliance-[0-9]{8}-[0-9]{6}(-[0-9]{2})?\.tar\.gz$'
+readonly BACKUP_TIMER_SERVICE="vaultwarden-appliance-backup.service"
+readonly BACKUP_TIMER_UNIT="vaultwarden-appliance-backup.timer"
 
 BACKUP_TOPOLOGY=""
 BACKUP_SYSTEM_MOUNTS=""
@@ -51,6 +57,11 @@ BACKUP_WORK_DIR=""
 BACKUP_TEMP_DATABASE=""
 BACKUP_MOUNTED_BY_APPLIANCE=0
 BACKUP_MOUNTPOINT_CREATED=0
+BACKUP_LOCAL_ARCHIVE=""
+BACKUP_LOCAL_PARTIAL_ARCHIVE=""
+BACKUP_LOCAL_PARTIAL_CHECKSUM=""
+BACKUP_USB_PARTIAL_ARCHIVE=""
+BACKUP_USB_PARTIAL_CHECKSUM=""
 
 backup_ok() {
     printf '[ OK ] %s\n' "$1"
@@ -75,6 +86,12 @@ backup_cleanup() {
     local final_status=${original_status}
 
     trap - EXIT INT TERM
+    if [[ -n "${BACKUP_ACTIVE_MOUNTPOINT}" ]]; then
+        backup_remove_partial_file "${BACKUP_USB_PARTIAL_ARCHIVE}" \
+            "${BACKUP_ACTIVE_MOUNTPOINT}/backups" || final_status=1
+        backup_remove_partial_file "${BACKUP_USB_PARTIAL_CHECKSUM}" \
+            "${BACKUP_ACTIVE_MOUNTPOINT}/backups" || final_status=1
+    fi
     if (( BACKUP_MOUNTED_BY_APPLIANCE == 1 )); then
         sync -f "${BACKUP_ACTIVE_MOUNTPOINT}" >/dev/null 2>&1 || true
         if umount -- "${BACKUP_ACTIVE_MOUNTPOINT}"; then
@@ -98,11 +115,26 @@ backup_cleanup() {
             final_status=1
         }
     fi
+    backup_remove_partial_file "${BACKUP_LOCAL_PARTIAL_ARCHIVE}" "${LOCAL_BACKUP_DIR}" || final_status=1
+    backup_remove_partial_file "${BACKUP_LOCAL_PARTIAL_CHECKSUM}" "${LOCAL_BACKUP_DIR}" || final_status=1
     if (( BACKUP_MOUNTPOINT_CREATED == 1 )) &&
        [[ -d "${BACKUP_MOUNTPOINT}" && ! -L "${BACKUP_MOUNTPOINT}" ]]; then
         rmdir -- "${BACKUP_MOUNTPOINT}" 2>/dev/null || true
     fi
     exit "${final_status}"
+}
+
+backup_remove_partial_file() {
+    local candidate=$1
+    local managed_directory=$2
+
+    [[ -n "${candidate}" ]] || return 0
+    [[ "${managed_directory}" == /* && "${managed_directory}" != "/" &&
+       "${candidate}" == "${managed_directory}"/.vaultwarden-appliance-*.partial.* ]] || return 1
+    if [[ -e "${candidate}" || -L "${candidate}" ]]; then
+        [[ -f "${candidate}" && ! -L "${candidate}" ]] || return 1
+        rm -f -- "${candidate}"
+    fi
 }
 
 backup_die() {
@@ -134,12 +166,26 @@ backup_require_environment() {
         backup_die "Caddy's persistent internal CA private key is missing or unsafe."
     for command in docker lsblk findmnt readlink stat mount umount tar gzip \
         sha256sum sync df du find install mktemp date uname awk grep mv rm \
-        mkdir rmdir chmod dirname; do
+        mkdir rmdir chmod chgrp dirname sort cp; do
         command_exists "${command}" || \
             backup_die "Required backup command '${command}' is unavailable. Rerun the installer."
     done
     docker info >/dev/null 2>&1 || backup_die "The Docker daemon is unavailable."
     container_is_running vaultwarden || backup_die "The Vaultwarden container is not running."
+    backup_local_directory_is_safe "${LOCAL_BACKUP_DIR}" || \
+        backup_die "The local backup directory is missing or unsafe. Rerun the installer."
+}
+
+backup_local_directory_is_safe() {
+    local directory=$1
+    local owner
+    local permissions
+
+    [[ -d "${directory}" && ! -L "${directory}" ]] || return 1
+    owner=$(stat -c '%u' "${directory}" 2>/dev/null) || return 1
+    permissions=$(stat -c '%a' "${directory}" 2>/dev/null) || return 1
+    [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${permissions} & 8#002) == 0 ))
 }
 
 backup_refresh_storage() {
@@ -155,22 +201,16 @@ backup_read_state() {
     local permissions
     local state
 
-    [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || \
-        backup_die "No safe configured backup-media state was found. Run sudo vwctl usb setup first."
-    owner=$(stat -c '%u' "${BACKUP_STATE_FILE}" 2>/dev/null) || \
-        backup_die "Unable to verify backup-media state ownership."
-    permissions=$(stat -c '%a' "${BACKUP_STATE_FILE}" 2>/dev/null) || \
-        backup_die "Unable to verify backup-media state permissions."
-    [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || \
-        backup_die "The configured backup-media state ownership or permissions are invalid."
-    (( (8#${permissions} & 8#022) == 0 )) || \
-        backup_die "The configured backup-media state file must not be group- or world-writable."
-    state=$(storage_read_backup_state "${BACKUP_STATE_FILE}") || \
-        backup_die "The configured backup-media state is invalid."
+    [[ ! -e "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] && return 2
+    [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || return 1
+    owner=$(stat -c '%u' "${BACKUP_STATE_FILE}" 2>/dev/null) || return 1
+    permissions=$(stat -c '%a' "${BACKUP_STATE_FILE}" 2>/dev/null) || return 1
+    [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${permissions} & 8#022) == 0 )) || return 1
+    state=$(storage_read_backup_state "${BACKUP_STATE_FILE}") || return 1
     BACKUP_UUID=${state%%|*}
     label=${state#*|}
-    [[ "${label}" == "${BACKUP_LABEL}" ]] || \
-        backup_die "The configured backup-media label is invalid."
+    [[ "${label}" == "${BACKUP_LABEL}" ]] || return 1
 }
 
 backup_resolve_media() {
@@ -178,7 +218,7 @@ backup_resolve_media() {
     local result
     local -a fields=()
 
-    backup_refresh_storage || backup_die "Unable to establish safe block-device topology."
+    backup_refresh_storage || return 1
     if lookup=$(storage_lookup_configured_backup \
         "${BACKUP_TOPOLOGY}" "${BACKUP_PROTECTED_DISKS}" \
         "${BACKUP_UUID}" "${BACKUP_LABEL}"); then
@@ -186,17 +226,11 @@ backup_resolve_media() {
     else
         result=$?
         case "${result}" in
-            2) backup_die "Backup device is not connected; configured UUID ${BACKUP_UUID} was not found." ;;
-            3) backup_die "Multiple filesystems report configured backup UUID ${BACKUP_UUID}." ;;
-            4) backup_die "The configured backup filesystem is not exFAT." ;;
-            5) backup_die "The configured backup filesystem is not labeled ${BACKUP_LABEL}." ;;
-            6) backup_die "The configured backup filesystem changed during validation." ;;
-            8) backup_die "The configured backup filesystem is backed by a protected system disk." ;;
-            9) backup_die "The configured backup filesystem is backed by a virtual device." ;;
-            *) backup_die "Configured backup filesystem failed safety validation." ;;
+            2|3|4|5|6|8|9) return "${result}" ;;
+            *) return 1 ;;
         esac
     fi
-    ((${#fields[@]} == 2)) || backup_die "Configured backup filesystem lookup was ambiguous."
+    ((${#fields[@]} == 2)) || return 1
     BACKUP_DEVICE=${fields[0]}
     BACKUP_DISK=${fields[1]}
 }
@@ -277,19 +311,15 @@ backup_prepare_mount() {
         BACKUP_MOUNTED_BY_APPLIANCE=0
     else
         mount_status=$?
-        (( mount_status == 1 )) || \
-            backup_die "The configured backup filesystem has multiple or unsafe mountpoints."
-        backup_prepare_runtime_directory || \
-            backup_die "The appliance runtime mountpoint is unsafe or unavailable."
+        (( mount_status == 1 )) || return 2
+        backup_prepare_runtime_directory || return 3
         mount --types exfat --options rw,nosuid,nodev,noexec \
-            --source "${BACKUP_DEVICE}" --target "${BACKUP_MOUNTPOINT}" || \
-            backup_die "Unable to mount backup filesystem."
+            --source "${BACKUP_DEVICE}" --target "${BACKUP_MOUNTPOINT}" || return 4
         BACKUP_ACTIVE_MOUNTPOINT=${BACKUP_MOUNTPOINT}
         BACKUP_MOUNTED_BY_APPLIANCE=1
     fi
     backup_verify_mounted_media \
-        "${BACKUP_DEVICE}" "${BACKUP_DISK}" "${BACKUP_ACTIVE_MOUNTPOINT}" || \
-        backup_die "Configured backup filesystem failed validation after mounting."
+        "${BACKUP_DEVICE}" "${BACKUP_DISK}" "${BACKUP_ACTIVE_MOUNTPOINT}" || return 5
 }
 
 backup_estimated_required_bytes() {
@@ -565,6 +595,223 @@ backup_write_checksum() {
     printf '%s\n' "${hash}"
 }
 
+backup_archive_name_is_managed() {
+    [[ "$1" =~ ${BACKUP_ARCHIVE_PATTERN} ]]
+}
+
+backup_verify_generation() {
+    local archive=$1
+    local checksum="${archive}.sha256"
+    local directory
+    local filename
+    local listing
+
+    [[ -f "${archive}" && ! -L "${archive}" &&
+       -f "${checksum}" && ! -L "${checksum}" ]] || return 1
+    filename=${archive##*/}
+    backup_archive_name_is_managed "${filename}" || return 1
+    directory=${archive%/*}
+    [[ "${directory}" != "${archive}" && -d "${directory}" && ! -L "${directory}" ]] || return 1
+    awk -v filename="${filename}" '
+        NR == 1 && length($1) == 64 && $1 ~ /^[0-9a-f]+$/ &&
+            ($2 == filename || $2 == "*" filename) {valid=1}
+        NR > 1 {valid=0}
+        END {exit !valid}
+    ' "${checksum}" || return 1
+    (cd -- "${directory}" && sha256sum --check --strict "${checksum##*/}") >/dev/null || return 1
+    listing=$(mktemp "${TMPDIR:-/tmp}/vaultwarden-backup-list.XXXXXXXX") || return 1
+    if backup_verify_archive "${archive}" "${listing}"; then
+        rm -f -- "${listing}" || return 1
+        return 0
+    fi
+    rm -f -- "${listing}" || true
+    return 1
+}
+
+backup_list_valid_generations() {
+    local directory=$1
+    local output=$2
+    local archive
+    local candidate
+    local name
+
+    [[ -d "${directory}" && ! -L "${directory}" ]] || return 1
+    : > "${output}" || return 1
+    for candidate in "${directory}"/*; do
+        [[ -e "${candidate}" || -L "${candidate}" ]] || continue
+        name=${candidate##*/}
+        if backup_archive_name_is_managed "${name}" || {
+            [[ "${name}" == *.sha256 ]] && backup_archive_name_is_managed "${name%.sha256}"
+        }; then
+            [[ -f "${candidate}" && ! -L "${candidate}" ]] || return 2
+        fi
+    done
+    for archive in "${directory}"/vaultwarden-appliance-*.tar.gz; do
+        [[ -e "${archive}" || -L "${archive}" ]] || continue
+        name=${archive##*/}
+        backup_archive_name_is_managed "${name}" || continue
+        if backup_verify_generation "${archive}"; then
+            printf '%s\n' "${archive}" >> "${output}" || return 1
+        fi
+    done
+    sort -o "${output}" "${output}"
+}
+
+backup_apply_retention() {
+    local directory=$1
+    local limit=$2
+    local protected_archive=$3
+    local temporary_root=$4
+    local archive
+    local checksum
+    local delete_count
+    local index
+    local list
+    local name
+    local -a generations=()
+
+    [[ "${limit}" =~ ^[1-9][0-9]*$ && -d "${temporary_root}" && ! -L "${temporary_root}" ]] || return 1
+    list=$(mktemp "${temporary_root}/retention.XXXXXXXX") || return 1
+    if ! backup_list_valid_generations "${directory}" "${list}"; then
+        rm -f -- "${list}" || true
+        return 1
+    fi
+    mapfile -t generations < "${list}"
+    rm -f -- "${list}" || return 1
+    ((${#generations[@]} > limit)) || return 0
+    delete_count=$((${#generations[@]} - limit))
+    for ((index = 0; index < delete_count; index++)); do
+        archive=${generations[${index}]}
+        checksum="${archive}.sha256"
+        name=${archive##*/}
+        [[ "${archive}" == "${directory}/${name}" && "${archive}" != "${protected_archive}" ]] || return 1
+        backup_archive_name_is_managed "${name}" || return 1
+        backup_verify_generation "${archive}" || return 1
+        [[ -f "${checksum}" && ! -L "${checksum}" ]] || return 1
+    done
+    for ((index = 0; index < delete_count; index++)); do
+        archive=${generations[${index}]}
+        checksum="${archive}.sha256"
+        name=${archive##*/}
+        [[ "${archive}" == "${directory}/${name}" && "${archive}" != "${protected_archive}" ]] || return 1
+        backup_archive_name_is_managed "${name}" || return 1
+        [[ -f "${archive}" && ! -L "${archive}" &&
+           -f "${checksum}" && ! -L "${checksum}" ]] || return 1
+        rm -f -- "${archive}" "${checksum}" || return 1
+    done
+}
+
+backup_install_local_generation() {
+    local source_archive=$1
+    local destination_archive=$2
+    local destination_checksum="${destination_archive}.sha256"
+    local filename=${destination_archive##*/}
+
+    [[ -f "${source_archive}" && ! -L "${source_archive}" &&
+       -f "${source_archive}.sha256" && ! -L "${source_archive}.sha256" ]] || return 1
+    backup_archive_name_is_managed "${filename}" || return 1
+    [[ "${destination_archive}" == "${LOCAL_BACKUP_DIR}/${filename}" ]] || return 1
+    BACKUP_LOCAL_PARTIAL_ARCHIVE=$(mktemp \
+        "${LOCAL_BACKUP_DIR}/.${filename}.partial.XXXXXXXX") || return 1
+    BACKUP_LOCAL_PARTIAL_CHECKSUM=$(mktemp \
+        "${LOCAL_BACKUP_DIR}/.${filename}.sha256.partial.XXXXXXXX") || return 1
+    install -o root -g docker -m 0640 -- "${source_archive}" \
+        "${BACKUP_LOCAL_PARTIAL_ARCHIVE}" || return 1
+    install -o root -g docker -m 0640 -- "${source_archive}.sha256" \
+        "${BACKUP_LOCAL_PARTIAL_CHECKSUM}" || return 1
+    sync -f "${BACKUP_LOCAL_PARTIAL_ARCHIVE}" || return 1
+    sync -f "${BACKUP_LOCAL_PARTIAL_CHECKSUM}" || return 1
+    mv -n -- "${BACKUP_LOCAL_PARTIAL_ARCHIVE}" "${destination_archive}" || return 1
+    [[ ! -e "${BACKUP_LOCAL_PARTIAL_ARCHIVE}" && -f "${destination_archive}" ]] || return 1
+    BACKUP_LOCAL_PARTIAL_ARCHIVE=""
+    mv -n -- "${BACKUP_LOCAL_PARTIAL_CHECKSUM}" "${destination_checksum}" || return 1
+    [[ ! -e "${BACKUP_LOCAL_PARTIAL_CHECKSUM}" && -f "${destination_checksum}" ]] || return 1
+    BACKUP_LOCAL_PARTIAL_CHECKSUM=""
+    sync -f "${LOCAL_BACKUP_DIR}" || return 1
+    backup_verify_generation "${destination_archive}"
+}
+
+backup_prepare_usb_directory() {
+    local directory=$1
+
+    if [[ ! -e "${directory}" && ! -L "${directory}" ]]; then
+        mkdir -m 0700 -- "${directory}" || return 1
+    fi
+    [[ -d "${directory}" && ! -L "${directory}" ]]
+}
+
+backup_copy_generation_to_usb() {
+    local local_archive=$1
+    local usb_directory=$2
+    local archive_size
+    local available_bytes
+    local expected_hash
+    local filename=${local_archive##*/}
+    local required_bytes
+    local usb_archive="${usb_directory}/${filename}"
+    local usb_checksum="${usb_archive}.sha256"
+
+    backup_verify_generation "${local_archive}" || return 1
+    backup_prepare_usb_directory "${usb_directory}" || return 2
+    if [[ -e "${usb_archive}" || -L "${usb_archive}" ||
+          -e "${usb_checksum}" || -L "${usb_checksum}" ]]; then
+        if backup_verify_generation "${usb_archive}" &&
+           [[ "$(awk 'NR == 1 {print $1}' "${local_archive}.sha256")" == \
+              "$(awk 'NR == 1 {print $1}' "${usb_checksum}")" ]]; then
+            return 0
+        fi
+        return 3
+    fi
+    archive_size=$(stat -c '%s' "${local_archive}") || return 1
+    required_bytes=$((archive_size + BACKUP_OVERHEAD_BYTES))
+    available_bytes=$(backup_available_bytes "${BACKUP_ACTIVE_MOUNTPOINT}") || return 1
+    backup_has_sufficient_space "${required_bytes}" "${available_bytes}" || return 4
+    BACKUP_USB_PARTIAL_ARCHIVE=$(mktemp \
+        "${usb_directory}/.${filename}.partial.XXXXXXXX") || return 1
+    BACKUP_USB_PARTIAL_CHECKSUM=$(mktemp \
+        "${usb_directory}/.${filename}.sha256.partial.XXXXXXXX") || return 1
+    cp -- "${local_archive}" "${BACKUP_USB_PARTIAL_ARCHIVE}" || return 1
+    cp -- "${local_archive}.sha256" "${BACKUP_USB_PARTIAL_CHECKSUM}" || return 1
+    sync -f "${BACKUP_USB_PARTIAL_ARCHIVE}" || return 1
+    sync -f "${BACKUP_USB_PARTIAL_CHECKSUM}" || return 1
+    expected_hash=$(awk 'NR == 1 {print $1}' "${local_archive}.sha256") || return 1
+    [[ "${expected_hash}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$(sha256sum -- "${BACKUP_USB_PARTIAL_ARCHIVE}" | awk 'NR == 1 {print $1}')" == \
+       "${expected_hash}" ]] || return 5
+    backup_verify_archive "${BACKUP_USB_PARTIAL_ARCHIVE}" \
+        "${BACKUP_WORK_DIR}/usb-archive.list" || return 6
+    mv -n -- "${BACKUP_USB_PARTIAL_ARCHIVE}" "${usb_archive}" || return 1
+    [[ ! -e "${BACKUP_USB_PARTIAL_ARCHIVE}" && -f "${usb_archive}" ]] || return 1
+    BACKUP_USB_PARTIAL_ARCHIVE=""
+    mv -n -- "${BACKUP_USB_PARTIAL_CHECKSUM}" "${usb_checksum}" || return 1
+    [[ ! -e "${BACKUP_USB_PARTIAL_CHECKSUM}" && -f "${usb_checksum}" ]] || return 1
+    BACKUP_USB_PARTIAL_CHECKSUM=""
+    sync -f "${usb_directory}" || return 1
+    backup_verify_generation "${usb_archive}"
+}
+
+backup_clear_usb_partials() {
+    backup_remove_partial_file "${BACKUP_USB_PARTIAL_ARCHIVE}" \
+        "${BACKUP_ACTIVE_MOUNTPOINT}/backups" || return 1
+    BACKUP_USB_PARTIAL_ARCHIVE=""
+    backup_remove_partial_file "${BACKUP_USB_PARTIAL_CHECKSUM}" \
+        "${BACKUP_ACTIVE_MOUNTPOINT}/backups" || return 1
+    BACKUP_USB_PARTIAL_CHECKSUM=""
+}
+
+backup_media_lookup_error() {
+    case "$1" in
+        2) printf 'configured medium is not connected' ;;
+        3) printf 'multiple filesystems report the configured UUID' ;;
+        4) printf 'configured filesystem is not exFAT' ;;
+        5) printf 'configured filesystem is not labeled %s' "${BACKUP_LABEL}" ;;
+        6) printf 'configured filesystem changed during validation' ;;
+        8) printf 'configured filesystem is backed by a protected system disk' ;;
+        9) printf 'configured filesystem is backed by a virtual device' ;;
+        *) printf 'configured filesystem failed safety validation' ;;
+    esac
+}
+
 backup_finish_mount() {
     sync -f "${BACKUP_ACTIVE_MOUNTPOINT}" || return 1
     sync || return 1
@@ -577,63 +824,24 @@ backup_finish_mount() {
     fi
 }
 
-backup_main() {
+backup_create_local_generation() {
     local appliance_version
-    local archive
-    local archive_partial
-    local archive_size
-    local available_bytes
-    local backup_directory
     local caddy_image
     local caddy_version
-    local checksum_hash
     local created_at
+    local destination_archive
     local hostname
-    local required_bytes
     local signup_allowed
-    local source_bytes
+    local staged_archive
     local timestamp
     local vaultwarden_image
     local vaultwarden_version
-    local verification_result
     local -a version_lines=()
-
-    umask 077
-    trap 'backup_cleanup $?' EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-
-    printf 'Vaultwarden Appliance backup\n\n'
-    backup_require_environment
-    backup_read_state
-    backup_resolve_media
-    backup_ok "Backup media: ${BACKUP_LABEL} (${BACKUP_UUID})"
-    backup_prepare_mount
-
-    backup_directory="${BACKUP_ACTIVE_MOUNTPOINT}/backups"
-    if [[ ! -e "${backup_directory}" ]]; then
-        mkdir -m 0700 -- "${backup_directory}" || backup_die "Unable to create backup directory."
-    fi
-    [[ -d "${backup_directory}" && ! -L "${backup_directory}" ]] || \
-        backup_die "The backup destination directory is unsafe."
-
-    source_bytes=$(backup_source_bytes "${VAULTWARDEN_DATA_DIR}" "${CADDY_DATA_DIR}") || \
-        backup_die "Unable to estimate backup source size."
-    required_bytes=$(backup_estimated_required_bytes "${source_bytes}") || \
-        backup_die "Unable to calculate required backup space."
-    available_bytes=$(backup_available_bytes "${BACKUP_ACTIVE_MOUNTPOINT}") || \
-        backup_die "Unable to determine available backup space."
-    printf '[INFO] Required estimate: %s\n' "$(storage_format_bytes "${required_bytes}")"
-    printf '[INFO] Available: %s\n' "$(storage_format_bytes "${available_bytes}")"
-    backup_has_sufficient_space "${required_bytes}" "${available_bytes}" || \
-        backup_die "Insufficient free space."
-    backup_ok "Available space checked"
 
     backup_create_work_directory || backup_die "Unable to create secure runtime staging."
     backup_copy_appliance_configuration "${INSTALL_DIR}" \
         "${BACKUP_WORK_DIR}/vaultwarden-appliance-backup/appliance" || \
         backup_die "Unable to stage appliance configuration."
-
     mapfile -t version_lines < "${APPLIANCE_VERSION_FILE}"
     ((${#version_lines[@]} == 1)) || backup_die "The appliance version state is invalid."
     appliance_version=${version_lines[0]}
@@ -656,62 +864,307 @@ backup_main() {
         "${vaultwarden_image}" "${vaultwarden_version}" \
         "${caddy_image}" "${caddy_version}" "$(uname -m)" || \
         backup_die "Unable to create backup manifest."
-
     backup_create_database_snapshot "${VAULTWARDEN_DATA_DIR}" \
         "${BACKUP_WORK_DIR}/vaultwarden-appliance-backup/vaultwarden/db.sqlite3" || \
         backup_die "Vaultwarden database backup failed."
     backup_ok "Vaultwarden database snapshot created"
 
     timestamp=$(date -u '+%Y%m%d-%H%M%S')
-    archive=$(backup_choose_archive_path "${backup_directory}" "${timestamp}") || \
-        backup_die "Unable to choose a collision-free backup filename."
-    archive_partial=$(mktemp "${backup_directory}/.${archive##*/}.partial.XXXXXXXX") || \
-        backup_die "Unable to create the backup archive safely."
-    backup_create_archive "${BACKUP_WORK_DIR}" "${archive_partial}" "${INSTALL_DIR}/data" || \
-        backup_die "Unable to create archive; the partial artifact was preserved."
-    backup_ok "Backup archive created"
+    destination_archive=$(backup_choose_archive_path "${LOCAL_BACKUP_DIR}" "${timestamp}") || \
+        backup_die "Unable to choose a collision-free local backup filename."
+    staged_archive="${BACKUP_WORK_DIR}/${destination_archive##*/}"
+    backup_create_archive "${BACKUP_WORK_DIR}" "${staged_archive}" "${INSTALL_DIR}/data" || \
+        backup_die "Unable to create the local backup archive."
+    backup_verify_archive "${staged_archive}" "${BACKUP_WORK_DIR}/archive.list" || \
+        backup_die "Local archive integrity verification failed."
+    backup_write_checksum "${staged_archive}" >/dev/null || \
+        backup_die "Unable to create and verify the local backup checksum."
+    backup_verify_generation "${staged_archive}" || \
+        backup_die "The staged local backup generation failed final verification."
+    backup_install_local_generation "${staged_archive}" "${destination_archive}" || \
+        backup_die "Unable to atomically install the verified local backup generation."
+    BACKUP_LOCAL_ARCHIVE=${destination_archive}
+}
 
-    if backup_verify_archive "${archive_partial}" "${BACKUP_WORK_DIR}/archive.list"; then
+backup_replicate_usb() {
+    local local_archive=$1
+    local mount_status
+    local read_status
+    local resolve_status
+    local usb_directory
+    local copy_status
+
+    if backup_read_state; then
         :
     else
-        verification_result=$?
-        case "${verification_result}" in
-            2) backup_die "Archive integrity verification failed: manifest is missing." ;;
-            3) backup_die "Archive integrity verification failed: database snapshot is missing." ;;
-            4) backup_die "Archive integrity verification failed: Vaultwarden data is missing." ;;
-            5) backup_die "Archive integrity verification failed: Caddy CA data is missing." ;;
-            *) backup_die "Archive integrity verification failed." ;;
-        esac
+        read_status=$?
+        if (( read_status == 2 )); then
+            printf '[INFO] USB replication skipped: no backup medium is configured.\n'
+            return 0
+        fi
+        backup_error "USB replication failed: configured backup-media state is unsafe or invalid."
+        return 1
     fi
-    mv -n -- "${archive_partial}" "${archive}" || \
-        backup_die "Unable to install the verified archive."
-    [[ ! -e "${archive_partial}" && -f "${archive}" && ! -L "${archive}" ]] || \
-        backup_die "The final backup filename collided with another file."
-    backup_ok "Archive integrity verified"
-
-    if checksum_hash=$(backup_write_checksum "${archive}"); then
+    if backup_resolve_media; then
         :
     else
-        verification_result=$?
-        case "${verification_result}" in
-            2) backup_die "Unable to write checksum." ;;
-            3) backup_die "Checksum verification failed." ;;
-            *) backup_die "Unable to install checksum safely." ;;
-        esac
+        resolve_status=$?
+        if (( resolve_status == 2 )); then
+            printf '[INFO] USB replication skipped: configured medium %s is not connected.\n' \
+                "${BACKUP_UUID}"
+            return 0
+        fi
+        backup_error "USB replication failed: $(backup_media_lookup_error "${resolve_status}")."
+        return 1
     fi
-    backup_ok "SHA-256 checksum verified"
-    archive_size=$(stat -c '%s' "${archive}") || backup_die "Unable to read final archive size."
-    backup_finish_mount || backup_die "Unable to unmount backup filesystem."
+    backup_ok "Backup media: ${BACKUP_LABEL} (${BACKUP_UUID})"
+    if backup_prepare_mount; then
+        :
+    else
+        mount_status=$?
+        backup_error "USB replication failed: unable to establish a unique safe writable mount (code ${mount_status})."
+        return 1
+    fi
+    usb_directory="${BACKUP_ACTIVE_MOUNTPOINT}/backups"
+    if backup_copy_generation_to_usb "${local_archive}" "${usb_directory}"; then
+        backup_ok "Verified local generation replicated to USB"
+    else
+        copy_status=$?
+        case "${copy_status}" in
+            2) backup_error "USB replication failed: the managed USB backup directory is unsafe." ;;
+            3) backup_error "USB replication failed: the destination filename already contains a different or invalid generation." ;;
+            4) backup_error "USB replication failed: insufficient free space; existing backups were not deleted." ;;
+            5) backup_error "USB replication failed: copied archive checksum does not match." ;;
+            6) backup_error "USB replication failed: copied archive is unreadable or incomplete." ;;
+            *) backup_error "USB replication failed while copying the verified local generation." ;;
+        esac
+        backup_clear_usb_partials || backup_error "Unable to remove incomplete USB temporary files safely."
+        backup_finish_mount || backup_error "Unable to unmount backup filesystem after replication failure."
+        return 1
+    fi
+    if ! backup_apply_retention "${usb_directory}" "${USB_RETENTION_GENERATIONS}" \
+        "${usb_directory}/${local_archive##*/}" "${BACKUP_WORK_DIR}"; then
+        backup_error "USB retention failed closed; the new USB copy and all extra generations were preserved."
+        backup_finish_mount || backup_error "Unable to unmount backup filesystem after retention failure."
+        return 1
+    fi
+    backup_ok "USB retention kept the newest ${USB_RETENTION_GENERATIONS} valid generations"
+    backup_finish_mount || {
+        backup_error "USB copy succeeded, but the appliance could not unmount its temporary mount."
+        return 1
+    }
+}
 
-    printf '\nBackup complete.\n\n'
-    printf 'File:\n  %s\n\n' "${archive##*/}"
-    printf 'Size:\n  %s\n\n' "$(storage_format_bytes "${archive_size}")"
-    printf 'SHA-256:\n  %s\n\n' "${checksum_hash}"
-    printf 'Security: this unencrypted backup contains Caddy internal CA private material.\n'
-    printf 'Physically protect the backup medium.\n'
+backup_format_generation_time() {
+    local name=${1##*/}
+
+    backup_archive_name_is_managed "${name}" || return 1
+    printf '%s-%s-%s %s:%s:%s UTC\n' \
+        "${name:22:4}" "${name:26:2}" "${name:28:2}" \
+        "${name:31:2}" "${name:33:2}" "${name:35:2}"
+}
+
+backup_status_directory() {
+    local directory=$1
+    local missing_is_empty=${2:-no}
+    local list
+    local latest
+    local -a generations=()
+
+    printf '  Directory:       %s\n' "${directory}"
+    if [[ ! -e "${directory}" && ! -L "${directory}" && "${missing_is_empty}" == yes ]]; then
+        printf '  Generations:     0\n'
+        printf '  Latest:          none\n'
+        printf '  Latest file:     none\n'
+        printf '  Latest valid:    n/a\n'
+        return 0
+    fi
+    if [[ ! -d "${directory}" || -L "${directory}" || ! -r "${directory}" ]]; then
+        printf '  Generations:     unavailable\n'
+        printf '  Latest:          unavailable\n'
+        printf '  Latest valid:    unavailable\n'
+        return 1
+    fi
+    list=$(mktemp "${TMPDIR:-/tmp}/vaultwarden-backup-status.XXXXXXXX") || return 1
+    if ! backup_list_valid_generations "${directory}" "${list}"; then
+        rm -f -- "${list}" || true
+        printf '  Generations:     unsafe or ambiguous\n'
+        printf '  Latest:          unavailable\n'
+        printf '  Latest valid:    no\n'
+        return 1
+    fi
+    mapfile -t generations < "${list}"
+    rm -f -- "${list}" || return 1
+    printf '  Generations:     %d\n' "${#generations[@]}"
+    if ((${#generations[@]} == 0)); then
+        printf '  Latest:          none\n'
+        printf '  Latest file:     none\n'
+        printf '  Latest valid:    n/a\n'
+        return 0
+    fi
+    latest=${generations[-1]}
+    printf '  Latest:          %s\n' "$(backup_format_generation_time "${latest}")"
+    printf '  Latest file:     %s\n' "${latest##*/}"
+    printf '  Latest valid:    yes\n'
+}
+
+backup_status_usb() {
+    local mountpoint
+    local mount_status
+    local read_status
+    local resolve_status
+
+    printf 'USB backup media:\n'
+    if backup_read_state; then
+        printf '  Configured:      yes\n'
+        printf '  Label:           %s\n' "${BACKUP_LABEL}"
+        printf '  UUID:            %s\n' "${BACKUP_UUID}"
+    else
+        read_status=$?
+        if (( read_status == 2 )); then
+            printf '  Configured:      no\n'
+            printf '  Present:         n/a\n'
+            return 0
+        fi
+        printf '  Configured:      unsafe or invalid\n'
+        printf '  Present:         unavailable\n'
+        return 1
+    fi
+    if backup_resolve_media; then
+        printf '  Present:         yes\n'
+    else
+        resolve_status=$?
+        if (( resolve_status == 2 )); then
+            printf '  Present:         no\n'
+            printf '  Generations:     unavailable (not mounted)\n'
+            return 0
+        fi
+        printf '  Present:         unsafe (%s)\n' "$(backup_media_lookup_error "${resolve_status}")"
+        return 1
+    fi
+    if mountpoint=$(backup_existing_mountpoint "${BACKUP_DEVICE}"); then
+        if backup_verify_mounted_media "${BACKUP_DEVICE}" "${BACKUP_DISK}" "${mountpoint}"; then
+            backup_status_directory "${mountpoint}/backups" yes
+        else
+            printf '  Generations:     unavailable (mounted media failed safety validation)\n'
+            return 1
+        fi
+    else
+        mount_status=$?
+        if (( mount_status == 2 )); then
+            printf '  Generations:     unavailable (multiple or unsafe mountpoints)\n'
+            return 1
+        fi
+        printf '  Generations:     unavailable (safe status does not mount media)\n'
+    fi
+}
+
+backup_status_timer() {
+    local enabled=unavailable
+    local last_result=unavailable
+    local last_run=unavailable
+    local next_run=unavailable
+
+    if command_exists systemctl; then
+        if systemctl is-enabled "${BACKUP_TIMER_UNIT}" >/dev/null 2>&1; then
+            enabled=enabled
+        else
+            enabled=disabled
+        fi
+        last_run=$(systemctl show "${BACKUP_TIMER_SERVICE}" \
+            --property=ExecMainStartTimestamp --value 2>/dev/null || true)
+        last_result=$(systemctl show "${BACKUP_TIMER_SERVICE}" \
+            --property=Result --value 2>/dev/null || true)
+        next_run=$(systemctl show "${BACKUP_TIMER_UNIT}" \
+            --property=NextElapseUSecRealtime --value 2>/dev/null || true)
+    fi
+    printf 'Automatic backup:\n'
+    printf '  Timer:           %s\n' "${enabled:-unavailable}"
+    printf '  Schedule:        daily at 02:30 local time\n'
+    printf '  Last run:        %s\n' "${last_run:-never}"
+    printf '  Last result:     %s\n' "${last_result:-not run}"
+    printf '  Next run:        %s\n' "${next_run:-unavailable}"
+}
+
+backup_status_main() {
+    local status=0
+
+    umask 077
+    [[ -d "${INSTALL_DIR}" && ! -L "${INSTALL_DIR}" &&
+       -f "${APPLIANCE_MARKER}" && ! -L "${APPLIANCE_MARKER}" ]] || \
+        backup_die "No safe Vaultwarden Appliance installation was found."
+    for command in stat tar gzip sha256sum awk grep sort mktemp rm lsblk findmnt readlink; do
+        command_exists "${command}" || backup_die "Required status command '${command}' is unavailable."
+    done
+    printf 'Vaultwarden Appliance backup status\n\n'
+    printf 'Local backups:\n'
+    backup_status_directory "${LOCAL_BACKUP_DIR}" || status=1
+    printf '\n'
+    backup_status_usb || status=1
+    printf '\n'
+    backup_status_timer
+    return "${status}"
+}
+
+backup_main() {
+    local archive
+    local archive_size
+    local available_bytes
+    local checksum_hash
+    local final_status=0
+    local required_bytes
+    local source_bytes
+
+    umask 077
+    trap 'backup_cleanup $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf 'Vaultwarden Appliance backup\n\n'
+    backup_require_environment
+    source_bytes=$(backup_source_bytes "${VAULTWARDEN_DATA_DIR}" "${CADDY_DATA_DIR}") || \
+        backup_die "Unable to estimate backup source size."
+    required_bytes=$(backup_estimated_required_bytes "${source_bytes}") || \
+        backup_die "Unable to calculate required local backup space."
+    available_bytes=$(backup_available_bytes "${LOCAL_BACKUP_DIR}") || \
+        backup_die "Unable to determine available local backup space."
+    printf '[INFO] Local required estimate: %s\n' "$(storage_format_bytes "${required_bytes}")"
+    printf '[INFO] Local available: %s\n' "$(storage_format_bytes "${available_bytes}")"
+    backup_has_sufficient_space "${required_bytes}" "${available_bytes}" || \
+        backup_die "Insufficient local free space; older backups were not deleted."
+    backup_ok "Local available space checked"
+
+    backup_create_local_generation
+    archive=${BACKUP_LOCAL_ARCHIVE}
+    backup_verify_generation "${archive}" || backup_die "Installed local backup verification failed."
+    archive_size=$(stat -c '%s' "${archive}") || backup_die "Unable to read local archive size."
+    checksum_hash=$(awk 'NR == 1 {print $1}' "${archive}.sha256") || \
+        backup_die "Unable to read local checksum."
+    backup_ok "Local backup generation installed and verified"
+    if backup_apply_retention "${LOCAL_BACKUP_DIR}" "${LOCAL_RETENTION_GENERATIONS}" \
+        "${archive}" "${BACKUP_WORK_DIR}"; then
+        backup_ok "Local retention kept the newest ${LOCAL_RETENTION_GENERATIONS} valid generations"
+    else
+        backup_error "Local retention failed closed; the new backup and all extra generations were preserved."
+        final_status=1
+    fi
+
+    printf '\nLocal backup succeeded.\n'
+    printf '  File:   %s\n' "${archive}"
+    printf '  Size:   %s\n' "$(storage_format_bytes "${archive_size}")"
+    printf '  SHA-256: %s\n\n' "${checksum_hash}"
+    backup_replicate_usb "${archive}" || final_status=1
+    printf '\nSecurity: backups contain sensitive Vaultwarden data and Caddy internal CA private material.\n'
+    printf 'Protect local and USB copies appropriately.\n'
+    if (( final_status != 0 )); then
+        backup_error "The local backup remains valid, but retention or configured USB replication failed."
+    fi
+    return "${final_status}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    (( $# == 0 )) || backup_die "Usage: backup"
-    backup_main
+    case "${1:-}" in
+        '') (( $# == 0 )) || backup_die "Usage: backup [status]"; backup_main ;;
+        status) (( $# == 1 )) || backup_die "Usage: backup status"; backup_status_main ;;
+        *) backup_die "Usage: backup [status]" ;;
+    esac
 fi
