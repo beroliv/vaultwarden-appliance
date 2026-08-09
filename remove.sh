@@ -18,6 +18,9 @@ fi
 
 readonly INSTALL_DIR="/opt/vaultwarden"
 readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
+readonly BOOTSTRAP_SOURCE_DIR="/opt/vaultwarden-appliance-src"
+readonly BOOTSTRAP_REPOSITORY_URL="https://github.com/beroliv/vaultwarden-appliance.git"
+readonly BOOTSTRAP_REPOSITORY_BRANCH="main"
 readonly OPERATION_LOCK="/run/lock/vaultwarden-appliance.lock"
 readonly COMPOSE_PROJECT="vaultwarden"
 readonly APPLIANCE_NETWORK="vaultwarden-appliance"
@@ -61,11 +64,19 @@ readonly -a SYSTEMD_UNITS=(
     "${BACKUP_SERVICE}|${BACKUP_SERVICE_FILE}|# Vaultwarden Appliance automatic backup"
     "${BACKUP_TIMER}|${BACKUP_TIMER_FILE}|# Vaultwarden Appliance automatic backup"
 )
+readonly -a BOOTSTRAP_PROJECT_FILES=(
+    bootstrap.sh
+    install.sh
+    remove.sh
+    vwctl
+    VERSION
+)
 
 REMOVAL_ERRORS=0
 DOCKER_COMPOSE_VERSION_BEFORE=""
 DOCKER_VERSION_BEFORE=""
 AVAHI_STATE_BEFORE=""
+SOURCE_CHECKOUT_STATUS="unchanged"
 
 remove_info() {
     printf '[INFO] %s\n' "$*"
@@ -121,6 +132,17 @@ remove_path_permissions() {
     stat -c '%a' "$1" 2>/dev/null
 }
 
+remove_canonical_path() {
+    local resolved
+
+    resolved=$(readlink -f -- "$1" 2>/dev/null) || return 1
+    if command_exists cygpath; then
+        cygpath -m -- "${resolved}"
+    else
+        printf '%s\n' "${resolved}"
+    fi
+}
+
 remove_validate_appliance() {
     local directory=$1
     local marker=$2
@@ -151,6 +173,51 @@ remove_validate_appliance() {
     mapfile -t marker_lines < "${marker}" || return 1
     (( ${#marker_lines[@]} == 1 )) || return 1
     [[ "${marker_lines[0]}" == "Vaultwarden Appliance" ]]
+}
+
+remove_validate_source_checkout() {
+    local directory=$1
+    local expected_directory=$2
+    local branch
+    local directory_owner
+    local directory_permissions
+    local expected_resolved
+    local origin
+    local project_file
+    local resolved
+    local repository_root
+
+    [[ "${directory}" == "${expected_directory}" &&
+       "${expected_directory}" == /* && "${expected_directory}" != "/" ]] || return 1
+    [[ -d "${directory}" && ! -L "${directory}" ]] || return 1
+    resolved=$(remove_canonical_path "${directory}") || return 1
+    if command_exists cygpath; then
+        expected_resolved=$(remove_canonical_path "${expected_directory}") || return 1
+    else
+        expected_resolved=${expected_directory}
+    fi
+    [[ "${resolved}" == "${expected_resolved}" ]] || return 1
+
+    directory_owner=$(remove_path_owner "${directory}") || return 1
+    directory_permissions=$(remove_path_permissions "${directory}") || return 1
+    [[ "${directory_owner}" == "0" &&
+       "${directory_permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${directory_permissions} & 8#002) == 0 )) || return 1
+
+    command_exists git || return 1
+    [[ -d "${directory}/.git" && ! -L "${directory}/.git" ]] || return 1
+    repository_root=$(git -C "${directory}" rev-parse --show-toplevel 2>/dev/null) || return 1
+    repository_root=$(remove_canonical_path "${repository_root}") || return 1
+    [[ "${repository_root}" == "${expected_resolved}" ]] || return 1
+    origin=$(git -C "${directory}" remote get-url --all origin 2>/dev/null) || return 1
+    [[ "${origin}" == "${BOOTSTRAP_REPOSITORY_URL}" ]] || return 1
+    branch=$(git -C "${directory}" symbolic-ref --quiet --short HEAD 2>/dev/null) || return 1
+    [[ "${branch}" == "${BOOTSTRAP_REPOSITORY_BRANCH}" ]] || return 1
+
+    for project_file in "${BOOTSTRAP_PROJECT_FILES[@]}"; do
+        [[ -f "${directory}/${project_file}" &&
+           ! -L "${directory}/${project_file}" ]] || return 1
+    done
 }
 
 remove_docker() {
@@ -447,6 +514,7 @@ The following appliance-owned data will be deleted:
   - Appliance systemd units
   - Appliance mDNS publisher
   - /usr/local/bin/vwctl
+  - /opt/vaultwarden-appliance-src, if positively identified as the canonical bootstrap checkout
 
 USB backup media will NOT be erased or reformatted.
 
@@ -650,6 +718,50 @@ remove_installation_tree() {
     [[ ! -e "${directory}" && ! -L "${directory}" ]]
 }
 
+remove_source_checkout_tree() {
+    local directory=$1
+    local expected_directory=$2
+
+    remove_validate_source_checkout "${directory}" "${expected_directory}" || return 1
+    remove_delete_tree "${directory}" || return 1
+    [[ ! -e "${directory}" && ! -L "${directory}" ]]
+}
+
+remove_source_checkout_if_owned() {
+    local directory=$1
+    local expected_directory=$2
+
+    [[ "${directory}" == "${expected_directory}" ]] || return 1
+    if [[ ! -e "${directory}" && ! -L "${directory}" ]]; then
+        SOURCE_CHECKOUT_STATUS="absent"
+        remove_info "Canonical bootstrap source checkout is already absent: ${directory}"
+        return 0
+    fi
+
+    if ! remove_validate_source_checkout \
+        "${directory}" "${expected_directory}"; then
+        SOURCE_CHECKOUT_STATUS="preserved"
+        remove_info "Source cleanup was skipped because ownership could not be verified: ${directory}"
+        return 0
+    fi
+
+    if remove_source_checkout_tree \
+        "${directory}" "${expected_directory}"; then
+        SOURCE_CHECKOUT_STATUS="removed"
+        remove_ok "Removed canonical bootstrap source checkout ${directory}."
+        return 0
+    fi
+
+    SOURCE_CHECKOUT_STATUS="failed"
+    remove_error "The verified bootstrap source checkout could not be removed: ${directory}."
+    return 1
+}
+
+remove_bootstrap_source_checkout() {
+    remove_source_checkout_if_owned \
+        "${BOOTSTRAP_SOURCE_DIR}" "${BOOTSTRAP_SOURCE_DIR}"
+}
+
 remove_verify_expected_files_absent() {
     local entry
     local marker
@@ -707,16 +819,39 @@ Removed:
   Appliance systemd services/timer
   Appliance management files
   /opt/vaultwarden and all local appliance data
+RESULT
+    if [[ "${SOURCE_CHECKOUT_STATUS}" == "removed" ]]; then
+        printf '  /opt/vaultwarden-appliance-src\n'
+    fi
+    cat <<'RESULT'
 
 Preserved:
   Docker and Docker Compose
   Avahi
   Docker images
   USB backup media
+RESULT
+    if [[ "${SOURCE_CHECKOUT_STATUS}" == "preserved" ]]; then
+        printf '  /opt/vaultwarden-appliance-src (ownership could not be verified)\n'
+    fi
+    cat <<'RESULT'
 
 Kein Backup, keine Gnade.
 No backup, no mercy.
 RESULT
+}
+
+remove_finish() {
+    if (( REMOVAL_ERRORS != 0 )) || ! remove_final_verification; then
+        remove_error "Vaultwarden Appliance removal is incomplete. Safe remaining resources were preserved for diagnosis and a rerun."
+        return 1
+    fi
+
+    remove_bootstrap_source_checkout || {
+        remove_error "Vaultwarden Appliance runtime removal succeeded, but canonical source cleanup failed."
+        return 1
+    }
+    remove_print_result
 }
 
 remove_main() {
@@ -758,12 +893,7 @@ remove_main() {
         remove_record_error "Local appliance data was preserved because an earlier cleanup step failed. Rerun remove.sh after correcting the reported problem."
     fi
 
-    if (( REMOVAL_ERRORS == 0 )) && remove_final_verification; then
-        remove_print_result
-        return 0
-    fi
-    remove_error "Vaultwarden Appliance removal is incomplete. Safe remaining resources were preserved for diagnosis and a rerun."
-    return 1
+    remove_finish
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

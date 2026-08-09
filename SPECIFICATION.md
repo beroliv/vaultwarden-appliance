@@ -643,7 +643,11 @@ After confirmation, removal stops/disables only the appliance backup and mDNS
 units, removes only positively identified `vaultwarden` and `caddy` containers
 and the `vaultwarden-appliance` network, removes explicitly owned management
 files, reloads systemd, and deletes `/opt/vaultwarden` only after revalidation
-and successful service/container shutdown.
+and successful service/container shutdown. After all critical cleanup and final
+appliance verification succeed as far as practical, it MUST remove the
+canonical bootstrap source checkout at `/opt/vaultwarden-appliance-src` as the
+final cleanup step when that checkout is positively identified as described
+below.
 
 This intentionally deletes Vaultwarden data, database, attachments, sends,
 keys, Caddy persistent CA and private keys, exported CA, local backups,
@@ -654,9 +658,22 @@ Removal MUST preserve Docker, Compose, images, Avahi, packages, users, groups,
 and unrelated resources. Partial removal must remain safely rerunnable where
 ownership can still be proven. No automatic backup is created.
 
-`remove.sh` does not delete `/opt/vaultwarden-appliance-src`. Source removal,
-if desired after a successful uninstall, is a separate explicit administrator
-action.
+The canonical bootstrap source checkout is eligible for automatic removal only
+when it is a real, non-symlink directory owned by root and not world-writable;
+its resolved Git repository root is exactly
+`/opt/vaultwarden-appliance-src`; its `origin` URL is exactly
+`https://github.com/beroliv/vaultwarden-appliance.git`; its branch is `main`;
+and the expected project files `bootstrap.sh`, `install.sh`, `remove.sh`,
+`vwctl`, and `VERSION` are present as regular non-symlink files. Ownership is
+revalidated immediately before deletion. If any check fails, source cleanup is
+skipped and reported without making the otherwise successful appliance removal
+broader or deleting the uncertain directory.
+
+Arbitrary or manual Git clones outside `/opt/vaultwarden-appliance-src` MUST be
+preserved. Cancellation and any partial failure before final verification MUST
+also preserve the canonical source checkout. The deletion step MUST use only
+absolute paths and MUST NOT depend on files in the checkout after it removes the
+directory from which `remove.sh` may itself be running.
 
 ## 18. Restore
 

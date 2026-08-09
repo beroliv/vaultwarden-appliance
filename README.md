@@ -261,15 +261,17 @@ appliance data, Caddy CA state, configuration, and local backup generations.
 There is no keep-data mode. USB backup media remains untouched. Docker, Docker
 Compose, Avahi, packages, images, users, and group membership remain installed.
 
-`remove.sh` deliberately leaves `/opt/vaultwarden-appliance-src` in place. After
-a successful uninstall, source cleanup is a separate explicit action:
+After all critical cleanup and final verification succeed, `remove.sh` also
+removes `/opt/vaultwarden-appliance-src` when it can positively identify that
+directory as the root-owned canonical bootstrap checkout for this project. An
+absent checkout is accepted. A symlink, unsafe ownership or permissions, wrong
+Git origin or branch, invalid repository root, or missing project file causes
+source cleanup to be skipped without broadening the deletion scope.
 
-```bash
-sudo rm -rf -- /opt/vaultwarden-appliance-src
-```
-
-For a manual installation outside that path, run `remove.sh` from the complete
-checkout used for installation and remove that checkout separately if desired.
+Arbitrary/manual Git clones elsewhere are always preserved. For a manual
+installation outside the canonical bootstrap path, run `remove.sh` from the
+complete checkout used for installation and remove that checkout separately if
+desired.
 
 Kein Backup, keine Gnade. No backup, no mercy.
 
