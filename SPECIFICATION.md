@@ -8,11 +8,12 @@ Docker, Docker Compose, and Avahi rather than modifying those projects.
 
 The implemented appliance includes installation, local HTTPS, mDNS access,
 `vwctl` lifecycle management, verified local-first backups, optional USB
-replication, automatic retention, and complete local removal.
+replication, automatic retention, restore, and complete local removal.
 
-Restore is not implemented and MUST NOT be presented as production-ready. A
-restore design is not complete until it has passed end-to-end validation on a
-fresh Raspberry Pi using real backup media.
+Restore is implemented for the appliance's schema-1 backup format and covered
+by non-destructive fixture tests. Its final destructive end-to-end validation
+on a fresh Raspberry Pi using real backup media remains pending and MUST be
+completed before a production-ready restore release is claimed.
 
 ## 2. Supported platform
 
@@ -100,6 +101,7 @@ Installed management files include:
 /usr/local/lib/vaultwarden-appliance/*.sh
 /usr/local/libexec/vaultwarden-appliance-usb-setup
 /usr/local/libexec/vaultwarden-appliance-backup
+/usr/local/libexec/vaultwarden-appliance-restore
 /usr/local/libexec/vaultwarden-appliance-mdns
 /etc/default/vaultwarden-appliance-mdns
 /etc/systemd/system/vaultwarden-appliance-mdns.service
@@ -355,9 +357,11 @@ vwctl usb status
 sudo vwctl usb setup
 vwctl backup status
 sudo vwctl backup
+sudo vwctl restore
 ```
 
-Restore is absent from both direct commands and the menu.
+Restore is also available from the interactive menu. The menu displays the
+same root instruction and does not invoke `sudo` itself.
 
 ### 11.1 Global operation lock
 
@@ -654,22 +658,85 @@ ownership can still be proven. No automatic backup is created.
 if desired after a successful uninstall, is a separate explicit administrator
 action.
 
-## 18. Restore status
+## 18. Restore
 
-No `vwctl restore` command or interactive restore menu is implemented. Backup
-format and contents are restore-oriented, but this does not constitute a
-supported recovery procedure.
+`sudo vwctl restore` uses the global operation lock and restores only backups
+created by the current appliance schema (`backup_schema=1`). It discovers valid
+generations under `/opt/vaultwarden/backups` and on a safely identified
+`VWBACKUP` filesystem. A configured UUID is preferred. On a newly installed
+appliance without USB state, an unconfigured medium may be offered only when
+its label, exFAT filesystem, UUID, partition topology, physical backing disk,
+and system-disk exclusion all validate. Multiple safe media require an explicit
+selection.
 
-Restore MUST remain documented as planned/final validation work until an
-implementation can:
+USB restore access is read-only. The helper reuses only one unambiguous mount
+that already has `ro,nodev,nosuid,noexec`; otherwise it mounts below `/run` with
+those options and unmounts only that appliance-created mount. Restore MUST NOT
+write to, delete from, format, partition, or otherwise modify USB media.
 
-- discover and validate a selected backup;
-- verify archive and checksum integrity and safe paths;
-- restore Vaultwarden, appliance, and Caddy state with correct permissions;
-- preserve or explicitly manage Caddy CA trust;
-- isolate changing services during restore;
-- recover safely from failure; and
-- pass a destructive end-to-end test on a fresh reference Raspberry Pi.
+Before displaying the destructive confirmation, restore copies the selected
+archive/checksum pair into a root-only staging directory below `/run` and
+verifies all of the following:
+
+- exact managed filename and one-line SHA-256 checksum;
+- gzip and tar readability;
+- no absolute or parent-traversal member names and no duplicate members;
+- regular files and directories only (no symlinks, hardlinks, devices, or
+  FIFOs);
+- the exact schema-1 manifest keys and safe values without sourcing or
+  evaluating backup content;
+- a valid SQLite snapshot header;
+- the appliance marker, version, access, Caddyfile, official-image Compose,
+  internal network, and signup state agree with the manifest; and
+- Caddy's internal root certificate and private key are present, parseable,
+  and form one cryptographic key pair.
+
+Manifest metadata and the source are shown before the exact, case-sensitive
+confirmation:
+
+```text
+RESTORE VAULTWARDEN
+```
+
+Any other input cancels before appliance data is changed. The selected source,
+checksum, USB identity, topology, and read-only mount are revalidated after
+confirmation.
+
+Restore records and suspends the automatic-backup timer, stops the backup
+service and appliance mDNS publisher, then stops Caddy and Vaultwarden. It
+replaces only `/opt/vaultwarden/data/vaultwarden` and
+`/opt/vaultwarden/data/caddy` from the verified staging tree and installs the
+verified database snapshot without stale WAL/SHM files. Existing local backup
+generations under `/opt/vaultwarden/backups` are outside that replacement and
+MUST remain intact.
+
+The currently installed management code and base/Caddy Compose files remain
+authoritative. Restore regenerates only the appliance-managed access state,
+Caddyfile, Vaultwarden `DOMAIN`/signup override, and mDNS state from the
+validated backup manifest. Backed-up scripts or executables are never run or
+installed.
+
+The restored Caddy data includes the selected backup's original internal root
+CA and private key. The public root is exported again, preserving trust for
+clients that already trust that backup's CA. Vaultwarden and Caddy are started,
+the hostname, mDNS mapping, `DOMAIN`, networks, host-port policy, HTTPS endpoint,
+and CA continuity are checked through `vwctl health`, and only then may USB
+UUID state be adopted and the prior timer state restored.
+
+Restore does not create an automatic pre-restore backup and does not perform an
+automatic data rollback after replacement begins. A critical post-confirmation
+failure is explicit and leaves recovery evidence rather than guessing at an
+unverified rollback. Administrators MUST retain an independent verified backup.
+
+Foreign Vaultwarden backups, raw database copies, other archive layouts, and
+future unknown schemas are rejected. Migration from another installation must
+use Vaultwarden's supported export/import facilities and explicit transfer of
+other required data rather than pretending a foreign archive is an appliance
+restore.
+
+The implementation has automated non-destructive security and workflow tests.
+Destructive end-to-end restore validation on a freshly installed reference
+Raspberry Pi with real local and USB backups remains a release-readiness task.
 
 ## 19. Error handling and safety
 
@@ -690,8 +757,8 @@ groups, services, network configuration, or storage.
 
 Shell scripts MUST remain readable, Bash-specific where required, and suitable
 for ShellCheck. Automated tests use mocks and temporary fixtures for storage,
-backup, menu, bootstrap, and removal behavior; they MUST NOT touch real disks,
-live appliance data, or GitHub.
+backup, restore, menu, bootstrap, and removal behavior; they MUST NOT touch real
+disks, live appliance data, or GitHub.
 
 Required validation for changes includes:
 
@@ -704,9 +771,10 @@ Required validation for changes includes:
 
 The reference end-to-end environment remains a clean supported Raspberry Pi.
 Installation, mDNS, trusted HTTPS, Vaultwarden account creation, health checks,
-manual/automatic backup, USB behavior, source updates, container updates, and
-removal require real-system validation. Restore is excluded until its separate
-implementation and destructive validation are complete.
+manual/automatic backup, USB behavior, source updates, container updates,
+restore, and removal require real-system validation. Restore code is complete,
+but its destructive fresh-Pi validation remains pending as stated in section
+18.
 
 ## 21. Project principles
 

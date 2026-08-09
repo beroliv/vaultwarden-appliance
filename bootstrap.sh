@@ -234,7 +234,7 @@ validate_project_files() {
     local -a required_files=(
         install.sh remove.sh vwctl mdns-publisher VERSION
         lib/common.sh lib/network.sh lib/docker.sh lib/caddy.sh lib/mdns.sh lib/storage.sh
-        libexec/backup libexec/usb-setup
+        libexec/backup libexec/restore libexec/usb-setup
         systemd/vaultwarden-appliance-backup.service
         systemd/vaultwarden-appliance-backup.timer
     )

@@ -37,6 +37,8 @@ readonly USB_SETUP_SOURCE="${SCRIPT_DIR}/libexec/usb-setup"
 readonly USB_SETUP_TARGET="/usr/local/libexec/vaultwarden-appliance-usb-setup"
 readonly BACKUP_SOURCE="${SCRIPT_DIR}/libexec/backup"
 readonly BACKUP_TARGET="/usr/local/libexec/vaultwarden-appliance-backup"
+readonly RESTORE_SOURCE="${SCRIPT_DIR}/libexec/restore"
+readonly RESTORE_TARGET="/usr/local/libexec/vaultwarden-appliance-restore"
 readonly LOCAL_BACKUP_DIR="${INSTALL_DIR}/backups"
 readonly BACKUP_SERVICE_SOURCE="${SCRIPT_DIR}/systemd/vaultwarden-appliance-backup.service"
 readonly BACKUP_TIMER_SOURCE="${SCRIPT_DIR}/systemd/vaultwarden-appliance-backup.timer"
@@ -66,6 +68,12 @@ if [[ ! -f "${BACKUP_SOURCE}" || -L "${BACKUP_SOURCE}" ]] ||
    ! grep -Fxq '# Vaultwarden Appliance manual backup' "${BACKUP_SOURCE}"; then
     printf '[FAIL] Required backup helper is missing or unsafe: %s\n' \
         "${BACKUP_SOURCE}" >&2
+    exit 1
+fi
+if [[ ! -f "${RESTORE_SOURCE}" || -L "${RESTORE_SOURCE}" ]] ||
+   ! grep -Fxq '# Vaultwarden Appliance restore' "${RESTORE_SOURCE}"; then
+    printf '[FAIL] Required restore helper is missing or unsafe: %s\n' \
+        "${RESTORE_SOURCE}" >&2
     exit 1
 fi
 for unit_source in "${BACKUP_SERVICE_SOURCE}" "${BACKUP_TIMER_SOURCE}"; do
@@ -810,6 +818,7 @@ install_backup_support() {
         missing_packages+=(coreutils)
     fi
     command_exists find || missing_packages+=(findutils)
+    command_exists openssl || missing_packages+=(openssl)
     if ! command_exists mount || ! command_exists umount; then
         missing_packages+=(mount)
     fi
@@ -825,7 +834,7 @@ install_backup_support() {
         ok "Required backup tools are already installed."
     fi
 
-    for command in tar gzip sha256sum sync df du find mount umount cp sort; do
+    for command in tar gzip sha256sum sync df du find mount umount cp sort openssl od tr; do
         command_exists "${command}" || {
             error "Required backup command '${command}' is unavailable after package installation."
             return 1
@@ -1424,6 +1433,11 @@ install_vwctl() {
         error "The appliance USB setup helper is missing or unsafe at ${USB_SETUP_SOURCE}."
         return 1
     fi
+    if [[ ! -f "${RESTORE_SOURCE}" || -L "${RESTORE_SOURCE}" ]] ||
+       ! grep -Fxq '# Vaultwarden Appliance restore' "${RESTORE_SOURCE}"; then
+        error "The appliance restore helper is missing or unsafe at ${RESTORE_SOURCE}."
+        return 1
+    fi
 
     if [[ -e "${VWCTL_TARGET}" ]]; then
         if [[ ! -f "${VWCTL_TARGET}" || -L "${VWCTL_TARGET}" ]] || \
@@ -1484,7 +1498,23 @@ install_vwctl() {
         return 1
     fi
 
-    ok "Installed the appliance management command, USB setup helper, and backup helper."
+    if [[ -e "${RESTORE_TARGET}" &&
+          ( ! -f "${RESTORE_TARGET}" || -L "${RESTORE_TARGET}" ) ]]; then
+        error "The restore helper target is unsafe: ${RESTORE_TARGET}."
+        return 1
+    fi
+    if [[ -f "${RESTORE_TARGET}" ]] &&
+       ! grep -Fxq '# Vaultwarden Appliance restore' "${RESTORE_TARGET}"; then
+        error "The existing restore helper is not appliance-managed and will not be overwritten."
+        return 1
+    fi
+    install -m 0755 "${RESTORE_SOURCE}" "${RESTORE_TARGET}"
+    if [[ ! -x "${RESTORE_TARGET}" ]]; then
+        error "The restore helper was copied but is not executable at ${RESTORE_TARGET}."
+        return 1
+    fi
+
+    ok "Installed the appliance management command, USB setup, backup, and restore helpers."
 }
 
 install_appliance_version() {
@@ -1531,6 +1561,7 @@ print_completion_summary() {
     info "Local backups: ${LOCAL_BACKUP_DIR} (newest 7 valid generations)"
     info "Optional USB copies: ${BACKUP_LABEL} backups/ (newest 30 valid generations)"
     info "Automatic backup: daily at 02:30 local time"
+    info "Restore command: sudo vwctl restore"
     info "Vaultwarden remains internal-only; only Caddy publishes host TCP port 443."
     info "Appliance-owned files and containers were reconciled idempotently; persistent Vaultwarden data was preserved."
     if (( DOCKER_GROUP_CHANGED == 1 )); then

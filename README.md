@@ -1,9 +1,12 @@
 # Vaultwarden Appliance
 
 A LAN-only Vaultwarden appliance for Debian and Raspberry Pi OS using Docker,
-Caddy HTTPS, mDNS, simple `vwctl` management, and verified local-first backups.
+Caddy HTTPS, mDNS, simple `vwctl` management, verified local-first backups, and
+an appliance-format restore workflow.
 
-Restore is not yet considered complete or production-ready.
+Restore is implemented and fixture-tested. Its final destructive validation on
+a fresh reference Raspberry Pi is still pending, so retain independent verified
+backup copies.
 
 ## What it does
 
@@ -17,6 +20,8 @@ Restore is not yet considered complete or production-ready.
 - Optionally copies backups to a safely initialized `VWBACKUP` USB filesystem
   and keeps the newest 30 USB generations.
 - Runs the same verified backup automatically every day at 02:30 local time.
+- Restores verified appliance backups from local storage or read-only USB while
+  retaining the backup's Caddy internal CA.
 - Provides a separate, deliberately destructive `remove.sh` uninstaller.
 
 The appliance does not configure public Internet access, public certificates,
@@ -104,6 +109,7 @@ vwctl status
 vwctl health
 vwctl backup status
 sudo vwctl backup
+sudo vwctl restore
 vwctl update check
 sudo vwctl update
 vwctl usb status
@@ -269,10 +275,45 @@ Kein Backup, keine Gnade. No backup, no mercy.
 
 ## Restore
 
-Restore is planned and remains final validation work. It is not implemented or
-considered production-ready until it has been tested end to end on a fresh
-Raspberry Pi. Keep independently verified backup copies and do not rely on an
-unimplemented appliance restore command.
+Run the root-only restore workflow with:
+
+```bash
+sudo vwctl restore
+```
+
+The command discovers valid appliance backup generations in
+`/opt/vaultwarden/backups` and on a safe `VWBACKUP` USB filesystem. USB media is
+mounted read-only with hardened options when necessary; restore never writes to
+or deletes from it. An unconfigured but safely identified `VWBACKUP` medium can
+be used after a fresh appliance installation.
+
+The selected archive is copied to root-only staging under `/run` before the
+confirmation prompt. Its checksum, tar paths and member types, schema-1
+manifest, SQLite snapshot, appliance state, and matching Caddy internal CA
+certificate/private key are verified. Restore proceeds only after the exact,
+case-sensitive text:
+
+```text
+RESTORE VAULTWARDEN
+```
+
+The workflow temporarily stops automatic backup, mDNS, Caddy, and Vaultwarden;
+replaces the verified Vaultwarden/Caddy persistent data; regenerates managed
+hostname, Caddy, mDNS, `DOMAIN`, and signup configuration; then starts and
+health-checks the appliance. Existing local backup generations are preserved.
+The selected backup's Caddy root CA is restored and re-exported so clients that
+already trust that CA remain valid.
+
+There is no automatic pre-restore backup or automatic rollback after data
+replacement begins. Keep a separate verified copy. Only backups created by
+this appliance with `backup_schema=1` are accepted. For a foreign Vaultwarden
+installation, use Vaultwarden's supported export/import path and explicitly
+transfer any other required data instead of feeding foreign files to this
+restore command.
+
+The restore implementation has non-destructive fixture coverage, including
+malicious archive cases. A destructive end-to-end restore on a clean reference
+Raspberry Pi with real media remains the final release-validation step.
 
 ## Security and scope
 

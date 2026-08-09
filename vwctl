@@ -59,6 +59,12 @@ else
     BACKUP_HELPER="/usr/local/libexec/vaultwarden-appliance-backup"
 fi
 readonly BACKUP_HELPER
+if [[ -f "${SCRIPT_DIR}/libexec/restore" && ! -L "${SCRIPT_DIR}/libexec/restore" ]]; then
+    RESTORE_HELPER="${SCRIPT_DIR}/libexec/restore"
+else
+    RESTORE_HELPER="/usr/local/libexec/vaultwarden-appliance-restore"
+fi
+readonly RESTORE_HELPER
 
 ACCESS_ADDRESS=""
 HTTPS_LAST_ERROR=""
@@ -105,6 +111,7 @@ Usage:
   sudo vwctl usb setup
   sudo vwctl backup
   vwctl backup status
+  sudo vwctl restore
 
 Commands:
   status             Show appliance and access information
@@ -124,6 +131,7 @@ Commands:
   usb setup          ERASE and initialize one explicitly selected backup disk
   backup             Create a verified local backup and optionally replicate it to USB
   backup status      Show local, USB, and automatic-backup status without changes
+  restore            Verify and restore one appliance backup from local or USB storage
 HELP
 }
 
@@ -1799,6 +1807,18 @@ command_backup_status() {
     bash "${BACKUP_HELPER}" status
 }
 
+command_restore() {
+    require_root "restore"
+    require_operation_lock
+    require_appliance
+    require_docker
+    [[ -f "${RESTORE_HELPER}" && ! -L "${RESTORE_HELPER}" ]] || \
+        die "The appliance restore helper is missing or unsafe. Rerun the installer."
+    grep -Fxq '# Vaultwarden Appliance restore' "${RESTORE_HELPER}" || \
+        die "The appliance restore helper is not recognized. Rerun the installer."
+    bash "${RESTORE_HELPER}"
+}
+
 command_cert_export() {
     require_root "cert export"
     require_operation_lock
@@ -2012,17 +2032,18 @@ interactive_menu() {
         printf '2) Health check\n'
         printf '3) Backup\n'
         printf '4) Backup status\n'
-        printf '5) USB backup media\n'
-        printf '6) Update check\n'
-        printf '7) Update\n'
-        printf '8) Start\n'
-        printf '9) Stop\n'
-        printf '10) Restart\n'
-        printf '11) Logs\n'
-        printf '12) Access / hostname\n'
-        printf '13) Signup settings\n'
-        printf '14) Certificate\n'
-        printf '15) Version\n'
+        printf '5) Restore\n'
+        printf '6) USB backup media\n'
+        printf '7) Update check\n'
+        printf '8) Update\n'
+        printf '9) Start\n'
+        printf '10) Stop\n'
+        printf '11) Restart\n'
+        printf '12) Logs\n'
+        printf '13) Access / hostname\n'
+        printf '14) Signup settings\n'
+        printf '15) Certificate\n'
+        printf '16) Version\n'
         printf '0) Exit\n\n'
         menu_read_selection || return 0
         case "${MENU_SELECTION}" in
@@ -2030,17 +2051,18 @@ interactive_menu() {
             2) menu_run_command command_health || return 0 ;;
             3) menu_run_root_command "backup" command_backup || return 0 ;;
             4) menu_run_command command_backup_status || return 0 ;;
-            5) menu_usb || return 0 ;;
-            6) menu_run_command command_update_check || return 0 ;;
-            7) menu_run_root_command "update" command_update || return 0 ;;
-            8) menu_run_root_command "start" command_start || return 0 ;;
-            9) menu_run_root_command "stop" command_stop || return 0 ;;
-            10) menu_run_root_command "restart" command_restart || return 0 ;;
-            11) menu_logs || return 0 ;;
-            12) menu_run_root_command "access" command_access "" || return 0 ;;
-            13) menu_signup || return 0 ;;
-            14) menu_certificate || return 0 ;;
-            15) menu_run_command command_version || return 0 ;;
+            5) menu_run_root_command "restore" command_restore || return 0 ;;
+            6) menu_usb || return 0 ;;
+            7) menu_run_command command_update_check || return 0 ;;
+            8) menu_run_root_command "update" command_update || return 0 ;;
+            9) menu_run_root_command "start" command_start || return 0 ;;
+            10) menu_run_root_command "stop" command_stop || return 0 ;;
+            11) menu_run_root_command "restart" command_restart || return 0 ;;
+            12) menu_logs || return 0 ;;
+            13) menu_run_root_command "access" command_access "" || return 0 ;;
+            14) menu_signup || return 0 ;;
+            15) menu_certificate || return 0 ;;
+            16) menu_run_command command_version || return 0 ;;
             0) return 0 ;;
             *) printf 'Invalid selection.\n' ;;
         esac
@@ -2127,6 +2149,10 @@ main() {
             else
                 die "Usage: sudo vwctl backup | vwctl backup status"
             fi
+            ;;
+        restore)
+            (( $# == 1 )) || die "Usage: sudo vwctl restore"
+            command_restore
             ;;
         *)
             die "Unknown command '${command}'. Run 'vwctl help'."

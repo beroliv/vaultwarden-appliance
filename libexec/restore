@@ -1,0 +1,1161 @@
+#!/usr/bin/env bash
+# Vaultwarden Appliance restore
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIR
+if [[ -f "${SCRIPT_DIR}/../lib/common.sh" && ! -L "${SCRIPT_DIR}/../lib/common.sh" ]]; then
+    LIB_DIR=$(cd -- "${SCRIPT_DIR}/../lib" && pwd -P)
+else
+    LIB_DIR="/usr/local/lib/vaultwarden-appliance"
+fi
+readonly LIB_DIR
+for library in common network docker caddy mdns storage; do
+    library_path="${LIB_DIR}/${library}.sh"
+    if [[ ! -f "${library_path}" || -L "${library_path}" ]]; then
+        printf 'Error: Required restore library is missing or unsafe: %s\n' \
+            "${library_path}" >&2
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    . "${library_path}"
+done
+unset library library_path
+
+readonly INSTALL_DIR="/opt/vaultwarden"
+readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
+readonly APPLIANCE_VERSION_FILE="${INSTALL_DIR}/.appliance-version"
+readonly ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
+readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
+readonly BASE_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
+readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
+readonly VWCTL_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.vwctl.yml"
+readonly CADDYFILE="${INSTALL_DIR}/Caddyfile"
+readonly LOCAL_BACKUP_DIR="${INSTALL_DIR}/backups"
+readonly DATA_DIR="${INSTALL_DIR}/data"
+readonly VAULTWARDEN_DATA_DIR="${DATA_DIR}/vaultwarden"
+readonly CADDY_DATA_DIR="${DATA_DIR}/caddy"
+readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
+readonly ARCHIVE_ROOT="vaultwarden-appliance-backup"
+readonly BACKUP_SCHEMA="1"
+readonly BACKUP_LABEL="VWBACKUP"
+readonly BACKUP_ARCHIVE_PATTERN='^vaultwarden-appliance-[0-9]{8}-[0-9]{6}(-[0-9]{2})?\.tar\.gz$'
+readonly CADDY_ROOT_CA_RELATIVE="data/caddy/pki/authorities/local/root.crt"
+readonly CADDY_ROOT_KEY_RELATIVE="data/caddy/pki/authorities/local/root.key"
+readonly RUNTIME_DIR="/run/vaultwarden-appliance"
+readonly RESTORE_MOUNTPOINT="${RUNTIME_DIR}/restore-media"
+readonly BACKUP_SERVICE="vaultwarden-appliance-backup.service"
+readonly BACKUP_TIMER="vaultwarden-appliance-backup.timer"
+readonly MDNS_SERVICE="vaultwarden-appliance-mdns.service"
+readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
+readonly RESTORE_CONFIRMATION="RESTORE VAULTWARDEN"
+readonly RESTORE_SPACE_OVERHEAD_BYTES=$((64 * 1024 * 1024))
+
+RESTORE_TOPOLOGY=""
+RESTORE_PROTECTED_DISKS=""
+RESTORE_USB_DEVICE=""
+RESTORE_USB_DISK=""
+RESTORE_USB_UUID=""
+RESTORE_USB_MOUNT=""
+RESTORE_MOUNTED_BY_APPLIANCE=0
+RESTORE_MOUNTPOINT_CREATED=0
+RESTORE_WORK_DIR=""
+RESTORE_STAGED_ARCHIVE=""
+RESTORE_SOURCE_ARCHIVE=""
+RESTORE_SOURCE_KIND=""
+RESTORE_SOURCE_HASH=""
+RESTORE_SELECTED_USB_UUID=""
+RESTORE_TIMER_ENABLED=0
+RESTORE_TIMER_ACTIVE=0
+RESTORE_TIMER_CHANGED=0
+RESTORE_MDNS_WAS_ACTIVE=0
+RESTORE_MDNS_STOPPED=0
+RESTORE_VAULTWARDEN_WAS_RUNNING=0
+RESTORE_CADDY_WAS_RUNNING=0
+RESTORE_DATA_REPLACEMENT_STARTED=0
+RESTORE_NEW_DATA_DIRECTORY=""
+RESTORE_CONFIG_TEMP_FILES=()
+RESTORE_HOSTNAME=""
+RESTORE_SIGNUP_ALLOWED=""
+RESTORE_BACKUP_DEVICE_STATE=""
+
+declare -a RESTORE_GENERATION_SOURCE=()
+declare -a RESTORE_GENERATION_PATH=()
+declare -a RESTORE_GENERATION_NAME=()
+declare -A RESTORE_MANIFEST=()
+
+restore_info() { printf '[INFO] %s\n' "$*"; }
+restore_error() { printf 'Error: %s\n' "$*" >&2; }
+restore_die() { restore_error "$*"; exit 1; }
+
+restore_remove_work_directory() {
+    local directory=$1
+
+    [[ "${directory}" == "${RUNTIME_DIR}"/restore-work.* &&
+       -d "${directory}" && ! -L "${directory}" ]] || return 1
+    rm -rf -- "${directory}"
+}
+
+restore_resume_timer() {
+    (( RESTORE_TIMER_CHANGED == 1 )) || return 0
+    if (( RESTORE_TIMER_ENABLED == 1 )); then
+        systemctl enable "${BACKUP_TIMER}" >/dev/null 2>&1 || return 1
+    fi
+    if (( RESTORE_TIMER_ACTIVE == 1 )); then
+        systemctl start "${BACKUP_TIMER}" >/dev/null 2>&1 || return 1
+    fi
+    RESTORE_TIMER_CHANGED=0
+}
+
+restore_cleanup() {
+    local original_status=$1
+    local final_status=${original_status}
+
+    trap - EXIT INT TERM
+    if ! restore_resume_timer; then
+        restore_error "Unable to restore the previous automatic-backup timer state."
+        final_status=1
+    fi
+    if (( original_status != 0 && RESTORE_DATA_REPLACEMENT_STARTED == 0 )); then
+        if (( RESTORE_VAULTWARDEN_WAS_RUNNING == 1 )); then
+            restore_compose start vaultwarden >/dev/null 2>&1 || final_status=1
+        fi
+        if (( RESTORE_CADDY_WAS_RUNNING == 1 )); then
+            restore_compose start caddy >/dev/null 2>&1 || final_status=1
+        fi
+        if (( RESTORE_MDNS_WAS_ACTIVE == 1 && RESTORE_MDNS_STOPPED == 1 )); then
+            systemctl start "${MDNS_SERVICE}" >/dev/null 2>&1 || final_status=1
+        fi
+    fi
+    if (( RESTORE_MOUNTED_BY_APPLIANCE == 1 )); then
+        if umount -- "${RESTORE_USB_MOUNT}"; then
+            RESTORE_MOUNTED_BY_APPLIANCE=0
+        else
+            restore_error "Unable to unmount the read-only backup medium."
+            final_status=1
+        fi
+    fi
+    if [[ -n "${RESTORE_WORK_DIR}" && -d "${RESTORE_WORK_DIR}" ]]; then
+        restore_remove_work_directory "${RESTORE_WORK_DIR}" || {
+            restore_error "Unable to remove sensitive restore staging data."
+            final_status=1
+        }
+    fi
+    if [[ -n "${RESTORE_NEW_DATA_DIRECTORY}" &&
+          "${RESTORE_NEW_DATA_DIRECTORY}" == "${DATA_DIR}"/.restore-new-* &&
+          -d "${RESTORE_NEW_DATA_DIRECTORY}" &&
+          ! -L "${RESTORE_NEW_DATA_DIRECTORY}" ]]; then
+        rm -rf -- "${RESTORE_NEW_DATA_DIRECTORY}" || final_status=1
+    fi
+    for candidate in "${RESTORE_CONFIG_TEMP_FILES[@]}"; do
+        [[ "${candidate}" == "${INSTALL_DIR}"/.restore-* ]] || continue
+        if [[ -e "${candidate}" || -L "${candidate}" ]]; then
+            [[ -f "${candidate}" && ! -L "${candidate}" ]] || {
+                final_status=1
+                continue
+            }
+            rm -f -- "${candidate}" || final_status=1
+        fi
+    done
+    if (( RESTORE_MOUNTPOINT_CREATED == 1 )) &&
+       [[ -d "${RESTORE_MOUNTPOINT}" && ! -L "${RESTORE_MOUNTPOINT}" ]]; then
+        rmdir -- "${RESTORE_MOUNTPOINT}" 2>/dev/null || true
+    fi
+    exit "${final_status}"
+}
+
+restore_require_environment() {
+    local command
+    local local_backup_permissions
+
+    (( EUID == 0 )) || restore_die "Restore must run as root through sudo vwctl restore."
+    [[ -d "${INSTALL_DIR}" && ! -L "${INSTALL_DIR}" ]] || \
+        restore_die "The appliance installation directory is missing or unsafe."
+    [[ -f "${APPLIANCE_MARKER}" && ! -L "${APPLIANCE_MARKER}" ]] || \
+        restore_die "The appliance marker is missing or unsafe."
+    grep -Fxq 'Vaultwarden Appliance' "${APPLIANCE_MARKER}" || \
+        restore_die "The appliance marker is not recognized."
+    for path in "${APPLIANCE_VERSION_FILE}" "${ACCESS_FILE}" "${BASE_COMPOSE_FILE}" \
+        "${CADDY_COMPOSE_FILE}" "${CADDYFILE}"; do
+        [[ -f "${path}" && ! -L "${path}" ]] || \
+            restore_die "Required appliance configuration is missing or unsafe: ${path}"
+    done
+    [[ -d "${DATA_DIR}" && ! -L "${DATA_DIR}" &&
+       -d "${LOCAL_BACKUP_DIR}" && ! -L "${LOCAL_BACKUP_DIR}" ]] || \
+        restore_die "The appliance data or local backup directory is missing or unsafe."
+    [[ "$(stat -c '%u' "${LOCAL_BACKUP_DIR}")" == 0 ]] || \
+        restore_die "The local backup directory is not root-owned."
+    local_backup_permissions=$(stat -c '%a' "${LOCAL_BACKUP_DIR}") || \
+        restore_die "Unable to inspect local backup directory permissions."
+    [[ "${local_backup_permissions}" =~ ^[0-7]{3,4}$ ]] || \
+        restore_die "The local backup directory permissions are invalid."
+    (( (8#${local_backup_permissions} & 8#002) == 0 )) || \
+        restore_die "The local backup directory is world-writable."
+    for command in docker lsblk findmnt readlink stat mount umount tar gzip sha256sum \
+        find install mktemp awk grep sort cp mv rm mkdir rmdir chmod systemctl curl \
+        timeout cut cmp date openssl od tr df avahi-resolve-host-name; do
+        command_exists "${command}" || \
+            restore_die "Required restore command '${command}' is unavailable. Rerun the installer."
+    done
+    docker info >/dev/null 2>&1 || restore_die "The Docker daemon is unavailable."
+    docker compose version >/dev/null 2>&1 || \
+        restore_die "Docker Compose v2 is unavailable as 'docker compose'."
+}
+
+restore_prepare_runtime_root() {
+    local owner
+    local permissions
+
+    if [[ ! -e "${RUNTIME_DIR}" && ! -L "${RUNTIME_DIR}" ]]; then
+        install -d -m 0700 "${RUNTIME_DIR}" || return 1
+    fi
+    [[ -d "${RUNTIME_DIR}" && ! -L "${RUNTIME_DIR}" ]] || return 1
+    owner=$(stat -c '%u' "${RUNTIME_DIR}") || return 1
+    permissions=$(stat -c '%a' "${RUNTIME_DIR}") || return 1
+    [[ "${owner}" == 0 && "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${permissions} & 8#022) == 0 ))
+}
+
+restore_read_current_backup_state() {
+    local owner
+    local permissions
+
+    [[ ! -e "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] && return 2
+    [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || return 1
+    owner=$(stat -c '%u' "${BACKUP_STATE_FILE}") || return 1
+    permissions=$(stat -c '%a' "${BACKUP_STATE_FILE}") || return 1
+    [[ "${owner}" == 0 && "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${permissions} & 8#022) == 0 )) || return 1
+    storage_read_backup_state "${BACKUP_STATE_FILE}"
+}
+
+restore_archive_name_is_managed() {
+    [[ "$1" =~ ${BACKUP_ARCHIVE_PATTERN} ]]
+}
+
+restore_checksum_hash() {
+    local archive=$1
+    local checksum="${archive}.sha256"
+    local directory=${archive%/*}
+    local filename=${archive##*/}
+
+    [[ -f "${archive}" && ! -L "${archive}" && -s "${archive}" &&
+       -f "${checksum}" && ! -L "${checksum}" ]] || return 1
+    restore_archive_name_is_managed "${filename}" || return 1
+    [[ "${directory}" != "${archive}" && -d "${directory}" && ! -L "${directory}" ]] || return 1
+    awk -v filename="${filename}" '
+        NR == 1 && length($1) == 64 && $1 ~ /^[0-9a-f]+$/ &&
+            ($2 == filename || $2 == "*" filename) {valid=1}
+        NR > 1 {valid=0}
+        END {exit !valid}
+    ' "${checksum}" || return 1
+    (cd -- "${directory}" && sha256sum --check --strict "${checksum##*/}") >/dev/null || return 1
+    awk 'NR == 1 {print $1}' "${checksum}"
+}
+
+restore_archive_members_are_safe() {
+    local archive=$1
+    local listing=$2
+    local types=$3
+    local member
+
+    LC_ALL=C tar --list --gzip --quoting-style=escape --file "${archive}" > "${listing}" || return 1
+    LC_ALL=C tar --list --verbose --numeric-owner --gzip --quoting-style=escape \
+        --file "${archive}" > "${types}" || return 1
+    [[ -s "${listing}" && -s "${types}" ]] || return 1
+    if awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" {exit 1}' "${types}"; then
+        :
+    else
+        return 2
+    fi
+    if [[ -n "$(sort "${listing}" | uniq -d)" ]]; then
+        return 3
+    fi
+    while IFS= read -r member || [[ -n "${member}" ]]; do
+        [[ -n "${member}" && "${member}" != /* && "${member}" != *\\* &&
+           "${member}" == "${ARCHIVE_ROOT}"/* ]] || return 4
+        [[ "${member}" != *'//'* && "${member}" != */./* &&
+           "${member}" != */. && "${member}" != *$'\r'* ]] || return 4
+        case "/${member}/" in
+            */../* ) return 4 ;;
+        esac
+    done < "${listing}"
+}
+
+restore_archive_payload_bytes() {
+    local types=$1
+
+    awk '
+        substr($0,1,1) == "-" || substr($0,1,1) == "d" {
+            if ($3 !~ /^[0-9]+$/) exit 1
+            total += $3
+            if (total > 9007199254740991) exit 1
+        }
+        END {
+            if (total < 0) exit 1
+            printf "%.0f\n", total
+        }
+    ' "${types}"
+}
+
+restore_staging_has_space() {
+    local types=$1
+    local available
+    local payload
+
+    payload=$(restore_archive_payload_bytes "${types}") || return 1
+    available=$(df --block-size=1 --output=avail "${RUNTIME_DIR}" 2>/dev/null |
+        awk 'NR == 2 {print $1}') || return 1
+    [[ "${payload}" =~ ^[0-9]+$ && "${available}" =~ ^[0-9]+$ ]] || return 1
+    (( available >= payload + RESTORE_SPACE_OVERHEAD_BYTES ))
+}
+
+restore_required_member() {
+    local listing=$1
+    local member=$2
+
+    [[ "$(grep -Fxc "${member}" "${listing}")" == "1" ]]
+}
+
+restore_verify_archive_structure() {
+    local archive=$1
+    local listing=$2
+    local types=$3
+    local required
+    local -a required_members=(
+        "${ARCHIVE_ROOT}/manifest"
+        "${ARCHIVE_ROOT}/vaultwarden/db.sqlite3"
+        "${ARCHIVE_ROOT}/appliance/.vaultwarden-appliance"
+        "${ARCHIVE_ROOT}/appliance/.appliance-version"
+        "${ARCHIVE_ROOT}/appliance/.caddy-access"
+        "${ARCHIVE_ROOT}/appliance/docker-compose.yml"
+        "${ARCHIVE_ROOT}/appliance/docker-compose.override.yml"
+        "${ARCHIVE_ROOT}/appliance/docker-compose.vwctl.yml"
+        "${ARCHIVE_ROOT}/appliance/Caddyfile"
+        "${ARCHIVE_ROOT}/caddy/${CADDY_ROOT_CA_RELATIVE}"
+        "${ARCHIVE_ROOT}/caddy/${CADDY_ROOT_KEY_RELATIVE}"
+    )
+
+    restore_archive_members_are_safe "${archive}" "${listing}" "${types}" || return 1
+    for required in "${required_members[@]}"; do
+        restore_required_member "${listing}" "${required}" || return 2
+    done
+}
+
+restore_extract_archive() {
+    local archive=$1
+    local destination=$2
+    local unexpected
+
+    [[ -d "${destination}" && ! -L "${destination}" ]] || return 1
+    tar --extract --gzip --file "${archive}" --directory "${destination}" \
+        --no-same-owner --no-same-permissions --delay-directory-restore || return 1
+    unexpected=$(find "${destination}" \( ! -type f ! -type d \) -print -quit) || return 1
+    [[ -z "${unexpected}" ]]
+}
+
+restore_manifest_value_is_safe() {
+    local value=$1
+
+    [[ -n "${value}" && ${#value} -le 512 && "${value}" != *$'\n'* &&
+       "${value}" != *$'\r'* && "${value}" != *'|'* ]]
+}
+
+restore_read_manifest() {
+    local manifest=$1
+    local key
+    local value
+    local extra
+    local -a required_keys=(
+        backup_schema appliance_version created_at_utc access_hostname signup_allowed
+        vaultwarden_image vaultwarden_version caddy_image caddy_version source_architecture
+        caddy_ca_included top_level_contents
+    )
+
+    RESTORE_MANIFEST=()
+    while IFS='=' read -r key value extra; do
+        [[ -z "${extra:-}" && "${key}" =~ ^[a-z_]+$ ]] || return 1
+        restore_manifest_value_is_safe "${value}" || return 1
+        [[ -z "${RESTORE_MANIFEST[${key}]+set}" ]] || return 1
+        case "${key}" in
+            backup_schema|appliance_version|created_at_utc|access_hostname|signup_allowed|vaultwarden_image|vaultwarden_version|caddy_image|caddy_version|source_architecture|caddy_ca_included|top_level_contents) ;;
+            *) return 1 ;;
+        esac
+        RESTORE_MANIFEST["${key}"]=${value}
+    done < "${manifest}"
+    for key in "${required_keys[@]}"; do
+        [[ -n "${RESTORE_MANIFEST[${key}]+set}" ]] || return 1
+    done
+    ((${#RESTORE_MANIFEST[@]} == ${#required_keys[@]})) || return 1
+    [[ "${RESTORE_MANIFEST[backup_schema]}" == "${BACKUP_SCHEMA}" ]] || return 2
+    [[ "${RESTORE_MANIFEST[created_at_utc]}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+    [[ "${RESTORE_MANIFEST[appliance_version]}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 1
+    [[ "${RESTORE_MANIFEST[source_architecture]}" =~ ^[A-Za-z0-9._+-]+$ ]] || return 1
+    validate_local_hostname "${RESTORE_MANIFEST[access_hostname]}" || return 1
+    [[ "${RESTORE_MANIFEST[signup_allowed]}" == true ||
+       "${RESTORE_MANIFEST[signup_allowed]}" == false ||
+       "${RESTORE_MANIFEST[signup_allowed]}" == unknown ]] || return 1
+    [[ "${RESTORE_MANIFEST[caddy_ca_included]}" == yes &&
+       "${RESTORE_MANIFEST[top_level_contents]}" == manifest,vaultwarden,caddy,appliance ]] || return 1
+}
+
+restore_signup_from_override() {
+    local override=$1
+    local -a values=()
+
+    mapfile -t values < <(awk '
+        /^[[:space:]]+SIGNUPS_ALLOWED:[[:space:]]+"(true|false)"[[:space:]]*$/ {
+            value=$0
+            sub(/^[^"]*"/, "", value)
+            sub(/".*$/, "", value)
+            print value
+        }
+    ' "${override}")
+    ((${#values[@]} == 1)) || return 1
+    printf '%s\n' "${values[0]}"
+}
+
+restore_sqlite_snapshot_is_valid() {
+    local snapshot=$1
+    local header
+
+    [[ -f "${snapshot}" && ! -L "${snapshot}" && -s "${snapshot}" ]] || return 1
+    header=$(od -An -tx1 -N16 "${snapshot}" 2>/dev/null | tr -d ' \n') || return 1
+    [[ "${header}" == 53514c69746520666f726d6174203300 ]]
+}
+
+restore_caddy_ca_pair_is_valid() {
+    local certificate=$1
+    local private_key=$2
+    local public_from_certificate="${RESTORE_WORK_DIR}/ca-certificate.pub"
+    local public_from_key="${RESTORE_WORK_DIR}/ca-private-key.pub"
+
+    [[ -f "${certificate}" && ! -L "${certificate}" && -s "${certificate}" &&
+       -f "${private_key}" && ! -L "${private_key}" && -s "${private_key}" ]] || return 1
+    openssl x509 -in "${certificate}" -pubkey -noout > "${public_from_certificate}" 2>/dev/null || return 1
+    openssl pkey -in "${private_key}" -pubout > "${public_from_key}" 2>/dev/null || return 1
+    cmp -s "${public_from_certificate}" "${public_from_key}"
+}
+
+restore_backed_compose_is_recognized() {
+    local appliance=$1
+    local base="${appliance}/docker-compose.yml"
+    local caddy="${appliance}/docker-compose.override.yml"
+
+    grep -Fxq '    image: vaultwarden/server:latest' "${base}" &&
+        grep -Fxq '    container_name: vaultwarden' "${base}" &&
+        grep -Fxq '      - ./data/vaultwarden:/data' "${base}" &&
+        grep -Fxq '    name: vaultwarden-appliance' "${base}" &&
+        ! grep -Eq '^[[:space:]]+ports:' "${base}" &&
+        grep -Fxq '    image: caddy:2' "${caddy}" &&
+        grep -Fxq '    container_name: caddy' "${caddy}" &&
+        grep -Fxq '      - "443:443/tcp"' "${caddy}" &&
+        grep -Fxq '      - ./data/caddy/data:/data' "${caddy}" &&
+        grep -Fxq '      - ./data/caddy/config:/config' "${caddy}" &&
+        grep -Fxq '      - appliance' "${caddy}" &&
+        [[ "$(grep -Ec '^[[:space:]]+- "?[0-9]+:[0-9]+(/tcp)?"?[[:space:]]*$' "${caddy}")" == 1 ]] &&
+        ! grep -Eq '(^|[^0-9])80(/|:|[^0-9]|$)' "${caddy}"
+}
+
+restore_validate_extracted_backup() {
+    local root=$1
+    local appliance="${root}/appliance"
+    local backed_access
+    local backed_caddy
+    local backed_signup
+    local unexpected
+
+    [[ -d "${root}" && ! -L "${root}" &&
+       -d "${root}/vaultwarden/data" && ! -L "${root}/vaultwarden/data" &&
+       -d "${root}/caddy/data" && ! -L "${root}/caddy/data" &&
+       -d "${root}/caddy/config" && ! -L "${root}/caddy/config" &&
+       -d "${appliance}" && ! -L "${appliance}" ]] || return 1
+    for path in \
+        "${root}/manifest" \
+        "${root}/vaultwarden/db.sqlite3" \
+        "${root}/caddy/${CADDY_ROOT_CA_RELATIVE}" \
+        "${root}/caddy/${CADDY_ROOT_KEY_RELATIVE}" \
+        "${appliance}/.vaultwarden-appliance" \
+        "${appliance}/.appliance-version" \
+        "${appliance}/.caddy-access" \
+        "${appliance}/docker-compose.yml" \
+        "${appliance}/docker-compose.override.yml" \
+        "${appliance}/docker-compose.vwctl.yml" \
+        "${appliance}/Caddyfile"; do
+        [[ -f "${path}" && ! -L "${path}" && -s "${path}" ]] || return 1
+    done
+    unexpected=$(find "${root}" \( ! -type f ! -type d \) -print -quit) || return 1
+    [[ -z "${unexpected}" ]] || return 1
+    [[ "$(<"${appliance}/.vaultwarden-appliance")" == 'Vaultwarden Appliance' ]] || return 1
+    [[ "$(<"${appliance}/.appliance-version")" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 1
+    restore_sqlite_snapshot_is_valid "${root}/vaultwarden/db.sqlite3" || return 1
+    restore_caddy_ca_pair_is_valid \
+        "${root}/caddy/${CADDY_ROOT_CA_RELATIVE}" \
+        "${root}/caddy/${CADDY_ROOT_KEY_RELATIVE}" || return 1
+    restore_backed_compose_is_recognized "${appliance}" || return 1
+    restore_read_manifest "${root}/manifest" || return $?
+    [[ "$(<"${appliance}/.appliance-version")" == "${RESTORE_MANIFEST[appliance_version]}" ]] || return 1
+    backed_access=$(read_access_hostname "${appliance}/.caddy-access") || return 1
+    backed_caddy=$(read_caddyfile_hostname "${appliance}/Caddyfile") || return 1
+    [[ "${backed_access}" == "${RESTORE_MANIFEST[access_hostname]}" &&
+       "${backed_caddy}" == "${RESTORE_MANIFEST[access_hostname]}" ]] || return 1
+    backed_signup=$(restore_signup_from_override "${appliance}/docker-compose.vwctl.yml") || return 1
+    if [[ "${RESTORE_MANIFEST[signup_allowed]}" == unknown ]]; then
+        RESTORE_SIGNUP_ALLOWED=${backed_signup}
+    else
+        [[ "${backed_signup}" == "${RESTORE_MANIFEST[signup_allowed]}" ]] || return 1
+        RESTORE_SIGNUP_ALLOWED=${backed_signup}
+    fi
+    RESTORE_HOSTNAME=${RESTORE_MANIFEST[access_hostname]}
+    RESTORE_BACKUP_DEVICE_STATE=""
+    if [[ -e "${appliance}/.backup-device" || -L "${appliance}/.backup-device" ]]; then
+        [[ -f "${appliance}/.backup-device" && ! -L "${appliance}/.backup-device" ]] || return 1
+        RESTORE_BACKUP_DEVICE_STATE=$(storage_read_backup_state "${appliance}/.backup-device") || return 1
+    fi
+}
+
+restore_generation_is_valid() {
+    local archive=$1
+    local temporary_root=${2:-${TMPDIR:-/tmp}}
+    local listing
+    local types
+
+    restore_checksum_hash "${archive}" >/dev/null || return 1
+    listing=$(mktemp "${temporary_root}/restore-list.XXXXXXXX") || return 1
+    types=$(mktemp "${temporary_root}/restore-types.XXXXXXXX") || {
+        rm -f -- "${listing}"
+        return 1
+    }
+    if restore_verify_archive_structure "${archive}" "${listing}" "${types}"; then
+        rm -f -- "${listing}" "${types}" || return 1
+        return 0
+    fi
+    rm -f -- "${listing}" "${types}" || true
+    return 1
+}
+
+restore_refresh_storage() {
+    local system_mounts
+
+    RESTORE_TOPOLOGY=$(storage_collect_topology) || return 1
+    system_mounts=$(storage_collect_system_mounts "${RESTORE_TOPOLOGY}") || return 1
+    RESTORE_PROTECTED_DISKS=$(storage_protected_disks_from_mounts \
+        "${RESTORE_TOPOLOGY}" "${system_mounts}") || return 1
+}
+
+restore_safe_media_tuple() {
+    local device=$1
+    local expected_uuid=$2
+    local actual_label
+    local actual_uuid
+    local disk
+    local filesystem
+    local type
+    local candidates
+    local disks_output
+    local -a disks=()
+
+    storage_valid_device_path "${device}" || return 1
+    type=$(storage_inventory_node_field "${RESTORE_TOPOLOGY}" "${device}" type) || return 1
+    [[ "${type}" == part ]] || return 1
+    filesystem=$(storage_lsblk_property "${device}" FSTYPE) || return 1
+    actual_label=$(storage_lsblk_property "${device}" LABEL) || return 1
+    actual_uuid=$(storage_lsblk_property "${device}" UUID) || return 1
+    [[ "${filesystem,,}" == exfat && "${actual_label}" == "${BACKUP_LABEL}" ]] || return 1
+    storage_valid_filesystem_uuid "${actual_uuid}" || return 1
+    [[ -z "${expected_uuid}" || "${actual_uuid}" == "${expected_uuid}" ]] || return 1
+    disks_output=$(storage_resolve_physical_disks "${RESTORE_TOPOLOGY}" "${device}") || return 1
+    mapfile -t disks <<<"${disks_output}"
+    ((${#disks[@]} == 1)) || return 1
+    disk=${disks[0]}
+    candidates=$(storage_candidate_disks "${RESTORE_TOPOLOGY}" "${RESTORE_PROTECTED_DISKS}") || return 1
+    grep -Fxq "${disk}" <<<"${candidates}" || return 1
+    printf '%s\n%s\n%s\n' "${device}" "${disk}" "${actual_uuid}"
+}
+
+restore_discover_unconfigured_media() {
+    local device
+    local tuple
+    local uuid
+    local -a fields=()
+    local -a tuples=()
+    local -A seen_uuid=()
+
+    while IFS= read -r device; do
+        [[ "$(storage_lsblk_property "${device}" LABEL || true)" == "${BACKUP_LABEL}" ]] || continue
+        tuple=$(restore_safe_media_tuple "${device}" "") || continue
+        mapfile -t fields <<<"${tuple}"
+        ((${#fields[@]} == 3)) || return 1
+        uuid=${fields[2]}
+        [[ -z "${seen_uuid[${uuid}]:-}" ]] || return 1
+        seen_uuid["${uuid}"]=1
+        tuples+=("${fields[0]}|${fields[1]}|${fields[2]}")
+    done < <(storage_inventory_nodes "${RESTORE_TOPOLOGY}")
+    ((${#tuples[@]} > 0)) || return 2
+    if ((${#tuples[@]} > 1)); then
+        printf 'Multiple safe VWBACKUP media were detected:\n'
+        for index in "${!tuples[@]}"; do
+            IFS='|' read -r device _ uuid <<<"${tuples[${index}]}"
+            printf '%d) %s (UUID %s)\n' "$((index + 1))" "${device}" "${uuid}"
+        done
+        printf 'Select backup medium [1-%d]: ' "${#tuples[@]}"
+        IFS= read -r selection || return 1
+        index=$(storage_selection_index "${selection}" "${#tuples[@]}") || return 1
+    else
+        index=0
+    fi
+    IFS='|' read -r RESTORE_USB_DEVICE RESTORE_USB_DISK RESTORE_USB_UUID <<<"${tuples[${index}]}"
+}
+
+restore_select_media() {
+    local state
+    local uuid
+    local lookup
+    local result
+    local -a fields=()
+
+    restore_refresh_storage || return 1
+    if state=$(restore_read_current_backup_state); then
+        uuid=${state%%|*}
+        if lookup=$(storage_lookup_configured_backup "${RESTORE_TOPOLOGY}" \
+            "${RESTORE_PROTECTED_DISKS}" "${uuid}" "${BACKUP_LABEL}"); then
+            mapfile -t fields <<<"${lookup}"
+            ((${#fields[@]} == 2)) || return 1
+            RESTORE_USB_DEVICE=${fields[0]}
+            RESTORE_USB_DISK=${fields[1]}
+            RESTORE_USB_UUID=${uuid}
+            return 0
+        else
+            result=$?
+            (( result == 2 )) || return 1
+        fi
+    else
+        result=$?
+        (( result == 2 )) || return 1
+    fi
+    restore_discover_unconfigured_media
+}
+
+restore_existing_mountpoint() {
+    local device=$1
+    local line
+    local options
+    local target
+    local -a matches=()
+
+    mapfile -t matches < <(findmnt --raw --noheadings --source "${device}" \
+        --output TARGET,OPTIONS 2>/dev/null || true)
+    ((${#matches[@]} > 0)) || return 1
+    ((${#matches[@]} == 1)) || return 2
+    line=${matches[0]}
+    target=${line%% *}
+    options=${line#* }
+    [[ "${target}" == /* && "${target}" != *' '* && "${target}" != *'\x'* &&
+       "${target}" != *$'\n'* && -d "${target}" && ! -L "${target}" ]] || return 2
+    [[ ",${options}," == *,ro,* && ",${options}," == *,nodev,* &&
+       ",${options}," == *,nosuid,* && ",${options}," == *,noexec,* ]] || return 2
+    printf '%s\n' "${target}"
+}
+
+restore_mountpoint_has_safe_options() {
+    local mountpoint=$1
+    local options
+
+    options=$(findmnt --raw --noheadings --target "${mountpoint}" --output OPTIONS 2>/dev/null) || return 1
+    [[ "${options}" != *$'\n'* && ",${options}," == *,ro,* &&
+       ",${options}," == *,nodev,* && ",${options}," == *,nosuid,* &&
+       ",${options}," == *,noexec,* ]]
+}
+
+restore_verify_mounted_media() {
+    local source
+    local uuid
+    local tuple
+    local -a fields=()
+
+    source=$(findmnt --raw --noheadings --target "${RESTORE_USB_MOUNT}" --output SOURCE 2>/dev/null) || return 1
+    [[ "${source}" == "${RESTORE_USB_DEVICE}" ]] || return 1
+    restore_mountpoint_has_safe_options "${RESTORE_USB_MOUNT}" || return 1
+    tuple=$(restore_safe_media_tuple "${RESTORE_USB_DEVICE}" "${RESTORE_USB_UUID}") || return 1
+    mapfile -t fields <<<"${tuple}"
+    [[ "${fields[0]}" == "${RESTORE_USB_DEVICE}" &&
+       "${fields[1]}" == "${RESTORE_USB_DISK}" &&
+       "${fields[2]}" == "${RESTORE_USB_UUID}" ]] || return 1
+    uuid=$(storage_lsblk_property "${RESTORE_USB_DEVICE}" UUID) || return 1
+    [[ "${uuid}" == "${RESTORE_USB_UUID}" ]]
+}
+
+restore_mount_media_read_only() {
+    local existing
+    local permissions
+    local result
+
+    if existing=$(restore_existing_mountpoint "${RESTORE_USB_DEVICE}"); then
+        RESTORE_USB_MOUNT=${existing}
+    else
+        result=$?
+        (( result == 1 )) || return 1
+        restore_prepare_runtime_root || return 1
+        if [[ ! -e "${RESTORE_MOUNTPOINT}" && ! -L "${RESTORE_MOUNTPOINT}" ]]; then
+            mkdir -m 0700 -- "${RESTORE_MOUNTPOINT}" || return 1
+            RESTORE_MOUNTPOINT_CREATED=1
+        fi
+        [[ -d "${RESTORE_MOUNTPOINT}" && ! -L "${RESTORE_MOUNTPOINT}" ]] || return 1
+        [[ "$(stat -c '%u' "${RESTORE_MOUNTPOINT}")" == 0 ]] || return 1
+        permissions=$(stat -c '%a' "${RESTORE_MOUNTPOINT}") || return 1
+        [[ "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+        (( (8#${permissions} & 8#022) == 0 )) || return 1
+        [[ -z "$(find "${RESTORE_MOUNTPOINT}" -mindepth 1 -maxdepth 1 -print -quit)" ]] || return 1
+        findmnt --mountpoint "${RESTORE_MOUNTPOINT}" >/dev/null 2>&1 && return 1
+        mount -o ro,nodev,nosuid,noexec -- "${RESTORE_USB_DEVICE}" "${RESTORE_MOUNTPOINT}" || return 1
+        RESTORE_USB_MOUNT=${RESTORE_MOUNTPOINT}
+        RESTORE_MOUNTED_BY_APPLIANCE=1
+    fi
+    restore_refresh_storage || return 1
+    restore_verify_mounted_media
+}
+
+restore_add_generations_from_directory() {
+    local source_kind=$1
+    local directory=$2
+    local archive
+    local candidate
+    local name
+
+    [[ -d "${directory}" && ! -L "${directory}" ]] || return 0
+    for candidate in "${directory}"/*; do
+        [[ -e "${candidate}" || -L "${candidate}" ]] || continue
+        name=${candidate##*/}
+        if restore_archive_name_is_managed "${name}" || {
+            [[ "${name}" == *.sha256 ]] && restore_archive_name_is_managed "${name%.sha256}"
+        }; then
+            [[ -f "${candidate}" && ! -L "${candidate}" ]] || return 1
+        fi
+    done
+    for archive in "${directory}"/vaultwarden-appliance-*.tar.gz; do
+        [[ -e "${archive}" || -L "${archive}" ]] || continue
+        restore_archive_name_is_managed "${archive##*/}" || continue
+        restore_generation_is_valid "${archive}" || continue
+        RESTORE_GENERATION_SOURCE+=("${source_kind}")
+        RESTORE_GENERATION_PATH+=("${archive}")
+        RESTORE_GENERATION_NAME+=("${archive##*/}")
+    done
+}
+
+restore_sort_generations() {
+    local index
+    local line
+    local -a records=()
+    local -a fields=()
+    local -a source=()
+    local -a path=()
+    local -a name=()
+
+    for index in "${!RESTORE_GENERATION_PATH[@]}"; do
+        records+=("${RESTORE_GENERATION_NAME[${index}]}|${RESTORE_GENERATION_SOURCE[${index}]}|${RESTORE_GENERATION_PATH[${index}]}")
+    done
+    while IFS= read -r line; do
+        IFS='|' read -r -a fields <<<"${line}"
+        ((${#fields[@]} == 3)) || return 1
+        name+=("${fields[0]}")
+        source+=("${fields[1]}")
+        path+=("${fields[2]}")
+    done < <(printf '%s\n' "${records[@]}" | sort -r)
+    RESTORE_GENERATION_NAME=("${name[@]}")
+    RESTORE_GENERATION_SOURCE=("${source[@]}")
+    RESTORE_GENERATION_PATH=("${path[@]}")
+}
+
+restore_format_generation_time() {
+    local generation_name=${1##*/}
+
+    restore_archive_name_is_managed "${generation_name}" || return 1
+    printf '%s-%s-%s %s:%s:%s UTC\n' \
+        "${generation_name:22:4}" "${generation_name:26:2}" "${generation_name:28:2}" \
+        "${generation_name:31:2}" "${generation_name:33:2}" "${generation_name:35:2}"
+}
+
+restore_choose_generation() {
+    local index
+    local selection
+
+    ((${#RESTORE_GENERATION_PATH[@]} > 0)) || \
+        restore_die "No valid Vaultwarden Appliance backup generations were found."
+    restore_sort_generations || restore_die "Unable to sort backup generations safely."
+    printf '\nAvailable backup generations with valid checksums and safe archive structure:\n\n'
+    for index in "${!RESTORE_GENERATION_PATH[@]}"; do
+        printf '%d) %-12s %s\n   File: %s\n' "$((index + 1))" \
+            "${RESTORE_GENERATION_SOURCE[${index}]}" \
+            "$(restore_format_generation_time "${RESTORE_GENERATION_NAME[${index}]}")" \
+            "${RESTORE_GENERATION_NAME[${index}]}"
+    done
+    printf '\nSelect backup generation [1-%d]: ' "${#RESTORE_GENERATION_PATH[@]}"
+    IFS= read -r selection || restore_die "Restore selection was cancelled."
+    index=$(storage_selection_index "${selection}" "${#RESTORE_GENERATION_PATH[@]}") || \
+        restore_die "Invalid backup selection; no changes were made."
+    RESTORE_SOURCE_ARCHIVE=${RESTORE_GENERATION_PATH[${index}]}
+    RESTORE_SOURCE_KIND=${RESTORE_GENERATION_SOURCE[${index}]}
+    if [[ "${RESTORE_SOURCE_KIND}" == USB* ]]; then
+        RESTORE_SELECTED_USB_UUID=${RESTORE_USB_UUID}
+    fi
+}
+
+restore_create_staging() {
+    restore_prepare_runtime_root || return 1
+    RESTORE_WORK_DIR=$(mktemp -d "${RUNTIME_DIR}/restore-work.XXXXXXXX") || return 1
+    [[ "${RESTORE_WORK_DIR}" == "${RUNTIME_DIR}"/restore-work.* &&
+       -d "${RESTORE_WORK_DIR}" && ! -L "${RESTORE_WORK_DIR}" ]] || return 1
+    chmod 0700 "${RESTORE_WORK_DIR}"
+    install -d -m 0700 "${RESTORE_WORK_DIR}/extract"
+}
+
+restore_validate_reconciliation() {
+    local caddy_candidate="${RESTORE_WORK_DIR}/reconciled-Caddyfile"
+    local override_candidate="${RESTORE_WORK_DIR}/reconciled-compose.yml"
+
+    write_caddyfile_to "${caddy_candidate}" "${RESTORE_HOSTNAME}" || return 1
+    write_vaultwarden_override_to "${override_candidate}" \
+        "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}" || return 1
+    docker compose \
+        --project-directory "${INSTALL_DIR}" \
+        -f "${BASE_COMPOSE_FILE}" \
+        -f "${CADDY_COMPOSE_FILE}" \
+        -f "${override_candidate}" \
+        config --quiet
+}
+
+restore_hostname_is_available() {
+    local current_ip
+    local resolved
+
+    current_ip=$(detect_ipv4_address) || return 1
+    resolved=$(mdns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
+    [[ -z "${resolved}" ]] && return 0
+    mdns_resolution_matches "${current_ip}" "${resolved}"
+}
+
+restore_stage_and_verify_selection() {
+    local filename=${RESTORE_SOURCE_ARCHIVE##*/}
+    local listing
+    local types
+
+    restore_create_staging || restore_die "Unable to create secure restore staging under ${RUNTIME_DIR}."
+    RESTORE_STAGED_ARCHIVE="${RESTORE_WORK_DIR}/${filename}"
+    install -m 0600 -- "${RESTORE_SOURCE_ARCHIVE}" "${RESTORE_STAGED_ARCHIVE}" || \
+        restore_die "Unable to stage the selected backup archive."
+    install -m 0600 -- "${RESTORE_SOURCE_ARCHIVE}.sha256" "${RESTORE_STAGED_ARCHIVE}.sha256" || \
+        restore_die "Unable to stage the selected backup checksum."
+    RESTORE_SOURCE_HASH=$(restore_checksum_hash "${RESTORE_STAGED_ARCHIVE}") || \
+        restore_die "The staged backup checksum is invalid."
+    listing="${RESTORE_WORK_DIR}/members"
+    types="${RESTORE_WORK_DIR}/types"
+    restore_verify_archive_structure "${RESTORE_STAGED_ARCHIVE}" "${listing}" "${types}" || \
+        restore_die "The selected archive has an unsafe or unsupported structure."
+    restore_staging_has_space "${types}" || \
+        restore_die "Insufficient free space under ${RUNTIME_DIR} for safe restore extraction."
+    restore_extract_archive "${RESTORE_STAGED_ARCHIVE}" "${RESTORE_WORK_DIR}/extract" || \
+        restore_die "The selected archive could not be extracted safely."
+    restore_validate_extracted_backup "${RESTORE_WORK_DIR}/extract/${ARCHIVE_ROOT}" || \
+        restore_die "The selected backup contents or manifest are invalid or unsupported."
+    restore_validate_reconciliation || \
+        restore_die "The selected backup state cannot be reconciled with the current appliance configuration."
+    restore_hostname_is_available || \
+        restore_die "The backed-up hostname is currently advertised by another LAN device."
+}
+
+restore_show_manifest() {
+    printf '\nSelected backup:\n'
+    printf '  File:                %s\n' "${RESTORE_SOURCE_ARCHIVE##*/}"
+    printf '  Source:              %s\n' "${RESTORE_SOURCE_KIND}"
+    printf '  Created (UTC):       %s\n' "${RESTORE_MANIFEST[created_at_utc]}"
+    printf '  Backup schema:       %s\n' "${RESTORE_MANIFEST[backup_schema]}"
+    printf '  Appliance version:   %s\n' "${RESTORE_MANIFEST[appliance_version]}"
+    printf '  Access hostname:     %s\n' "${RESTORE_HOSTNAME}"
+    printf '  Account registration:%s\n' " ${RESTORE_SIGNUP_ALLOWED}"
+    printf '  Source architecture: %s\n' "${RESTORE_MANIFEST[source_architecture]}"
+    printf '  Vaultwarden image:   %s\n' "${RESTORE_MANIFEST[vaultwarden_image]}"
+    printf '  Caddy image:         %s\n' "${RESTORE_MANIFEST[caddy_image]}"
+    printf '  Caddy CA:            included and key-pair verified\n'
+    printf '  SHA-256:             %s\n' "${RESTORE_SOURCE_HASH}"
+    printf '\nWARNING: Existing Vaultwarden Appliance data will be replaced.\n\n'
+    printf 'The selected backup has already been verified.\n\n'
+    printf 'Current local Vaultwarden data, configuration and Caddy CA data\n'
+    printf 'will be replaced by the selected backup.\n\n'
+    printf 'Existing local backup generations are preserved.\n'
+    printf 'No automatic pre-restore backup or rollback is performed.\n\n'
+    printf 'Kein Backup, keine Gnade.\n'
+    printf 'No backup, no mercy.\n\n'
+}
+
+restore_confirm() {
+    local answer
+
+    printf 'Type %s to continue: ' "${RESTORE_CONFIRMATION}"
+    IFS= read -r answer || return 1
+    [[ "${answer}" == "${RESTORE_CONFIRMATION}" ]]
+}
+
+restore_revalidate_source() {
+    local current_hash
+
+    if [[ "${RESTORE_SOURCE_KIND}" == USB* ]]; then
+        restore_refresh_storage || return 1
+        restore_verify_mounted_media || return 1
+    fi
+    current_hash=$(restore_checksum_hash "${RESTORE_SOURCE_ARCHIVE}") || return 1
+    [[ "${current_hash}" == "${RESTORE_SOURCE_HASH}" ]]
+}
+
+restore_compose() {
+    local -a arguments=(
+        --project-directory "${INSTALL_DIR}"
+        -f "${BASE_COMPOSE_FILE}"
+        -f "${CADDY_COMPOSE_FILE}"
+    )
+    if [[ -e "${VWCTL_COMPOSE_FILE}" ]]; then
+        [[ -f "${VWCTL_COMPOSE_FILE}" && ! -L "${VWCTL_COMPOSE_FILE}" ]] || return 1
+        arguments+=(-f "${VWCTL_COMPOSE_FILE}")
+    fi
+    docker compose "${arguments[@]}" "$@"
+}
+
+restore_record_and_stop_timer() {
+    systemctl is-enabled --quiet "${BACKUP_TIMER}" && RESTORE_TIMER_ENABLED=1 || true
+    systemctl is-active --quiet "${BACKUP_TIMER}" && RESTORE_TIMER_ACTIVE=1 || true
+    RESTORE_TIMER_CHANGED=1
+    systemctl stop "${BACKUP_TIMER}" "${BACKUP_SERVICE}" || return 1
+    if (( RESTORE_TIMER_ENABLED == 1 )); then
+        systemctl disable "${BACKUP_TIMER}" >/dev/null || return 1
+    fi
+}
+
+restore_stop_services() {
+    systemctl is-active --quiet "${MDNS_SERVICE}" && RESTORE_MDNS_WAS_ACTIVE=1 || true
+    container_is_running vaultwarden && RESTORE_VAULTWARDEN_WAS_RUNNING=1 || true
+    container_is_running caddy && RESTORE_CADDY_WAS_RUNNING=1 || true
+    restore_record_and_stop_timer || return 1
+    systemctl stop "${MDNS_SERVICE}" || return 1
+    RESTORE_MDNS_STOPPED=1
+    restore_compose stop caddy || return 1
+    restore_compose stop vaultwarden || return 1
+    ! container_is_running caddy && ! container_is_running vaultwarden
+}
+
+restore_safe_remove_old_directory() {
+    local directory=$1
+    local expected_prefix=$2
+
+    [[ "${directory}" == "${DATA_DIR}/${expected_prefix}".* &&
+       -d "${directory}" && ! -L "${directory}" ]] || return 1
+    rm -rf -- "${directory}"
+}
+
+restore_replace_data_directory() {
+    local target_name=$1
+    local source_directory=$2
+    local destination="${DATA_DIR}/${target_name}"
+    local new_directory
+    local old_directory="${DATA_DIR}/.restore-old-${target_name}.$$"
+
+    [[ "${target_name}" == vaultwarden || "${target_name}" == caddy ]] || return 1
+    [[ -d "${source_directory}" && ! -L "${source_directory}" &&
+       -d "${destination}" && ! -L "${destination}" ]] || return 1
+    [[ ! -e "${old_directory}" && ! -L "${old_directory}" ]] || return 1
+    new_directory=$(mktemp -d "${DATA_DIR}/.restore-new-${target_name}.XXXXXXXX") || return 1
+    RESTORE_NEW_DATA_DIRECTORY=${new_directory}
+    chmod 0700 "${new_directory}" || return 1
+    cp -a -- "${source_directory}/." "${new_directory}/" || return 1
+    [[ -z "$(find "${new_directory}" \( ! -type f ! -type d \) -print -quit)" ]] || return 1
+    mv -- "${destination}" "${old_directory}" || return 1
+    if ! mv -- "${new_directory}" "${destination}"; then
+        mv -- "${old_directory}" "${destination}" || true
+        return 1
+    fi
+    RESTORE_NEW_DATA_DIRECTORY=""
+    restore_safe_remove_old_directory "${old_directory}" ".restore-old-${target_name}"
+}
+
+restore_write_configuration() {
+    local root=$1
+    local access_candidate
+    local caddy_candidate
+    local override_candidate
+
+    access_candidate=$(mktemp "${INSTALL_DIR}/.restore-access.XXXXXXXX") || return 1
+    RESTORE_CONFIG_TEMP_FILES=("${access_candidate}")
+    caddy_candidate=$(mktemp "${INSTALL_DIR}/.restore-caddy.XXXXXXXX") || return 1
+    RESTORE_CONFIG_TEMP_FILES+=("${caddy_candidate}")
+    override_candidate=$(mktemp "${INSTALL_DIR}/.restore-compose.XXXXXXXX") || return 1
+    RESTORE_CONFIG_TEMP_FILES+=("${override_candidate}")
+    printf 'hostname=%s\n' "${RESTORE_HOSTNAME}" > "${access_candidate}" || return 1
+    chmod 0644 "${access_candidate}" || return 1
+    write_caddyfile_to "${caddy_candidate}" "${RESTORE_HOSTNAME}" || return 1
+    write_vaultwarden_override_to "${override_candidate}" \
+        "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}" || return 1
+    mv -f -- "${access_candidate}" "${ACCESS_FILE}" || return 1
+    mv -f -- "${caddy_candidate}" "${CADDYFILE}" || return 1
+    mv -f -- "${override_candidate}" "${VWCTL_COMPOSE_FILE}" || return 1
+    RESTORE_CONFIG_TEMP_FILES=()
+    [[ "${root}" == "${RESTORE_WORK_DIR}/extract/${ARCHIVE_ROOT}" ]]
+}
+
+restore_write_mdns_state() {
+    local current_ip
+    local candidate
+
+    current_ip=$(detect_ipv4_address) || return 1
+    candidate=$(mktemp "${INSTALL_DIR}/.restore-mdns.XXXXXXXX") || return 1
+    RESTORE_CONFIG_TEMP_FILES=("${candidate}")
+    printf '# Vaultwarden Appliance mDNS\nVAULTWARDEN_MDNS_HOSTNAME=%s\nVAULTWARDEN_MDNS_IPV4=%s\n' \
+        "${RESTORE_HOSTNAME}" "${current_ip}" > "${candidate}" || return 1
+    chmod 0644 "${candidate}" || return 1
+    install -m 0644 "${candidate}" "${MDNS_ENV_FILE}" || return 1
+    rm -f -- "${candidate}"
+    RESTORE_CONFIG_TEMP_FILES=()
+}
+
+restore_install_database_snapshot() {
+    local snapshot=$1
+    local destination="${VAULTWARDEN_DATA_DIR}/db.sqlite3"
+
+    [[ -f "${snapshot}" && ! -L "${snapshot}" && -s "${snapshot}" ]] || return 1
+    [[ -d "${VAULTWARDEN_DATA_DIR}" && ! -L "${VAULTWARDEN_DATA_DIR}" ]] || return 1
+    install -m 0600 -- "${snapshot}" "${destination}"
+    rm -f -- "${VAULTWARDEN_DATA_DIR}/db.sqlite3-wal" \
+        "${VAULTWARDEN_DATA_DIR}/db.sqlite3-shm"
+}
+
+restore_export_root_ca() {
+    local root_ca="${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}"
+
+    [[ -f "${root_ca}" && ! -L "${root_ca}" ]] || return 1
+    install -d -m 0755 "${INSTALL_DIR}/certs" || return 1
+    copy_public_certificate_atomic "${root_ca}" "${EXPORTED_ROOT_CA}" || return 1
+    cmp -s "${root_ca}" "${EXPORTED_ROOT_CA}"
+}
+
+restore_write_backup_state_after_success() {
+    local content
+    local candidate
+    local uuid=""
+
+    if [[ -n "${RESTORE_SELECTED_USB_UUID}" ]]; then
+        uuid=${RESTORE_SELECTED_USB_UUID}
+    elif [[ -n "${RESTORE_BACKUP_DEVICE_STATE}" ]]; then
+        uuid=${RESTORE_BACKUP_DEVICE_STATE%%|*}
+    fi
+    if [[ -z "${uuid}" ]]; then
+        if [[ -e "${BACKUP_STATE_FILE}" || -L "${BACKUP_STATE_FILE}" ]]; then
+            [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || return 1
+            rm -f -- "${BACKUP_STATE_FILE}" || return 1
+        fi
+        return 0
+    fi
+    content=$(storage_backup_state_content "${uuid}") || return 1
+    candidate=$(mktemp "${INSTALL_DIR}/.restore-backup-state.XXXXXXXX") || return 1
+    RESTORE_CONFIG_TEMP_FILES=("${candidate}")
+    printf '%s' "${content}" > "${candidate}" || return 1
+    chmod 0600 "${candidate}" || return 1
+    mv -f -- "${candidate}" "${BACKUP_STATE_FILE}" || return 1
+    RESTORE_CONFIG_TEMP_FILES=()
+}
+
+restore_verify_result() {
+    local root=$1
+    local expected_ca="${root}/caddy/${CADDY_ROOT_CA_RELATIVE}"
+    local vwctl_command="/usr/local/bin/vwctl"
+
+    [[ -f "${expected_ca}" && ! -L "${expected_ca}" ]] || return 1
+    container_is_running vaultwarden || return 1
+    container_is_running caddy || return 1
+    vaultwarden_domain_matches "${RESTORE_HOSTNAME}" || return 1
+    cmp -s "${expected_ca}" "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" || return 1
+    cmp -s "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" "${EXPORTED_ROOT_CA}" || return 1
+    if [[ -f "${SCRIPT_DIR}/../vwctl" && ! -L "${SCRIPT_DIR}/../vwctl" ]]; then
+        vwctl_command="${SCRIPT_DIR}/../vwctl"
+    fi
+    bash "${vwctl_command}" health
+}
+
+restore_apply() {
+    local root="${RESTORE_WORK_DIR}/extract/${ARCHIVE_ROOT}"
+
+    restore_stop_services || restore_die "Unable to stop appliance services cleanly; restore was not started."
+    RESTORE_DATA_REPLACEMENT_STARTED=1
+    restore_replace_data_directory vaultwarden "${root}/vaultwarden/data" || \
+        restore_die "Vaultwarden data replacement failed. No automatic rollback was attempted."
+    restore_install_database_snapshot "${root}/vaultwarden/db.sqlite3" || \
+        restore_die "Vaultwarden database snapshot installation failed. No automatic rollback was attempted."
+    restore_replace_data_directory caddy "${root}/caddy" || \
+        restore_die "Caddy data replacement failed. No automatic rollback was attempted."
+    restore_write_configuration "${root}" || \
+        restore_die "Appliance access configuration reconciliation failed."
+    restore_compose config --quiet || \
+        restore_die "The reconciled appliance Compose configuration is invalid."
+    restore_write_mdns_state || restore_die "mDNS state reconciliation failed."
+    restore_compose up -d vaultwarden || restore_die "Vaultwarden did not start after restore."
+    restore_compose up -d caddy || restore_die "Caddy did not start after restore."
+    restore_export_root_ca || restore_die "The restored public Caddy root CA could not be exported."
+    systemctl restart "${MDNS_SERVICE}" || restore_die "The appliance mDNS publisher did not restart."
+    RESTORE_MDNS_STOPPED=0
+    restore_verify_result "${root}" || \
+        restore_die "Post-restore appliance health verification failed. No automatic rollback was attempted."
+    restore_write_backup_state_after_success || \
+        restore_die "The restore succeeded, but backup-media state adoption failed."
+    restore_resume_timer || restore_die "The restore succeeded, but the automatic-backup timer state could not be restored."
+}
+
+restore_find_generations() {
+    local media_status
+
+    RESTORE_GENERATION_SOURCE=()
+    RESTORE_GENERATION_PATH=()
+    RESTORE_GENERATION_NAME=()
+    restore_add_generations_from_directory "Local" "${LOCAL_BACKUP_DIR}" || \
+        restore_die "The local backup directory contains an unsafe managed path."
+    if restore_select_media; then
+        restore_mount_media_read_only || \
+            restore_die "The backup medium could not be mounted or verified read-only."
+        restore_add_generations_from_directory \
+            "USB (${RESTORE_USB_DEVICE}, UUID ${RESTORE_USB_UUID})" \
+            "${RESTORE_USB_MOUNT}/backups" || \
+            restore_die "The USB backup directory contains an unsafe managed path."
+    else
+        media_status=$?
+        case "${media_status}" in
+            2) restore_info "No safe VWBACKUP USB medium is currently attached." ;;
+            *) restore_die "USB backup-media discovery failed closed because storage topology or state was unsafe." ;;
+        esac
+    fi
+}
+
+restore_main() {
+    umask 077
+    trap 'restore_cleanup $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf 'Vaultwarden Appliance restore\n\n'
+    restore_require_environment
+    restore_find_generations
+    restore_choose_generation
+    restore_stage_and_verify_selection
+    restore_show_manifest
+    if ! restore_confirm; then
+        restore_die "Confirmation did not match; no appliance data was modified."
+    fi
+    restore_revalidate_source || \
+        restore_die "The selected source changed or became unsafe after confirmation; no appliance data was modified."
+    restore_apply
+    printf '\nRestore completed successfully.\n'
+    printf '  HTTPS URL: https://%s\n' "${RESTORE_HOSTNAME}"
+    printf '  Caddy internal root CA: preserved from the selected backup\n'
+    printf '  Local backup generations: preserved\n'
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    (( $# == 0 )) || restore_die "Usage: restore"
+    restore_main
+fi

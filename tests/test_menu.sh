@@ -38,7 +38,7 @@ main_menu_count=$(grep -Fc 'Vaultwarden Appliance' <<<"${invalid_output}")
 expect_success "invalid selection redisplays the menu" test "${main_menu_count}" -ge 2
 
 submenu_output=$(interactive_menu <<'INPUT'
-5
+6
 0
 0
 INPUT
@@ -74,6 +74,18 @@ expect_success "non-root backup selection prints the exact sudo command" \
 expect_failure "non-root menu selection never invokes the mutating command" \
     grep -Fq 'ROOT_BYPASS' <<<"${root_output}"
 
+command_restore() { printf 'RESTORE_BYPASS\n'; }
+restore_root_output=$(interactive_menu <<'INPUT' 2>&1
+5
+
+0
+INPUT
+)
+expect_success "non-root restore selection prints the exact sudo command" \
+    grep -Fq 'sudo vwctl restore' <<<"${restore_root_output}"
+expect_failure "non-root menu selection never invokes restore" \
+    grep -Fq 'RESTORE_BYPASS' <<<"${restore_root_output}"
+
 command_version() { printf 'DIRECT_VERSION\n'; }
 expect_success "direct CLI dispatch remains unchanged" test "$(main version)" = DIRECT_VERSION
 help_output=$(main help)
@@ -83,7 +95,7 @@ expect_failure "help does not open the menu" grep -Fq '0) Exit' <<<"${help_outpu
 menu_is_root() { return 0; }
 command_usb() { printf 'USB_DISPATCH:%s\n' "$1"; }
 usb_setup_output=$(interactive_menu <<'INPUT'
-5
+6
 2
 
 0
@@ -101,7 +113,7 @@ expect_success "menu contains no duplicate ERASE USB confirmation" bash -c \
 
 command_update() { printf 'UPDATE_DISPATCHED\n'; }
 update_output=$(interactive_menu <<'INPUT'
-7
+8
 
 0
 INPUT
