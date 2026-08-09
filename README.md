@@ -1,369 +1,291 @@
-# vaultwarden-appliance
+# Vaultwarden Appliance
 
-Simple LAN-only Vaultwarden appliance with Caddy, local HTTPS, mDNS, `vwctl`,
-verified local backups, optional USB replication, and automatic retention.
-Restore remains a later phase.
+A LAN-only Vaultwarden appliance for Debian and Raspberry Pi OS using Docker,
+Caddy HTTPS, mDNS, simple `vwctl` management, and verified local-first backups.
 
-## Installation
+Restore is not yet considered complete or production-ready.
 
-Copy or clone the complete repository checkout to a supported Debian or 64-bit
-Raspberry Pi OS system, enter that directory, and run:
+## What it does
+
+- Runs the official Vaultwarden and Caddy images with Docker Compose.
+- Serves Vaultwarden as `https://vaultwarden.local` using Caddy's internal CA.
+- Advertises the local name with mDNS; no router or DNS changes are normally
+  required.
+- Publishes only Caddy on TCP port 443. Vaultwarden has no direct LAN port.
+- Provides an interactive `vwctl` menu and direct commands for administration.
+- Creates verified local backups and keeps the newest 7 generations.
+- Optionally copies backups to a safely initialized `VWBACKUP` USB filesystem
+  and keeps the newest 30 USB generations.
+- Runs the same verified backup automatically every day at 02:30 local time.
+- Provides a separate, deliberately destructive `remove.sh` uninstaller.
+
+The appliance does not configure public Internet access, public certificates,
+router settings, static addresses, or external backup services.
+
+## Requirements
+
+- Debian, Raspberry Pi OS, or a Debian-derived Linux system
+- ARM64/aarch64 or x86-64/amd64 CPU
+- At least 2 GiB free space for installation
+- Root access through `sudo`
+- A LAN with TCP port 443 available on the appliance host
+- Internet access for the initial source, package, and container downloads
+- An mDNS-capable client for `.local` name resolution
+
+The normal reference platform is 64-bit Raspberry Pi OS on ARM64. TCP port 80
+is not used or required.
+
+## Quick install
+
+The convenient installation path downloads the small bootstrap, which obtains
+the complete repository under `/opt/vaultwarden-appliance-src` and then runs
+the real installer:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/beroliv/vaultwarden-appliance/main/bootstrap.sh | sudo bash
+```
+
+The bootstrap installs Git only when it is missing. It adds the standard CA
+certificate bundle only when an HTTPS checkout requires it. It clones over
+HTTPS and does not duplicate installation logic from `install.sh`.
+
+Piping a script into a root shell is convenient but requires trusting its
+current contents; cryptographic release-signature verification is not yet
+implemented. To inspect everything first, use the manual path:
+
+```bash
+sudo apt update
+sudo apt install -y git
+
+git clone https://github.com/beroliv/vaultwarden-appliance.git
+cd vaultwarden-appliance
 sudo ./install.sh
 ```
 
-The installer performs system checks, can install Docker Engine and Docker
-Compose v2 from Docker's official Debian repository, and deploys the appliance
-under `/opt/vaultwarden`. A working existing Docker installation is reused
-without modification.
+The complete checkout is required. `install.sh` uses `lib/`, `libexec/`,
+`systemd/`, `VERSION`, `vwctl`, `mdns-publisher`, and other project helpers; do
+not download `install.sh` by itself.
 
-`install.sh` is not a remote bootstrap downloader. It requires the repository's
-`vwctl`, `mdns-publisher`, `VERSION`, `lib/`, `libexec/`, and `systemd/` files
-beside it.
+The installer checks the operating system, architecture, disk space, Docker,
+Docker Compose v2, TCP port 443, the LAN address, and any existing appliance.
+It can install Docker from Docker's official Debian repository when Docker is
+missing. A working Docker installation is reused without modification.
 
-The installer installs Debian's `avahi-daemon`, `avahi-utils`, and `libnss-mdns`
-packages when needed. On a fresh configuration it asks:
+## First use
 
-```text
-Local Vaultwarden name [vaultwarden.local]:
-```
+1. Run the installer and accept or adjust the proposed local hostname.
+2. Open `https://vaultwarden.local` from a client on the same LAN.
+3. Trust the exported Caddy root CA on every client that should accept the
+   appliance certificate.
+4. Run `vwctl` for the interactive menu.
+5. Run `vwctl health` for a read-only end-to-end check.
 
-The name must be a single valid label below `.local`. An appliance-managed
-systemd service uses `avahi-publish-address` to publish an explicit mapping from
-that name to the detected LAN IPv4 address, so the normal URL is:
+Account registration is enabled initially and the Vaultwarden admin panel is
+not configured.
 
-```text
-https://vaultwarden.local
-```
+mDNS and HTTPS trust are separate. mDNS resolves `vaultwarden.local` to the
+appliance's LAN address; it does not make the certificate trusted. The Caddy
+root CA establishes HTTPS trust; installing it does not configure mDNS. Both
+must work on a client.
 
-The appliance does not change the Raspberry Pi's system hostname or Avahi's
-global hostname and does not
-modify router, DNS, DHCP, static-IP, gateway, interface, or client hosts-file
-settings. If the requested mDNS name is already advertised by another device,
-the installer proposes an available alternative such as
-`vaultwarden-2.local`.
-
-Vaultwarden data is stored in `/opt/vaultwarden/data/vaultwarden` and has no
-host-published port. Caddy is the only LAN-facing container and publishes only
-TCP port 443. Its persistent data, including the internal CA, is stored below
-`/opt/vaultwarden/data/caddy`.
-
-Vaultwarden's external `DOMAIN` is managed as the same URL, for example
-`DOMAIN=https://vaultwarden.local`. The appliance stores `DOMAIN` and the
-current signup setting in `/opt/vaultwarden/docker-compose.vwctl.yml`.
-
-The selected local name is stored as human-readable, non-secret state in:
-
-```text
-/opt/vaultwarden/.caddy-access
-```
-
-## mDNS and certificate trust are separate
-
-mDNS makes `vaultwarden.local` resolve to the appliance's detected LAN address.
-The appliance publication names that address explicitly, so Docker bridge
-addresses are not published for the Vaultwarden name.
-It does not make the HTTPS certificate trusted. Every client must also trust
-Caddy's exported public root CA:
+The public root certificate is exported to:
 
 ```text
 /opt/vaultwarden/certs/caddy-root-ca.crt
 ```
 
-The private CA key is never exported. Installing the public root certificate
-does not configure mDNS, and mDNS resolution does not install the certificate.
-Both must work on a client for a trusted `https://vaultwarden.local` connection.
+The private CA key is never exported by certificate commands.
 
-mDNS is link-local multicast. It normally works only within the same LAN or
-subnet and can be blocked by guest-Wi-Fi isolation, VLAN boundaries, multicast
-filtering, VPNs, or client policy. Apple platforms include Bonjour support.
-Modern Android includes `.local` mDNS resolution, while older or vendor-modified
-devices and individual apps may vary. Windows application and policy behavior
-can vary; Bonjour-capable software may be needed on affected clients. Linux
-clients need working mDNS resolver integration, commonly `libnss-mdns` or an
-appropriately configured `systemd-resolved`.
-
-## Management
-
-The installer copies `vwctl` to `/usr/local/bin/vwctl`:
+## Common commands
 
 ```bash
 vwctl
-vwctl help
 vwctl status
 vwctl health
-vwctl logs [vaultwarden|caddy]
-sudo vwctl start
-sudo vwctl stop
-sudo vwctl update
+vwctl backup status
+sudo vwctl backup
 vwctl update check
-sudo vwctl restart
-sudo vwctl access
-sudo vwctl access hostname
-vwctl version
-vwctl signup status
-sudo vwctl signup on
-sudo vwctl signup off
-vwctl cert info
-sudo vwctl cert export
+sudo vwctl update
 vwctl usb status
 sudo vwctl usb setup
-sudo vwctl backup
-vwctl backup status
 ```
 
-Running `vwctl` without arguments opens a plain interactive administration
-menu suitable for SSH. It dispatches to the same command paths listed above;
-existing confirmations and root checks remain in force. The menu never invokes
-`sudo` automatically. Direct commands remain available and are recommended for
-scripts and automation. Restore is not included yet.
+Use `vwctl help` for the complete direct-command list. Running `vwctl` without
+arguments opens the terminal menu. The menu never invokes `sudo` automatically
+or bypasses an existing confirmation.
 
-`vwctl health` performs read-only checks of Docker, both containers and their
-ports/network, mDNS, HTTPS with the exported root CA, persistent public CA
-consistency, data directories, and free disk space. It reports every failed
-check and exits non-zero if the appliance is not healthy.
-
-`sudo vwctl start` starts existing appliance containers without unnecessarily
-recreating them and starts the appliance mDNS publisher. `sudo vwctl stop`
-stops both containers and that publisher without removing containers, the
-Docker network, persistent data, or Caddy CA data. Avahi itself remains
-running.
-
-`vwctl version` reads the appliance version installed from the repository's
-single `VERSION` file and reports available component versions or configured
-images. `vwctl update check` reads remote container manifest metadata without
-pulling an image or changing running containers; `sudo vwctl update` remains
-the command that applies updates. `vwctl cert info` reads the exported public
-root certificate and the live HTTPS leaf certificate. It never reads private
-keys.
-
-Immediately before `sudo vwctl update` pulls or changes images and containers,
-it reminds the administrator to have a current backup and asks
-`Continue? [y/N]`. Only a literal `y` or `Y` continues. The appliance does not
-check for a backup or create one automatically; backup responsibility remains
-with the administrator. `vwctl update check` stays read-only and does not ask.
-
-Read-only commands can run without `sudo` when the user has access to Docker.
-Commands that change appliance state require root and print the exact `sudo`
-command when invoked without it. The installer and all mutating `vwctl`
-commands use one non-blocking lock at
-`/run/lock/vaultwarden-appliance.lock`; a second operation fails clearly instead
-of waiting. Read-only commands do not take this lock.
-
-`sudo vwctl access` and `sudo vwctl access hostname` change only the local
-`.local` name. After validation, conflict detection, and confirmation, `vwctl`
-updates the explicit mDNS hostname-to-LAN-IP publication, regenerates the
-complete Caddyfile, updates Vaultwarden's `DOMAIN`, and rebuilds Caddy.
-Vaultwarden is recreated only when the effective `DOMAIN` changes. Persistent
-Vaultwarden data and Caddy data are not deleted, and the internal root CA hash
-must remain unchanged while Caddy obtains a new leaf certificate for the new
-hostname.
-
-Direct-IP HTTPS access is no longer supported.
-
-## Existing installations
-
-Reruns recognize `/opt/vaultwarden/.vaultwarden-appliance` and remain
-non-destructive. They reconcile missing appliance-owned files and containers,
-including a first installation interrupted during an image pull, while
-preserving Vaultwarden data and Caddy's persistent internal root CA. Existing
-installations also receive the managed `DOMAIN` setting when needed.
-
-Unknown `/opt/vaultwarden` directories without the appliance marker are left
-unchanged and are not adopted.
-
-Rerunning the installer refreshes the stored publication address from the
-current default-route LAN IPv4 address without changing the Linux system
-hostname or Avahi's global hostname. A remote device using the requested alias
-remains a conflict.
-
-The systemd service runs an appliance-owned wrapper around
-`avahi-publish-address -R --no-fail`. `-R` suppresses the reverse record when
-publishing an additional alias for the machine's already-published LAN address.
-The wrapper remains active with the publisher, confirms that the hostname
-resolves exclusively to the configured LAN IPv4 address, and turns an early
-successful publisher exit into a service failure.
-
-## Phase 5A/5B backup-media setup
-
-`vwctl usb status` performs read-only block-device discovery. It inspects the
-devices backing `/`, `/boot`, and `/boot/firmware` where present, follows
-partitions and supported device-mapper stacks to their complete physical disks,
-and marks every such disk as protected. Protection does not depend on whether
-the operating system boots from SD, USB SSD, USB flash storage, SATA, or NVMe.
-
-Other writable whole-disk devices are listed with available model, vendor,
-serial, size, transport, removable, partition, filesystem, and mount
-information. `TRAN=usb` is informative but is not required because some bridges
-do not report it reliably. Loop, RAM, zram, optical, and device-mapper pseudo
-devices are not selectable. If the system topology cannot be established
-safely, discovery fails closed and offers no device.
-
-`sudo vwctl usb setup` is destructive. It uses the global appliance operation
-lock and lets the administrator select only a number from the internally
-generated safe candidate list. The system disk is never numbered, and entering
-a `/dev/...` path is not accepted. The selected disk is identified by its
-major/minor number, exact size, serial/model/transport where available, and
-resolved kernel device path. The complete topology and identity are scanned
-again after selection, after the exact destructive confirmation, and immediately
-before each destructive step.
-
-The command displays mounted filesystems belonging to the selected simple disk
-layout. Only after the user types the exact `ERASE USB` text are
-those selected filesystems unmounted. It then replaces the partition table with
-GPT, creates one Microsoft Basic Data partition spanning the usable disk, and
-formats it as exFAT with label `VWBACKUP`. There is no default `y/N` confirmation
-and no attempt to restore erased data.
-
-After fresh verification of the GPT layout, exFAT label, UUID, unmounted state,
-and system-disk protection, the non-secret state is installed atomically at:
-
-```text
-/opt/vaultwarden/.backup-device
-```
-
-It contains the filesystem UUID and `VWBACKUP` label. `vwctl usb status` locates
-the medium by UUID rather than `/dev/sdX`, verifies its exFAT type and label,
-and safely resolves it to one real, non-system physical disk. A disconnected
-configured medium is reported normally. Phase 5B does not mount the filesystem,
-add an `/etc/fstab` entry, create a backup, restore data, schedule jobs, or
-implement retention.
-
-## Phase 5D local-first backup
-
-Create one backup with:
+Removal remains outside the menu:
 
 ```bash
-sudo vwctl backup
-```
-
-The command holds the global appliance operation lock and always creates and
-verifies the primary generation under `/opt/vaultwarden/backups` first. This
-directory is root-owned, group-readable by the standard `docker` administrator
-group, mode `0750`, and not world-writable. Archives and checksums are installed
-as `root:docker` mode `0640`. Backup staging remains root-only under `/run`.
-
-Generations use UTC filenames:
-
-```text
-vaultwarden-appliance-20260808-233000.tar.gz
-vaultwarden-appliance-20260808-233000.tar.gz.sha256
-```
-
-The archive has a predictable restore-oriented layout:
-
-```text
-vaultwarden-appliance-backup/
-├── manifest
-├── vaultwarden/
-│   ├── db.sqlite3
-│   └── data/
-├── caddy/
-└── appliance/
-```
-
-Vaultwarden's supported built-in `backup` command creates the consistent SQLite
-snapshot with `VACUUM INTO`; the live database, WAL, and SHM files are never
-copied blindly. Remaining persistent Vaultwarden files, selected appliance
-configuration, and complete persistent Caddy state are included. The archive is
-read-tested, required members are checked, and a SHA-256 checksum is created and
-verified before success. Filename collisions receive a numeric suffix; existing
-backups are never overwritten. Incomplete or invalid pairs are not counted as
-generations and are never selected by retention.
-
-The Caddy state includes the internal CA private key so a future restore can
-preserve client trust. Backups are not encrypted: possession of a local archive
-or USB medium can expose Vaultwarden data and the appliance's internal CA
-private key.
-
-After the new local archive and checksum have both passed checksum and archive
-integrity checks, the appliance keeps the newest 7 valid local generations.
-Only exact appliance archive/checksum pairs inside the managed backup directory
-can be removed. Unrelated files, directories, symlinks, incomplete pairs, and
-ambiguous names are preserved; retention fails closed. Older generations are
-never removed to make room before a new backup succeeds.
-
-USB is optional. With no configured medium, or with the configured medium
-disconnected, the local backup remains successful and replication is skipped.
-When the configured exFAT `VWBACKUP` medium is present and passes the existing
-UUID/topology/system-disk checks, the appliance copies the completed local pair
-through temporary filenames into its root-level `backups/` directory, flushes
-and verifies the copy, then keeps the newest 30 valid USB generations. It does
-not create a second archive. A configured-and-present USB copy or retention
-failure returns non-zero but never removes the successful local backup. A mount
-created by the appliance is unmounted; an existing safe mount is left intact.
-
-Automatic backups are enabled by `install.sh` through
-`vaultwarden-appliance-backup.timer`, scheduled every day at 02:30 local time
-with `Persistent=true`. Its one-shot service invokes `/usr/local/bin/vwctl
-backup`, so manual and scheduled runs use the same engine and global lock.
-
-Inspect backup state without changing or mounting storage:
-
-```bash
-vwctl backup status
-```
-
-It fully validates readable local generations. It reports configured USB
-identity and presence, but only counts USB generations when that medium is
-already mounted at one unique safe mountpoint; otherwise counts are shown as
-unavailable. It also shows timer enablement and available last/next-run data.
-The command normally works for an administrator whose current login session is
-in the `docker` group; `sudo vwctl backup status` may be used otherwise.
-
-The appliance does not implement Synology, Syncthing, rsync, SMB, NFS, cloud,
-S3, or remote SSH targets. Administrators may independently replicate
-`/opt/vaultwarden/backups/` with appropriately secured tools. Restore and backup
-encryption are not implemented yet.
-
-## Removal
-
-Verify a usable backup before removal, then run the separate repository script:
-
-```bash
+cd /opt/vaultwarden-appliance-src
 sudo ./remove.sh
 ```
 
-Removal is deliberately not available from `vwctl` or its interactive menu.
-The script requires the exact, case-sensitive confirmation
-`REMOVE VAULTWARDEN` and permanently deletes **all** local appliance state below
-`/opt/vaultwarden`, including Vaultwarden data, the Caddy internal CA and private
-keys, exported certificates, configuration, and local backup generations. There
-is no keep-data option.
+## Source checkout and installer reruns
 
-Only positively identified appliance containers, its Compose network, systemd
-units, and installed management files are removed. Docker, Docker Compose,
-Avahi, packages, Docker images, users, and group memberships remain unchanged.
-The uninstaller never mounts, unmounts, partitions, formats, or deletes from USB
-backup media; a configured `VWBACKUP` filesystem and its backups are preserved.
+The bootstrap stores its root-owned checkout at:
+
+```text
+/opt/vaultwarden-appliance-src
+```
+
+Running the bootstrap one-liner again validates that this directory is the
+expected HTTPS repository on branch `main`, is owned by root, is not
+world-writable, and has no local changes. It then performs a fast-forward-only
+update and reruns `install.sh`. An unexpected directory, remote, branch,
+ownership state, or modified checkout causes a clear abort; the bootstrap never
+uses `git reset --hard`.
+
+The equivalent manual source update is:
+
+```bash
+cd /opt/vaultwarden-appliance-src
+sudo git pull --ff-only origin main
+sudo ./install.sh
+```
+
+Installer reruns preserve Vaultwarden data, Caddy's persistent internal CA,
+local backups, and configured USB state. They reconcile missing
+appliance-owned files and containers where safe.
+
+A source update and a container update are different operations:
+
+- Bootstrap or `git pull --ff-only` updates appliance scripts and installer
+  source.
+- `sudo vwctl update` pulls and applies Vaultwarden and Caddy container images.
+
+The bootstrap never invokes `vwctl update` automatically.
+
+## Backups
+
+Every backup first creates a verified primary archive/checksum pair under:
+
+```text
+/opt/vaultwarden/backups
+```
+
+The appliance keeps the newest 7 valid local generations. If a configured
+`VWBACKUP` filesystem is present and passes its UUID, filesystem, topology, and
+system-disk checks, the completed local pair is copied and verified there. The
+newest 30 valid USB generations are retained.
+
+The automatic timer runs daily at 02:30 local system time and calls the same
+backup path as `sudo vwctl backup`. A missing or disconnected USB medium does
+not fail the primary local backup. A present but invalid or failed USB target
+is reported without deleting the successful local generation.
+
+Backups contain sensitive Vaultwarden data and persistent Caddy state,
+including internal CA private-key material needed to preserve client trust in a
+future restore. Local and USB backups are not encrypted and must be protected
+accordingly.
+
+External replication remains the administrator's responsibility. Tools such as
+Syncthing, rsync, NAS software, or other secure systems may independently copy
+`/opt/vaultwarden/backups/`, but they are not configured or managed by this
+appliance.
+
+## USB backup media
+
+`vwctl usb status` is read-only. It never mounts, unmounts, partitions, formats,
+or changes a disk.
+
+`sudo vwctl usb setup` is destructive. It lists only real whole physical disks
+that are not part of the running system. System-disk protection follows the
+actual backing topology for `/`, `/boot`, and `/boot/firmware`, regardless of
+whether the system uses SD, SSD, NVMe, SATA, or USB storage.
+
+The selected device is repeatedly revalidated before destructive steps. Setup
+continues only after the exact, case-sensitive confirmation:
+
+```text
+ERASE USB
+```
+
+It then creates one GPT partition with an exFAT filesystem labeled `VWBACKUP`.
+
+## Updates
+
+Before applying any update, make sure a current backup exists outside the
+system being updated.
 
 Kein Backup, keine Gnade. No backup, no mercy.
 
-## Basic verification
-
-After installation, a concise end-to-end check is:
+Update appliance source and management scripts:
 
 ```bash
-vwctl version
-vwctl status
-vwctl health
-vwctl cert info
-vwctl update check
-vwctl usb status
-vwctl backup status
-systemctl status vaultwarden-appliance-backup.timer
-systemctl is-active avahi-daemon
-systemctl is-active vaultwarden-appliance-mdns
-avahi-resolve-host-name -4 vaultwarden.local
-curl --cacert /opt/vaultwarden/certs/caddy-root-ca.crt \
-  https://vaultwarden.local/alive
-docker inspect vaultwarden --format '{{json .HostConfig.PortBindings}}'
-docker inspect caddy --format '{{json .HostConfig.PortBindings}}'
+cd /opt/vaultwarden-appliance-src
+sudo git pull --ff-only origin main
+sudo ./install.sh
 ```
 
-Use the actual hostname reported by `vwctl status` if a conflict-free
-alternative was selected. Phase 5B initializes explicitly selected backup
-media. Phase 5D uses local-first verified backups, optional USB copies, fixed
-7/30-generation retention, and the daily 02:30 timer. Restore is not implemented
-yet.
+Check and update Vaultwarden/Caddy container images:
+
+```bash
+vwctl update check
+sudo vwctl update
+```
+
+`vwctl update` asks for confirmation, preserves bind-mounted data and Caddy CA
+state, and does not update Debian or prune Docker images.
+
+## Certificates
+
+Caddy issues the local server certificate through its persistent internal CA.
+The public root certificate must be installed as trusted on each client.
+
+```bash
+vwctl cert info
+sudo vwctl cert export
+```
+
+`cert export` refreshes only the public certificate at
+`/opt/vaultwarden/certs/caddy-root-ca.crt`. It never exports private CA keys.
+
+## Removal
+
+Verify an external backup first, then run the separate source script:
+
+```bash
+cd /opt/vaultwarden-appliance-src
+sudo ./remove.sh
+```
+
+The exact confirmation `REMOVE VAULTWARDEN` permanently deletes all local
+appliance data, Caddy CA state, configuration, and local backup generations.
+There is no keep-data mode. USB backup media remains untouched. Docker, Docker
+Compose, Avahi, packages, images, users, and group membership remain installed.
+
+`remove.sh` deliberately leaves `/opt/vaultwarden-appliance-src` in place. After
+a successful uninstall, source cleanup is a separate explicit action:
+
+```bash
+sudo rm -rf -- /opt/vaultwarden-appliance-src
+```
+
+For a manual installation outside that path, run `remove.sh` from the complete
+checkout used for installation and remove that checkout separately if desired.
+
+Kein Backup, keine Gnade. No backup, no mercy.
+
+## Restore
+
+Restore is planned and remains final validation work. It is not implemented or
+considered production-ready until it has been tested end to end on a fresh
+Raspberry Pi. Keep independently verified backup copies and do not rely on an
+unimplemented appliance restore command.
+
+## Security and scope
+
+- The appliance is LAN-only and has no public Internet exposure feature.
+- Caddy is the only LAN-facing service and publishes only TCP port 443.
+- TCP port 80 is neither published nor required.
+- Vaultwarden's HTTP port is available only on the internal Docker network.
+- HTTPS uses Caddy's internal CA; Let's Encrypt and public ACME are out of scope.
+- Router, DHCP, static-IP, public DNS, and dynamic-DNS configuration are out of
+  scope.
+- Synology, cloud, S3, NAS, and other external backup integrations are not
+  included.
+- `VWBACKUP` USB media and backup archives are not encrypted.
+
+The appliance favors data safety, predictable behavior, transparent standard
+components, and narrowly scoped automation.
