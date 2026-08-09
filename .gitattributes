@@ -1,0 +1,2 @@
+# Normalize text files and keep Linux-oriented project files on LF everywhere.
+* text=auto eol=lf
