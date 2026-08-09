@@ -89,6 +89,7 @@ appropriately configured `systemd-resolved`.
 The installer copies `vwctl` to `/usr/local/bin/vwctl`:
 
 ```bash
+vwctl
 vwctl help
 vwctl status
 vwctl health
@@ -111,6 +112,12 @@ sudo vwctl usb setup
 sudo vwctl backup
 vwctl backup status
 ```
+
+Running `vwctl` without arguments opens a plain interactive administration
+menu suitable for SSH. It dispatches to the same command paths listed above;
+existing confirmations and root checks remain in force. The menu never invokes
+`sudo` automatically. Direct commands remain available and are recommended for
+scripts and automation. Restore is not included yet.
 
 `vwctl health` performs read-only checks of Docker, both containers and their
 ports/network, mDNS, HTTPS with the exported root CA, persistent public CA

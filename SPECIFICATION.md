@@ -464,6 +464,13 @@ to `/usr/local/bin/vwctl` with executable permissions. Read-only commands work
 without `sudo` when the user can access Docker. Mutating commands require root
 and print the corresponding `sudo vwctl ...` command instead of invoking sudo.
 
+Running `vwctl` without arguments opens a plain Bash interactive menu for
+administration over a terminal or SSH session. The menu is only a UI layer over
+the existing command functions: it adds no automatic sudo, dependency, or
+confirmation bypass. `0` exits or returns from submenus, invalid input loops,
+and EOF exits cleanly. Direct commands and `vwctl help` remain unchanged;
+direct commands are the supported interface for scripts and automation.
+
 The installer and every mutating `vwctl` command use the same non-blocking,
 root-owned runtime lock at `/run/lock/vaultwarden-appliance.lock`. If another
 operation holds it, the new operation fails clearly without waiting. The lock
@@ -492,7 +499,9 @@ vwctl cert info
 sudo vwctl cert export
 ```
 
-Backup and restore commands remain future phases.
+Phase 5C and Phase 5D add the existing `sudo vwctl backup` and read-only
+`vwctl backup status` paths. Restore remains deliberately unimplemented and is
+not presented in the interactive menu.
 
 Phase 5A adds read-only block-device discovery. Phase 5B turns the setup command
 into explicit destructive backup-media initialization:
