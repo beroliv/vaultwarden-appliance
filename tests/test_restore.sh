@@ -437,6 +437,119 @@ else
     pass "direct non-root restore process test requires a non-root test runner"
 fi
 
+readiness_immediately_available() (
+    local sleep_marker="${temporary_dir}/unexpected-readiness-sleep"
+
+    SECONDS=0
+    detect_ipv4_address() { printf '192.168.0.192\n'; }
+    container_is_running() { return 0; }
+    systemctl() { return 0; }
+    mdns_ready_file_matches() { return 0; }
+    mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
+    restore_https_alive_is_ready() { return 0; }
+    sleep() { printf 'called\n' > "${sleep_marker}"; }
+    restore_wait_for_post_restore_readiness 5 1 && [[ ! -e "${sleep_marker}" ]]
+)
+expect_success "immediately ready services incur no readiness delay" readiness_immediately_available
+
+readiness_mdns_delayed() (
+    local mdns_attempts=0
+
+    SECONDS=0
+    detect_ipv4_address() { printf '192.168.0.192\n'; }
+    container_is_running() { return 0; }
+    systemctl() {
+        if [[ "${3:-}" == "${MDNS_SERVICE}" ]]; then
+            mdns_attempts=$((mdns_attempts + 1))
+            (( mdns_attempts >= 3 ))
+            return
+        fi
+        return 0
+    }
+    mdns_ready_file_matches() { return 0; }
+    mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
+    restore_https_alive_is_ready() { return 0; }
+    sleep() { SECONDS=$((SECONDS + $1)); }
+    restore_wait_for_post_restore_readiness 6 1 && (( mdns_attempts == 3 ))
+)
+expect_success "mDNS becoming ready after several polls succeeds" readiness_mdns_delayed
+
+readiness_https_delayed() (
+    local https_attempts=0
+
+    SECONDS=0
+    detect_ipv4_address() { printf '192.168.0.192\n'; }
+    container_is_running() { return 0; }
+    systemctl() { return 0; }
+    mdns_ready_file_matches() { return 0; }
+    mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
+    restore_https_alive_is_ready() {
+        https_attempts=$((https_attempts + 1))
+        (( https_attempts >= 3 ))
+    }
+    sleep() { SECONDS=$((SECONDS + $1)); }
+    restore_wait_for_post_restore_readiness 6 1 && (( https_attempts == 3 ))
+)
+expect_success "HTTPS becoming ready after several polls succeeds" readiness_https_delayed
+
+readiness_mdns_and_https_delayed() (
+    local https_attempts=0
+    local mdns_attempts=0
+
+    SECONDS=0
+    detect_ipv4_address() { printf '192.168.0.192\n'; }
+    container_is_running() { return 0; }
+    systemctl() {
+        if [[ "${3:-}" == "${MDNS_SERVICE}" ]]; then
+            mdns_attempts=$((mdns_attempts + 1))
+            (( mdns_attempts >= 3 ))
+            return
+        fi
+        return 0
+    }
+    mdns_ready_file_matches() { return 0; }
+    mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
+    restore_https_alive_is_ready() {
+        https_attempts=$((https_attempts + 1))
+        (( https_attempts >= 3 ))
+    }
+    sleep() { SECONDS=$((SECONDS + $1)); }
+    restore_wait_for_post_restore_readiness 8 1 &&
+        (( mdns_attempts >= 5 && https_attempts == 3 ))
+)
+expect_success "combined delayed mDNS and HTTPS readiness succeeds" readiness_mdns_and_https_delayed
+
+readiness_never_available() (
+    SECONDS=0
+    detect_ipv4_address() { printf '192.168.0.192\n'; }
+    container_is_running() { return 0; }
+    systemctl() {
+        [[ "${3:-}" != "${MDNS_SERVICE}" ]]
+    }
+    sleep() { SECONDS=$((SECONDS + $1)); }
+    restore_wait_for_post_restore_readiness 3 1
+)
+expect_failure "readiness timeout is bounded and non-zero" readiness_never_available
+
+successful_apply_runs_readiness_before_health() (
+    RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
+    restore_stop_services() { return 0; }
+    restore_replace_data_directory() { return 0; }
+    restore_install_database_snapshot() { return 0; }
+    restore_write_configuration() { return 0; }
+    restore_compose() { return 0; }
+    restore_write_mdns_state() { return 0; }
+    restore_export_root_ca() { return 0; }
+    systemctl() { return 0; }
+    restore_wait_for_post_restore_readiness() { printf 'READINESS\n'; }
+    restore_verify_result() { printf 'HEALTH\n'; }
+    restore_write_backup_state_after_success() { return 0; }
+    restore_resume_timer() { return 0; }
+    restore_apply
+)
+expect_equal "authoritative health runs after readiness succeeds" \
+    $'READINESS\nHEALTH' "$(successful_apply_runs_readiness_before_health)"
+
 simulated_health_failure() (
     RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
     restore_stop_services() { return 0; }
@@ -447,11 +560,31 @@ simulated_health_failure() (
     restore_write_mdns_state() { return 0; }
     restore_export_root_ca() { return 0; }
     systemctl() { return 0; }
+    restore_wait_for_post_restore_readiness() { return 0; }
     restore_verify_result() { return 1; }
     restore_die() { exit 1; }
     restore_apply
 )
 expect_failure "post-restore health failure returns non-zero" simulated_health_failure
+
+simulated_readiness_failure() (
+    RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
+    restore_stop_services() { return 0; }
+    restore_replace_data_directory() { return 0; }
+    restore_install_database_snapshot() { return 0; }
+    restore_write_configuration() { return 0; }
+    restore_compose() { return 0; }
+    restore_write_mdns_state() { return 0; }
+    restore_export_root_ca() { return 0; }
+    systemctl() { return 0; }
+    restore_wait_for_post_restore_readiness() { return 1; }
+    restore_verify_result() { printf 'unexpected health\n' > "${temporary_dir}/health-after-timeout"; }
+    restore_die() { exit 1; }
+    restore_apply
+)
+expect_failure "restore fails non-zero when readiness is never reached" simulated_readiness_failure
+expect_failure "authoritative health is not run after readiness timeout" \
+    test -e "${temporary_dir}/health-after-timeout"
 
 expect_success "vwctl exposes the root-only restore command" grep -Fq 'sudo vwctl restore' "${REPO_DIR}/vwctl"
 expect_success "vwctl restore uses the global operation lock" bash -c \

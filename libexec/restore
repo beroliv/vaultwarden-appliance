@@ -51,8 +51,11 @@ readonly BACKUP_SERVICE="vaultwarden-appliance-backup.service"
 readonly BACKUP_TIMER="vaultwarden-appliance-backup.timer"
 readonly MDNS_SERVICE="vaultwarden-appliance-mdns.service"
 readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
+readonly MDNS_READY_FILE="/run/vaultwarden-appliance-mdns/ready"
 readonly RESTORE_CONFIRMATION="RESTORE VAULTWARDEN"
 readonly RESTORE_SPACE_OVERHEAD_BYTES=$((64 * 1024 * 1024))
+readonly RESTORE_READINESS_TIMEOUT=60
+readonly RESTORE_READINESS_RETRY_INTERVAL=2
 
 RESTORE_TOPOLOGY=""
 RESTORE_PROTECTED_DISKS=""
@@ -81,6 +84,7 @@ RESTORE_CONFIG_TEMP_FILES=()
 RESTORE_HOSTNAME=""
 RESTORE_SIGNUP_ALLOWED=""
 RESTORE_BACKUP_DEVICE_STATE=""
+RESTORE_READINESS_LAST_HTTPS_ERROR=""
 
 declare -a RESTORE_GENERATION_SOURCE=()
 declare -a RESTORE_GENERATION_PATH=()
@@ -1063,6 +1067,64 @@ restore_write_backup_state_after_success() {
     RESTORE_CONFIG_TEMP_FILES=()
 }
 
+restore_https_alive_is_ready() {
+    [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || return 1
+
+    RESTORE_READINESS_LAST_HTTPS_ERROR=""
+    if RESTORE_READINESS_LAST_HTTPS_ERROR=$(curl --fail --silent --show-error \
+        --connect-timeout 3 \
+        --max-time 5 \
+        --noproxy '*' \
+        --cacert "${EXPORTED_ROOT_CA}" \
+        --connect-to "${RESTORE_HOSTNAME}:443:127.0.0.1:443" \
+        --output /dev/null \
+        "https://${RESTORE_HOSTNAME}/alive" 2>&1); then
+        RESTORE_READINESS_LAST_HTTPS_ERROR=""
+        return 0
+    fi
+    return 1
+}
+
+restore_post_restore_conditions_are_ready() {
+    local expected_ip=$1
+    local resolved
+
+    container_is_running vaultwarden || return 1
+    container_is_running caddy || return 1
+    systemctl is-active --quiet avahi-daemon.service || return 1
+    systemctl is-active --quiet "${MDNS_SERVICE}" || return 1
+    mdns_ready_file_matches "${MDNS_READY_FILE}" "${RESTORE_HOSTNAME}" "${expected_ip}" || return 1
+    resolved=$(mdns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
+    mdns_resolution_matches "${expected_ip}" "${resolved}" || return 1
+    restore_https_alive_is_ready
+}
+
+restore_wait_for_post_restore_readiness() {
+    local timeout_seconds=${1:-${RESTORE_READINESS_TIMEOUT}}
+    local retry_interval=${2:-${RESTORE_READINESS_RETRY_INTERVAL}}
+    local deadline
+    local expected_ip
+
+    [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ &&
+       "${retry_interval}" =~ ^[1-9][0-9]*$ ]] || return 1
+    expected_ip=$(detect_ipv4_address) || return 1
+    deadline=$((SECONDS + timeout_seconds))
+
+    while :; do
+        if restore_post_restore_conditions_are_ready "${expected_ip}"; then
+            return 0
+        fi
+        (( SECONDS >= deadline )) && break
+        sleep "${retry_interval}"
+    done
+
+    restore_error "Post-restore service readiness was not reached within ${timeout_seconds} seconds."
+    if [[ -n "${RESTORE_READINESS_LAST_HTTPS_ERROR}" ]]; then
+        restore_error "Last HTTPS readiness error: ${RESTORE_READINESS_LAST_HTTPS_ERROR}"
+    fi
+    return 1
+}
+
 restore_verify_result() {
     local root=$1
     local expected_ca="${root}/caddy/${CADDY_ROOT_CA_RELATIVE}"
@@ -1101,6 +1163,9 @@ restore_apply() {
     restore_export_root_ca || restore_die "The restored public Caddy root CA could not be exported."
     systemctl restart "${MDNS_SERVICE}" || restore_die "The appliance mDNS publisher did not restart."
     RESTORE_MDNS_STOPPED=0
+    restore_wait_for_post_restore_readiness \
+        "${RESTORE_READINESS_TIMEOUT}" "${RESTORE_READINESS_RETRY_INTERVAL}" || \
+        restore_die "Post-restore service readiness failed. No automatic rollback was attempted."
     restore_verify_result "${root}" || \
         restore_die "Post-restore appliance health verification failed. No automatic rollback was attempted."
     restore_write_backup_state_after_success || \
