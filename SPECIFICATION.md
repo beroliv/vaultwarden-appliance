@@ -327,14 +327,19 @@ Vaultwarden container but MUST preserve its bind-mounted data.
 
 The installer copies `vwctl` to `/usr/local/bin/vwctl`. Read-only commands may
 run without root when the caller can access Docker. Mutating commands require
-root and print the corresponding `sudo vwctl ...` invocation rather than
-invoking `sudo` themselves.
+root. A direct non-root CLI invocation prints the corresponding `sudo vwctl ...`
+instruction rather than elevating itself.
 
 Running `vwctl` without arguments opens a terminal/SSH-friendly interactive
 menu. The menu is a UI over the same command functions used by direct commands.
 It MUST NOT bypass root checks, safety validation, or confirmations, and it MUST
-NOT invoke `sudo` automatically. Invalid choices loop, `0` returns or exits, and
-EOF exits cleanly. Direct commands remain the automation interface.
+remain unprivileged. When a user selects a mutating operation, the menu invokes
+only that operation through the normal system `sudo` command using the resolved
+`vwctl` program path and direct argv arguments. It MUST NOT use a shell command
+string, handle passwords, alter sudo policy, or invoke another argument-free
+menu. Sudo failure or cancellation reports that the operation was not performed
+and returns to the menu. Invalid choices loop, `0` returns or exits, and EOF
+exits cleanly. Direct commands remain the automation interface.
 
 Implemented commands are:
 
@@ -363,7 +368,8 @@ sudo vwctl restore
 ```
 
 Restore is also available from the interactive menu. The menu displays the
-same root instruction and does not invoke `sudo` itself.
+same workflow through a single-operation sudo child while preserving the exact
+restore confirmation and all restore safety checks.
 
 ### 11.1 Global operation lock
 

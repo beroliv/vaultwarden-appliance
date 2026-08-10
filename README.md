@@ -143,8 +143,10 @@ sudo vwctl usb setup
 ```
 
 Use `vwctl help` for the complete direct-command list. Running `vwctl` without
-arguments opens the terminal menu. The menu never invokes `sudo` automatically
-or bypasses an existing confirmation.
+arguments opens the unprivileged terminal menu. A selected mutating operation
+is launched directly as `sudo <vwctl-path> <command> ...`; only that operation
+is elevated, using the system's normal sudo authentication. The menu does not
+handle passwords and never bypasses an existing confirmation.
 
 Removal remains outside the menu:
 

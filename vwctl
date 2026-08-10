@@ -7,6 +7,15 @@ set -o pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly SCRIPT_DIR
+PROGRAM_PATH=$(readlink -f -- "${BASH_SOURCE[0]}") || {
+    printf 'Error: Unable to determine the vwctl program path.\n' >&2
+    exit 1
+}
+readonly PROGRAM_PATH
+[[ -f "${PROGRAM_PATH}" && ! -L "${PROGRAM_PATH}" ]] || {
+    printf 'Error: The vwctl program path is missing or unsafe.\n' >&2
+    exit 1
+}
 if [[ -f "${SCRIPT_DIR}/lib/common.sh" && ! -L "${SCRIPT_DIR}/lib/common.sh" ]]; then
     LIB_DIR="${SCRIPT_DIR}/lib"
 else
@@ -1996,15 +2005,25 @@ menu_run_command() {
 }
 
 menu_run_root_command() {
-    local command_text=$1
-    shift
+    local result=0
 
     if menu_is_root; then
-        menu_run_command "$@"
-    else
-        print_root_instruction "${command_text}"
-        menu_pause
+        menu_run_command main "$@"
+        return
     fi
+    if ! command_exists sudo; then
+        printf '\nPrivileged operation was not performed: sudo is unavailable.\n' >&2
+        menu_pause
+        return
+    fi
+    if sudo "${PROGRAM_PATH}" "$@"; then
+        :
+    else
+        result=$?
+        printf '\nPrivileged operation was not performed (sudo exited with status %d).\n' \
+            "${result}" >&2
+    fi
+    menu_pause
 }
 
 menu_usb() {
@@ -2016,7 +2035,7 @@ menu_usb() {
         menu_read_selection || return 1
         case "${MENU_SELECTION}" in
             1) menu_run_command command_usb status || return 1 ;;
-            2) menu_run_root_command "usb setup" command_usb setup || return 1 ;;
+            2) menu_run_root_command usb setup || return 1 ;;
             0) return 0 ;;
             *) printf 'Invalid selection.\n' ;;
         esac
@@ -2040,8 +2059,8 @@ menu_signup() {
         printf '0) Back\n\n'
         menu_read_selection || return 1
         case "${MENU_SELECTION}" in
-            1) menu_run_root_command "signup on" command_signup on || return 1 ;;
-            2) menu_run_root_command "signup off" command_signup off || return 1 ;;
+            1) menu_run_root_command signup on || return 1 ;;
+            2) menu_run_root_command signup off || return 1 ;;
             0) return 0 ;;
             *) printf 'Invalid selection.\n' ;;
         esac
@@ -2057,7 +2076,7 @@ menu_certificate() {
         menu_read_selection || return 1
         case "${MENU_SELECTION}" in
             1) menu_run_command command_cert_info || return 1 ;;
-            2) menu_run_root_command "cert export" command_cert_export || return 1 ;;
+            2) menu_run_root_command cert export || return 1 ;;
             0) return 0 ;;
             *) printf 'Invalid selection.\n' ;;
         esac
@@ -2106,17 +2125,17 @@ interactive_menu() {
         case "${MENU_SELECTION}" in
             1) menu_run_command command_status || return 0 ;;
             2) menu_run_command command_health || return 0 ;;
-            3) menu_run_root_command "backup" command_backup || return 0 ;;
+            3) menu_run_root_command backup || return 0 ;;
             4) menu_run_command command_backup_status || return 0 ;;
-            5) menu_run_root_command "restore" command_restore || return 0 ;;
+            5) menu_run_root_command restore || return 0 ;;
             6) menu_usb || return 0 ;;
             7) menu_run_command command_update_check || return 0 ;;
-            8) menu_run_root_command "update" command_update || return 0 ;;
-            9) menu_run_root_command "start" command_start || return 0 ;;
-            10) menu_run_root_command "stop" command_stop || return 0 ;;
-            11) menu_run_root_command "restart" command_restart || return 0 ;;
+            8) menu_run_root_command update || return 0 ;;
+            9) menu_run_root_command start || return 0 ;;
+            10) menu_run_root_command stop || return 0 ;;
+            11) menu_run_root_command restart || return 0 ;;
             12) menu_logs || return 0 ;;
-            13) menu_run_root_command "access" command_access "" || return 0 ;;
+            13) menu_run_root_command access || return 0 ;;
             14) menu_signup || return 0 ;;
             15) menu_certificate || return 0 ;;
             16) menu_run_command command_version || return 0 ;;
