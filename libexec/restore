@@ -88,6 +88,7 @@ RESTORE_BACKUP_DEVICE_STATE=""
 RESTORE_ACCESS_HASH=""
 RESTORE_NETWORK_HEALTHY=0
 RESTORE_NETWORK_LAST_HTTPS_ERROR=""
+RESTORE_SELECTION_CANCELLED=0
 
 declare -a RESTORE_GENERATION_SOURCE=()
 declare -a RESTORE_GENERATION_PATH=()
@@ -792,6 +793,7 @@ restore_choose_generation() {
 
     ((${#RESTORE_GENERATION_PATH[@]} > 0)) || \
         restore_die "No valid Vaultwarden Appliance backup generations were found."
+    RESTORE_SELECTION_CANCELLED=0
     restore_sort_generations || restore_die "Unable to sort backup generations safely."
     printf '\nAvailable backup generations with valid checksums and safe archive structure:\n\n'
     for index in "${!RESTORE_GENERATION_PATH[@]}"; do
@@ -800,8 +802,16 @@ restore_choose_generation() {
             "$(restore_format_generation_time "${RESTORE_GENERATION_NAME[${index}]}")" \
             "${RESTORE_GENERATION_NAME[${index}]}"
     done
-    printf '\nSelect backup generation [1-%d]: ' "${#RESTORE_GENERATION_PATH[@]}"
+    printf '\n0) Back\n\n'
+    printf 'Select backup generation [0-%d]: ' "${#RESTORE_GENERATION_PATH[@]}"
     IFS= read -r selection || restore_die "Restore selection was cancelled."
+    if [[ "${selection}" == "0" ]]; then
+        RESTORE_SELECTION_CANCELLED=1
+        RESTORE_SOURCE_ARCHIVE=""
+        RESTORE_SOURCE_KIND=""
+        RESTORE_SELECTED_USB_UUID=""
+        return 0
+    fi
     index=$(storage_selection_index "${selection}" "${#RESTORE_GENERATION_PATH[@]}") || \
         restore_die "Invalid backup selection; no changes were made."
     RESTORE_SOURCE_ARCHIVE=${RESTORE_GENERATION_PATH[${index}]}
@@ -1360,6 +1370,10 @@ restore_main() {
     restore_require_environment
     restore_find_generations
     restore_choose_generation
+    if (( RESTORE_SELECTION_CANCELLED == 1 )); then
+        restore_info "Restore cancelled."
+        return 0
+    fi
     restore_stage_and_verify_selection
     restore_show_manifest
     if ! restore_confirm; then

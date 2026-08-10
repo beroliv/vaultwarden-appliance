@@ -316,6 +316,47 @@ expect_success "valid local generation is discovered" \
 expect_equal "local discovery records one generation" 1 "${#RESTORE_GENERATION_PATH[@]}"
 expect_equal "local discovery identifies its source" Local "${RESTORE_GENERATION_SOURCE[0]}"
 
+selection_output_file="${temporary_dir}/restore-selection-output"
+RESTORE_SOURCE_ARCHIVE=previous-selection
+RESTORE_SOURCE_KIND=Local
+RESTORE_SELECTED_USB_UUID=previous-usb
+restore_choose_generation <<<"0" > "${selection_output_file}"
+selection_output=$(<"${selection_output_file}")
+expect_success "restore selection displays zero as Back" \
+    grep -Fxq '0) Back' <<<"${selection_output}"
+expect_success "restore selection prompt includes zero" \
+    grep -Fq 'Select backup generation [0-1]:' <<<"${selection_output}"
+expect_equal "zero marks restore selection as cancelled" 1 "${RESTORE_SELECTION_CANCELLED}"
+expect_equal "zero clears the selected restore archive" '' "${RESTORE_SOURCE_ARCHIVE}"
+expect_equal "zero clears pending USB-state adoption" '' "${RESTORE_SELECTED_USB_UUID}"
+
+restore_choose_generation <<<"1" > /dev/null
+expect_equal "existing numbered restore selection remains accepted" 0 "${RESTORE_SELECTION_CANCELLED}"
+expect_equal "selection one still chooses the existing generation" \
+    "${valid_archive}" "${RESTORE_SOURCE_ARCHIVE}"
+
+direct_restore_zero_is_safe() (
+    local output
+    local marker="${temporary_dir}/cancel-destructive-marker"
+
+    restore_cleanup() { return 0; }
+    restore_require_environment() { return 0; }
+    restore_find_generations() {
+        RESTORE_GENERATION_SOURCE=(Local)
+        RESTORE_GENERATION_PATH=("${valid_archive}")
+        RESTORE_GENERATION_NAME=("${valid_archive##*/}")
+    }
+    restore_stage_and_verify_selection() { printf 'stage\n' > "${marker}"; return 1; }
+    restore_confirm() { printf 'confirm\n' > "${marker}"; return 1; }
+    restore_apply() { printf 'apply\n' > "${marker}"; return 1; }
+
+    output=$(restore_main <<<"0")
+    grep -Fq 'Restore cancelled.' <<<"${output}" &&
+        [[ ! -e "${marker}" ]]
+)
+expect_success "direct restore zero cancels before staging confirmation or apply" \
+    direct_restore_zero_is_safe
+
 RESTORE_TOPOLOGY=$(cat <<'TOPOLOGY'
 /dev/mmcblk0||disk|179:0|32000000000|0|1
 /dev/mmcblk0p2|/dev/mmcblk0|part|179:2|31000000000|0|0

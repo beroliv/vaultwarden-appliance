@@ -57,6 +57,7 @@ expect_success "submenu zero returns to the main menu" test "${main_menu_count}"
 
 command_status() { printf 'STATUS_DISPATCHED\n'; }
 SUDO_TEST_STATUS=0
+SUDO_TEST_OUTPUT=""
 sudo() {
     local argument
 
@@ -64,6 +65,7 @@ sudo() {
     for argument in "$@"; do
         printf 'SUDO_ARG:%s\n' "${argument}"
     done
+    [[ -z "${SUDO_TEST_OUTPUT}" ]] || printf '%s\n' "${SUDO_TEST_OUTPUT}"
     return "${SUDO_TEST_STATUS}"
 }
 sudo_output_has_args() {
@@ -114,16 +116,21 @@ expect_failure "non-root backup never bypasses the privileged CLI path" \
     grep -Fq 'ROOT_BYPASS' <<<"${root_output}"
 
 command_restore() { printf 'RESTORE_BYPASS\n'; }
+SUDO_TEST_OUTPUT='Restore cancelled.'
 restore_root_output=$(interactive_menu <<'INPUT' 2>&1
 5
 
 0
 INPUT
 )
+SUDO_TEST_OUTPUT=""
 expect_success "non-root restore launches only vwctl restore through sudo" \
     sudo_output_has_args "${restore_root_output}" 2 "${PROGRAM_PATH}" restore
 expect_failure "non-root restore never bypasses the privileged CLI path" \
     grep -Fq 'RESTORE_BYPASS' <<<"${restore_root_output}"
+expect_success "cancelled restore child returns cleanly to the main menu" bash -c \
+    'grep -Fq "Restore cancelled." <<<"$1" && test "$(grep -Fc "Vaultwarden Appliance" <<<"$1")" -ge 2' \
+    _ "${restore_root_output}"
 
 command_version() { printf 'DIRECT_VERSION\n'; }
 expect_success "direct CLI dispatch remains unchanged" test "$(main version)" = DIRECT_VERSION
