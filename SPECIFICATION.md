@@ -79,7 +79,7 @@ The runtime layout includes:
   .vaultwarden-appliance
   .appliance-version
   .access
-  .backup-device                  # only after USB setup
+  .backup-device                  # after setup, adoption, or successful USB restore
   docker-compose.yml
   docker-compose.override.yml
   docker-compose.vwctl.yml
@@ -361,6 +361,7 @@ sudo vwctl signup on|off
 vwctl cert info
 sudo vwctl cert export
 vwctl usb status
+sudo vwctl usb adopt
 sudo vwctl usb setup
 vwctl backup status
 sudo vwctl backup
@@ -492,7 +493,26 @@ MUST NOT by itself exclude a real physical disk.
 
 Discovery reports available device path, vendor/model, serial, size, transport,
 removable state, partitions, filesystems, and mounts. It MUST NOT assume stable
-names such as `/dev/sda`.
+names such as `/dev/sda`. When no medium is configured, it distinguishes safe
+existing `VWBACKUP` filesystems that can be adopted from disks that would need
+destructive setup. The root-owned mode-0644 `.backup-device` state remains
+readable by unprivileged status commands and MUST NOT be group- or world-writable.
+
+### 14.1 Non-destructive adoption
+
+`sudo vwctl usb adopt` uses the global operation lock and a fresh inventory. It
+accepts only writable exFAT partition filesystems labeled `VWBACKUP` with a
+valid UUID, one supported real physical backing disk, and no protected system
+backing. Virtual, composite, ambiguous, duplicate-UUID, wrong-label, and
+wrong-filesystem candidates are excluded. Multiple safe media require explicit
+numbered selection; a single safe candidate still requires `y` or `Y`
+confirmation.
+
+Adoption does not mount or write to the filesystem and contains no partition,
+format, wipe, repair, or backup-content operation. After revalidating the same
+device, topology, and UUID, it atomically creates `.backup-device` with only the
+filesystem UUID and `VWBACKUP` label. Existing configured state is never
+silently replaced.
 
 ## 15. USB backup-media setup
 

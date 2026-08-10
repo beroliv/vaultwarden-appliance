@@ -25,6 +25,7 @@ readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
 readonly BASE_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 readonly VWCTL_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.vwctl.yml"
 readonly ACCESS_FILE="${INSTALL_DIR}/.access"
+readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
 readonly CADDYFILE="${INSTALL_DIR}/Caddyfile"
 readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
 readonly CADDY_DATA_DIR="${INSTALL_DIR}/data/caddy/data"
@@ -872,6 +873,33 @@ configure_local_backup_directory() {
         return 1
     }
     ok "Local backups use ${LOCAL_BACKUP_DIR} with root:docker 0750 permissions."
+}
+
+reconcile_backup_state_permissions() {
+    local owner
+    local permissions
+
+    [[ -e "${BACKUP_STATE_FILE}" || -L "${BACKUP_STATE_FILE}" ]] || return 0
+    [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || {
+        error "The backup-media state path is unsafe: ${BACKUP_STATE_FILE}."
+        return 1
+    }
+    owner=$(stat -c '%u' "${BACKUP_STATE_FILE}") || return 1
+    permissions=$(stat -c '%a' "${BACKUP_STATE_FILE}") || return 1
+    [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || {
+        error "The backup-media state ownership or permissions are invalid."
+        return 1
+    }
+    (( (8#${permissions} & 8#022) == 0 )) || {
+        error "The backup-media state file is group- or world-writable."
+        return 1
+    }
+    storage_read_backup_state "${BACKUP_STATE_FILE}" >/dev/null || {
+        error "The backup-media state file is invalid and will not be changed."
+        return 1
+    }
+    chmod 0644 "${BACKUP_STATE_FILE}"
+    ok "Backup-media state is root-owned and readable for unprivileged status checks."
 }
 
 install_backup_automation() {
@@ -1738,6 +1766,7 @@ main() {
     install_appliance_version
     install_vwctl
     configure_local_backup_directory
+    reconcile_backup_state_permissions
     install_backup_automation
 
     print_completion_summary

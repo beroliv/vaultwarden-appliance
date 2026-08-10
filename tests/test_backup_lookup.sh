@@ -180,5 +180,48 @@ set_filesystem_properties /dev/mapper/backup exfat VWBACKUP 6E7F-FD0E ''
 expect_lookup_status "unsupported composite backing topology is rejected" 7 \
     "${composite_inventory}" "${composite_protected}"
 
+MOCK_PROPERTIES=()
+set_filesystem_properties /dev/sda1 exfat VWBACKUP 6E7F-FD0E ''
+expect_equal "safe unconfigured VWBACKUP is discoverable for non-destructive adoption" \
+    '/dev/sda1|/dev/sda|6E7F-FD0E' \
+    "$(storage_discover_backup_media "${atlas_inventory}" "${atlas_protected}")"
+
+MOCK_PROPERTIES=()
+set_filesystem_properties /dev/sda1 exfat OTHER 6E7F-FD0E ''
+expect_equal "wrong-label filesystem is not adoptable" '' \
+    "$(storage_discover_backup_media "${atlas_inventory}" "${atlas_protected}")"
+
+MOCK_PROPERTIES=()
+set_filesystem_properties /dev/sda1 ext4 VWBACKUP 6E7F-FD0E ''
+expect_equal "wrong-filesystem VWBACKUP is not adoptable" '' \
+    "$(storage_discover_backup_media "${atlas_inventory}" "${atlas_protected}")"
+
+MOCK_PROPERTIES=()
+set_filesystem_properties /dev/mmcblk0p1 exfat VWBACKUP SYSTEM-UUID /boot/firmware
+expect_equal "VWBACKUP on the protected system disk is not adoptable" '' \
+    "$(storage_discover_backup_media "${atlas_inventory}" "${atlas_protected}")"
+
+MOCK_PROPERTIES=()
+set_filesystem_properties /dev/zram0 exfat VWBACKUP ZRAM-UUID ''
+expect_equal "virtual VWBACKUP storage is not adoptable" '' \
+    "$(storage_discover_backup_media "${atlas_inventory}" "${atlas_protected}")"
+
+multiple_media_inventory=$(printf '%s\n' \
+    '/dev/mmcblk0||disk|179:0|64000000000|0|1' \
+    '/dev/mmcblk0p2|/dev/mmcblk0|part|179:2|63400000000|0|0' \
+    '/dev/sda||disk|8:0|62100000000|0|1' \
+    '/dev/sda1|/dev/sda|part|8:1|62000000000|0|0' \
+    '/dev/sdb||disk|8:16|32100000000|0|1' \
+    '/dev/sdb1|/dev/sdb|part|8:17|32000000000|0|0')
+multiple_media_protected=$(storage_protected_disks_from_mounts \
+    "${multiple_media_inventory}" '/|/dev/mmcblk0p2')
+MOCK_PROPERTIES=()
+set_filesystem_properties /dev/sda1 exfat VWBACKUP FIRST-UUID ''
+set_filesystem_properties /dev/sdb1 exfat VWBACKUP SECOND-UUID ''
+expect_equal "multiple safe VWBACKUP media remain separate adoption choices" \
+    $'/dev/sda1|/dev/sda|FIRST-UUID\n/dev/sdb1|/dev/sdb|SECOND-UUID' \
+    "$(storage_discover_backup_media \
+        "${multiple_media_inventory}" "${multiple_media_protected}")"
+
 printf '1..%d\n' "${TESTS}"
 (( FAILURES == 0 ))

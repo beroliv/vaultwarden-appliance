@@ -613,6 +613,44 @@ storage_lookup_configured_backup() {
     return 7
 }
 
+# Print safe, writable exFAT filesystems labeled VWBACKUP as
+# filesystem-node|physical-disk|filesystem-UUID records. Every result passes
+# the same physical-topology and system-disk checks as configured media.
+storage_discover_backup_media() {
+    local inventory=$1
+    local protected=$2
+    local device
+    local filesystem
+    local label
+    local lookup
+    local read_only
+    local uuid
+    local -a fields=()
+    local -A seen_uuid=()
+
+    storage_validate_inventory "${inventory}" || return 1
+    storage_candidate_disks "${inventory}" "${protected}" >/dev/null || return 1
+
+    while IFS= read -r device; do
+        label=$(storage_lsblk_property "${device}" LABEL || true)
+        [[ "${label}" == "VWBACKUP" ]] || continue
+        filesystem=$(storage_lsblk_property "${device}" FSTYPE || true)
+        [[ "${filesystem,,}" == "exfat" ]] || continue
+        uuid=$(storage_lsblk_property "${device}" UUID || true)
+        storage_valid_filesystem_uuid "${uuid}" || continue
+        read_only=$(storage_inventory_node_field "${inventory}" "${device}" read_only) || continue
+        [[ "${read_only}" == "0" ]] || continue
+        lookup=$(storage_lookup_configured_backup \
+            "${inventory}" "${protected}" "${uuid}" VWBACKUP) || continue
+        mapfile -t fields <<<"${lookup}"
+        ((${#fields[@]} == 2)) || return 1
+        [[ "${fields[0]}" == "${device}" ]] || return 1
+        [[ -z "${seen_uuid[${uuid}]:-}" ]] || return 1
+        seen_uuid["${uuid}"]=1
+        printf '%s|%s|%s\n' "${fields[0]}" "${fields[1]}" "${uuid}"
+    done < <(storage_inventory_nodes "${inventory}")
+}
+
 storage_validate_backup_layout() {
     local partition_table=$1
     local partition_count=$2

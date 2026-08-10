@@ -139,6 +139,7 @@ sudo vwctl restore
 vwctl update check
 sudo vwctl update
 vwctl usb status
+sudo vwctl usb adopt
 sudo vwctl usb setup
 ```
 
@@ -221,7 +222,14 @@ appliance.
 ## USB backup media
 
 `vwctl usb status` is read-only. It never mounts, unmounts, partitions, formats,
-or changes a disk.
+or changes a disk. If no backup medium is configured, status distinguishes an
+existing safe `VWBACKUP` filesystem from a blank disk that would require setup.
+
+`sudo vwctl usb adopt` safely registers an existing exFAT filesystem labeled
+`VWBACKUP` by storing only its UUID and label in the appliance state. Adoption
+uses the same physical-topology and system-disk exclusions as USB setup, but it
+does not mount, write, partition, format, or otherwise modify the medium. This
+is the correct command for a previously initialized backup stick.
 
 `sudo vwctl usb setup` is destructive. It lists only real whole physical disks
 that are not part of the running system. System-disk protection follows the
@@ -315,7 +323,9 @@ The command discovers valid appliance backup generations in
 `/opt/vaultwarden/backups` and on a safe `VWBACKUP` USB filesystem. USB media is
 mounted read-only with hardened options when necessary; restore never writes to
 or deletes from it. An unconfigured but safely identified `VWBACKUP` medium can
-be used after a fresh appliance installation.
+be used after a fresh appliance installation. Its UUID is persisted only after
+the restore's data and CA integrity checks succeed; running USB setup is not
+part of disaster recovery.
 
 The selected archive is copied to root-only staging under `/run` before the
 confirmation prompt. Its checksum, tar paths and member types, schema-1

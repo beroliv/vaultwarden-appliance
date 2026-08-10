@@ -115,7 +115,7 @@ expect_failure "help does not open the menu" grep -Fq '0) Exit' <<<"${help_outpu
 command_usb() { printf 'USB_DISPATCH:%s\n' "$1"; }
 usb_setup_output=$(interactive_menu <<'INPUT'
 6
-2
+3
 
 0
 0
@@ -125,6 +125,18 @@ expect_success "non-root USB setup launches only vwctl usb setup through sudo" \
     sudo_output_has_args "${usb_setup_output}" 3 "${PROGRAM_PATH}" usb setup
 expect_failure "non-root USB setup does not invoke the unprivileged function directly" \
     grep -Fq 'USB_DISPATCH:setup' <<<"${usb_setup_output}"
+usb_adopt_output=$(interactive_menu <<'INPUT'
+6
+2
+
+0
+0
+INPUT
+)
+expect_success "non-root USB adoption launches only vwctl usb adopt through sudo" \
+    sudo_output_has_args "${usb_adopt_output}" 3 "${PROGRAM_PATH}" usb adopt
+expect_failure "non-root USB adoption does not invoke the unprivileged function directly" \
+    grep -Fq 'USB_DISPATCH:adopt' <<<"${usb_adopt_output}"
 # shellcheck disable=SC2016 # The assertion intentionally matches literal shell source.
 expect_success "USB destructive confirmation remains in the existing helper" \
     grep -Fq 'confirmation=$(storage_disk_confirmation_text "${identity}")' \
@@ -167,7 +179,7 @@ SUDO_TEST_STATUS=0
 menu_is_root() { return 0; }
 root_usb_output=$(interactive_menu <<'INPUT'
 6
-2
+3
 
 0
 0
@@ -194,7 +206,8 @@ expect_success "all mutating main-menu actions use the privileged argv dispatche
 ' _ "${REPO_DIR}/vwctl"
 expect_success "all mutating submenu actions use the privileged argv dispatcher" bash -c '
     file=$1
-    grep -Fq "menu_run_root_command usb setup" "$file" &&
+    grep -Fq "menu_run_root_command usb adopt" "$file" &&
+        grep -Fq "menu_run_root_command usb setup" "$file" &&
         grep -Fq "menu_run_root_command signup on" "$file" &&
         grep -Fq "menu_run_root_command signup off" "$file" &&
         grep -Fq "menu_run_root_command cert export" "$file"
@@ -217,6 +230,7 @@ expect_success "backup restore USB and update root checks remain present" bash -
     file=$1
     grep -A5 -F "command_backup()" "$file" | grep -Fq "require_root \"backup\"" &&
         grep -A5 -F "command_restore()" "$file" | grep -Fq "require_root \"restore\"" &&
+        grep -A8 -F "command_usb_adopt()" "$file" | grep -Fq "require_root \"usb adopt\"" &&
         grep -A8 -F "command_usb_setup()" "$file" | grep -Fq "require_root \"usb setup\"" &&
         grep -A8 -F "command_update()" "$file" | grep -Fq "require_root \"update\""
 ' _ "${REPO_DIR}/vwctl"

@@ -192,22 +192,27 @@ backup_refresh_storage() {
         "${BACKUP_TOPOLOGY}" "${BACKUP_SYSTEM_MOUNTS}") || return 1
 }
 
-backup_read_state() {
+backup_read_state_file() {
+    local state_file=$1
     local label
     local owner
     local permissions
     local state
 
-    [[ ! -e "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] && return 2
-    [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || return 1
-    owner=$(stat -c '%u' "${BACKUP_STATE_FILE}" 2>/dev/null) || return 1
-    permissions=$(stat -c '%a' "${BACKUP_STATE_FILE}" 2>/dev/null) || return 1
+    [[ ! -e "${state_file}" && ! -L "${state_file}" ]] && return 2
+    [[ -f "${state_file}" && ! -L "${state_file}" ]] || return 1
+    owner=$(stat -c '%u' "${state_file}" 2>/dev/null) || return 1
+    permissions=$(stat -c '%a' "${state_file}" 2>/dev/null) || return 1
     [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
     (( (8#${permissions} & 8#022) == 0 )) || return 1
-    state=$(storage_read_backup_state "${BACKUP_STATE_FILE}") || return 1
+    state=$(storage_read_backup_state "${state_file}") || return 1
     BACKUP_UUID=${state%%|*}
     label=${state#*|}
     [[ "${label}" == "${BACKUP_LABEL}" ]] || return 1
+}
+
+backup_read_state() {
+    backup_read_state_file "${BACKUP_STATE_FILE}"
 }
 
 backup_resolve_media() {

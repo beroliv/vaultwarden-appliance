@@ -1059,7 +1059,8 @@ restore_write_backup_state_after_success() {
     candidate=$(mktemp "${INSTALL_DIR}/.restore-backup-state.XXXXXXXX") || return 1
     RESTORE_CONFIG_TEMP_FILES=("${candidate}")
     printf '%s' "${content}" > "${candidate}" || return 1
-    chmod 0600 "${candidate}" || return 1
+    chown 0:0 "${candidate}" || return 1
+    chmod 0644 "${candidate}" || return 1
     mv -f -- "${candidate}" "${BACKUP_STATE_FILE}" || return 1
     RESTORE_CONFIG_TEMP_FILES=()
 }

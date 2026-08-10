@@ -200,6 +200,13 @@ expect_success "configured but absent USB keeps local-first run successful" back
 usb_absent_output=$(backup_status_usb)
 expect_success "backup status reports configured USB as absent without mounting" \
     grep -Fq 'Present:         no' <<<"${usb_absent_output}"
+backup_resolve_media() { BACKUP_DEVICE=/dev/sda1; BACKUP_DISK=/dev/sda; return 0; }
+backup_existing_mountpoint() { return 1; }
+usb_present_output=$(backup_status_usb)
+expect_success "backup status succeeds for a valid configured unmounted device" \
+    grep -Fq 'Present:         yes' <<<"${usb_present_output}"
+expect_success "read-only status does not mount a valid configured device" \
+    grep -Fq 'safe status does not mount media' <<<"${usb_present_output}"
 
 systemctl() {
     case "$1 $2" in

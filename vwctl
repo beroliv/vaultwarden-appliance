@@ -85,6 +85,9 @@ USB_TOPOLOGY=""
 USB_SYSTEM_MOUNTS=""
 USB_PROTECTED_DISKS=""
 USB_CANDIDATES=()
+USB_ADOPT_CANDIDATES=()
+USB_BACKUP_CONFIGURED=0
+USB_ADOPT_SELECTION=""
 
 info() {
     printf '%s\n' "$*"
@@ -118,6 +121,7 @@ Usage:
   vwctl cert info
   sudo vwctl cert export
   vwctl usb status
+  sudo vwctl usb adopt
   sudo vwctl usb setup
   sudo vwctl backup
   vwctl backup status
@@ -138,6 +142,7 @@ Commands:
   cert info          Show public root and HTTPS server certificate information
   cert export        Refresh the public Caddy root CA export
   usb status         Discover block devices without modifying them
+  usb adopt          Register an existing safe VWBACKUP without modifying it
   usb setup          ERASE and initialize one explicitly selected backup disk
   backup             Create a verified local backup and optionally replicate it to USB
   backup status      Show local, USB, and automatic-backup status without changes
@@ -1577,6 +1582,30 @@ discover_storage_devices() {
     fi
 }
 
+usb_read_backup_state() {
+    local owner
+    local permissions
+
+    [[ ! -e "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] && return 2
+    [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || return 1
+    owner=$(stat -c '%u' "${BACKUP_STATE_FILE}" 2>/dev/null) || return 1
+    permissions=$(stat -c '%a' "${BACKUP_STATE_FILE}" 2>/dev/null) || return 1
+    [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${permissions} & 8#022) == 0 )) || return 1
+    storage_read_backup_state "${BACKUP_STATE_FILE}"
+}
+
+usb_discover_adopt_candidates() {
+    local candidates=""
+
+    candidates=$(storage_discover_backup_media \
+        "${USB_TOPOLOGY}" "${USB_PROTECTED_DISKS}") || return 1
+    USB_ADOPT_CANDIDATES=()
+    if [[ -n "${candidates}" ]]; then
+        mapfile -t USB_ADOPT_CANDIDATES <<<"${candidates}"
+    fi
+}
+
 usb_disk_label() {
     local disk=$1
     local model=""
@@ -1716,6 +1745,42 @@ usb_print_candidates() {
     done
 }
 
+usb_print_adopt_candidate() {
+    local tuple=$1
+    local number=$2
+    local device
+    local disk
+    local disk_label
+    local mountpoints
+    local size
+    local transport
+    local uuid
+
+    IFS='|' read -r device disk uuid <<<"${tuple}"
+    disk_label=$(usb_disk_label "${disk}" || printf '%s' "${disk##*/}")
+    size=$(usb_disk_size "${disk}" || printf unknown)
+    transport=$(storage_lsblk_property "${disk}" TRAN || true)
+    mountpoints=$(storage_lsblk_property "${device}" MOUNTPOINTS || true)
+
+    printf '%d) %s\n' "${number}" "${disk_label}"
+    printf '   Device: %s\n' "${device}"
+    printf '   Backing disk: %s\n' "${disk}"
+    printf '   UUID: %s\n' "${uuid}"
+    printf '   Label: VWBACKUP\n'
+    printf '   Filesystem: exFAT\n'
+    printf '   Size: %s\n' "${size}"
+    printf '   Transport: %s\n' "${transport:-unknown}"
+    printf '   Mounted: %s\n\n' "${mountpoints:-no}"
+}
+
+usb_print_adopt_candidates() {
+    local index
+
+    for index in "${!USB_ADOPT_CANDIDATES[@]}"; do
+        usb_print_adopt_candidate "${USB_ADOPT_CANDIDATES[${index}]}" "$((index + 1))"
+    done
+}
+
 usb_print_configured_backup_media() {
     local device
     local disk
@@ -1723,25 +1788,18 @@ usb_print_configured_backup_media() {
     local lookup
     local lookup_status
     local mountpoints
-    local owner
-    local permissions
     local state
     local uuid
     local -a lookup_fields=()
 
-    [[ -e "${BACKUP_STATE_FILE}" || -L "${BACKUP_STATE_FILE}" ]] || return 0
-    [[ -f "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]] || \
-        die "The configured backup-media state file is unsafe."
-    owner=$(stat -c '%u' "${BACKUP_STATE_FILE}" 2>/dev/null) || \
-        die "Unable to verify backup-media state ownership."
-    permissions=$(stat -c '%a' "${BACKUP_STATE_FILE}" 2>/dev/null) || \
-        die "Unable to verify backup-media state permissions."
-    [[ "${owner}" == "0" && "${permissions}" =~ ^[0-7]{3,4}$ ]] || \
-        die "The configured backup-media state ownership or permissions are invalid."
-    (( (8#${permissions} & 8#022) == 0 )) || \
-        die "The configured backup-media state file must not be group- or world-writable."
-    state=$(storage_read_backup_state "${BACKUP_STATE_FILE}") || \
-        die "The configured backup-media state is invalid."
+    USB_BACKUP_CONFIGURED=0
+    if state=$(usb_read_backup_state); then
+        USB_BACKUP_CONFIGURED=1
+    else
+        lookup_status=$?
+        (( lookup_status == 2 )) && return 0
+        die "The configured backup-media state file is unsafe, unreadable, or invalid."
+    fi
     uuid=${state%%|*}
     label=${state#*|}
 
@@ -1796,13 +1854,131 @@ command_usb_status() {
     printf 'Backup media\n\n'
     usb_print_configured_backup_media
     usb_print_system_devices
+    if (( USB_BACKUP_CONFIGURED == 1 )); then
+        printf 'Discovery is read-only. No block device was modified.\n'
+        return 0
+    fi
+    usb_discover_adopt_candidates || \
+        die "Unable to validate existing VWBACKUP media safely."
+    if ((${#USB_ADOPT_CANDIDATES[@]} > 0)); then
+        printf 'Existing unconfigured VWBACKUP media:\n\n'
+        usb_print_adopt_candidates
+        printf 'Hint:\n'
+        printf "  Run \`sudo vwctl usb adopt\`\n"
+        printf '  or use the interactive menu.\n\n'
+        printf 'Discovery is read-only. No block device was modified.\n'
+        return 0
+    fi
     if ((${#USB_CANDIDATES[@]} == 0)); then
         printf 'No suitable external backup devices detected.\n'
         return 0
     fi
-    printf 'Available backup devices:\n\n'
+    printf 'Available unconfigured disks for setup/erase:\n\n'
     usb_print_candidates
+    printf 'No existing safe VWBACKUP filesystem was detected.\n'
+    printf "To initialize a new backup disk, run \`sudo vwctl usb setup\`.\n\n"
     printf 'Discovery is read-only. No block device was modified.\n'
+}
+
+usb_confirm_adoption() {
+    local answer=""
+
+    read -r -p 'Adopt this existing VWBACKUP device? [y/N]: ' answer </dev/tty || return 1
+    [[ "${answer}" == "y" || "${answer}" == "Y" ]]
+}
+
+usb_adopt_terminal_is_available() {
+    [[ -r /dev/tty ]]
+}
+
+usb_adopt_read_selection() {
+    local count=$1
+
+    read -r -p "Select existing VWBACKUP [1-${count}]: " USB_ADOPT_SELECTION </dev/tty
+}
+
+usb_write_backup_state() {
+    local state_file=$1
+    local uuid=$2
+    local content
+    local temporary
+
+    [[ ! -e "${state_file}" && ! -L "${state_file}" ]] || return 1
+    content=$(storage_backup_state_content "${uuid}") || return 1
+    temporary=$(mktemp "${state_file}.XXXXXXXX") || return 1
+    if ! printf '%s\n' "${content}" > "${temporary}" ||
+       ! chown 0:0 "${temporary}" ||
+       ! chmod 0644 "${temporary}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    if [[ -e "${state_file}" || -L "${state_file}" ]] ||
+       ! mv -- "${temporary}" "${state_file}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    [[ "$(storage_read_backup_state "${state_file}")" == "${uuid}|VWBACKUP" ]]
+}
+
+usb_backup_state_is_absent() {
+    [[ ! -e "${BACKUP_STATE_FILE}" && ! -L "${BACKUP_STATE_FILE}" ]]
+}
+
+command_usb_adopt() {
+    local index=0
+    local selected
+    local selection=""
+    local state
+    local state_status
+
+    require_root "usb adopt"
+    require_operation_lock
+    require_appliance
+    if state=$(usb_read_backup_state); then
+        info "Backup media is already configured (${state%%|*}); it was not replaced."
+        return 0
+    else
+        state_status=$?
+        (( state_status == 2 )) || die "The existing backup-media state is unsafe, unreadable, or invalid; it was not replaced."
+    fi
+    usb_adopt_terminal_is_available || die "An interactive terminal is required for USB adoption."
+
+    discover_storage_devices || \
+        die "Unable to establish the system block-device topology safely; no backup device can be adopted."
+    usb_discover_adopt_candidates || die "Unable to validate existing VWBACKUP media safely."
+    printf 'Adopt existing VWBACKUP — NON-DESTRUCTIVE\n\n'
+    if ((${#USB_ADOPT_CANDIDATES[@]} == 0)); then
+        printf 'No safe unconfigured VWBACKUP media detected.\n'
+        printf 'No device was mounted, written, formatted, or otherwise modified.\n'
+        return 0
+    fi
+
+    usb_print_adopt_candidates
+    if ((${#USB_ADOPT_CANDIDATES[@]} > 1)); then
+        if ! usb_adopt_read_selection "${#USB_ADOPT_CANDIDATES[@]}"; then
+            die "Unable to read the backup-device selection."
+        fi
+        selection=${USB_ADOPT_SELECTION}
+        index=$(storage_selection_index "${selection}" "${#USB_ADOPT_CANDIDATES[@]}") || \
+            die "Invalid selection. Enter only one of the displayed device numbers."
+    fi
+    selected=${USB_ADOPT_CANDIDATES[${index}]}
+    printf 'Selected existing backup media:\n\n'
+    usb_print_adopt_candidate "${selected}" 1
+    if ! usb_confirm_adoption; then
+        printf 'Adoption cancelled. No device was modified.\n'
+        return 0
+    fi
+
+    discover_storage_devices || die "Storage topology changed; adoption was cancelled."
+    usb_discover_adopt_candidates || die "Storage topology became unsafe; adoption was cancelled."
+    printf '%s\n' "${USB_ADOPT_CANDIDATES[@]}" | grep -Fxq "${selected}" || \
+        die "The selected VWBACKUP identity or topology changed; adoption was cancelled."
+    usb_backup_state_is_absent || \
+        die "Backup-media state appeared during adoption and was not replaced."
+    usb_write_backup_state "${BACKUP_STATE_FILE}" "${selected##*|}" || \
+        die "Unable to save the adopted backup-media UUID safely."
+    info "Existing VWBACKUP media adopted without mounting or modifying its filesystem."
 }
 
 command_usb_setup() {
@@ -1847,8 +2023,9 @@ command_usb_setup() {
 command_usb() {
     case "${1:-}" in
         status) command_usb_status ;;
+        adopt) command_usb_adopt ;;
         setup) command_usb_setup ;;
-        *) die "Usage: vwctl usb status | sudo vwctl usb setup" ;;
+        *) die "Usage: vwctl usb status | sudo vwctl usb adopt | sudo vwctl usb setup" ;;
     esac
 }
 
@@ -2030,12 +2207,14 @@ menu_usb() {
     while true; do
         printf '\nUSB backup media\n\n'
         printf '1) Status\n'
-        printf '2) Setup / format backup device\n'
+        printf '2) Adopt existing VWBACKUP\n'
+        printf '3) Setup / erase new backup device\n'
         printf '0) Back\n\n'
         menu_read_selection || return 1
         case "${MENU_SELECTION}" in
             1) menu_run_command command_usb status || return 1 ;;
-            2) menu_run_root_command usb setup || return 1 ;;
+            2) menu_run_root_command usb adopt || return 1 ;;
+            3) menu_run_root_command usb setup || return 1 ;;
             0) return 0 ;;
             *) printf 'Invalid selection.\n' ;;
         esac
@@ -2214,7 +2393,7 @@ main() {
             fi
             ;;
         usb)
-            (( $# == 2 )) || die "Usage: vwctl usb status | sudo vwctl usb setup"
+            (( $# == 2 )) || die "Usage: vwctl usb status | sudo vwctl usb adopt | sudo vwctl usb setup"
             command_usb "${2}"
             ;;
         backup)
