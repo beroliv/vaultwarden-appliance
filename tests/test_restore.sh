@@ -431,10 +431,11 @@ else
     pass "direct non-root restore process test requires a non-root test runner"
 fi
 
-readiness_immediately_available() (
-    local sleep_marker="${temporary_dir}/unexpected-readiness-sleep"
+network_immediately_available() (
+    local sleep_marker="${temporary_dir}/unexpected-network-sleep"
 
     SECONDS=0
+    command_exists() { return 0; }
     detect_ipv4_address() { printf '192.168.0.192\n'; }
     container_is_running() { return 0; }
     systemctl() { return 0; }
@@ -442,14 +443,15 @@ readiness_immediately_available() (
     mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
     restore_https_alive_is_ready() { return 0; }
     sleep() { printf 'called\n' > "${sleep_marker}"; }
-    restore_wait_for_post_restore_readiness 5 1 && [[ ! -e "${sleep_marker}" ]]
+    restore_wait_for_network_health 5 1 && [[ ! -e "${sleep_marker}" ]]
 )
-expect_success "immediately ready services incur no readiness delay" readiness_immediately_available
+expect_success "immediately healthy network incurs no retry delay" network_immediately_available
 
-readiness_mdns_delayed() (
+network_mdns_delayed() (
     local mdns_attempts=0
 
     SECONDS=0
+    command_exists() { return 0; }
     detect_ipv4_address() { printf '192.168.0.192\n'; }
     container_is_running() { return 0; }
     systemctl() {
@@ -464,14 +466,15 @@ readiness_mdns_delayed() (
     mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
     restore_https_alive_is_ready() { return 0; }
     sleep() { SECONDS=$((SECONDS + $1)); }
-    restore_wait_for_post_restore_readiness 6 1 && (( mdns_attempts == 3 ))
+    restore_wait_for_network_health 6 1 && (( mdns_attempts == 3 ))
 )
-expect_success "mDNS becoming ready after several polls succeeds" readiness_mdns_delayed
+expect_success "mDNS becoming healthy after several polls succeeds" network_mdns_delayed
 
-readiness_https_delayed() (
+network_https_delayed() (
     local https_attempts=0
 
     SECONDS=0
+    command_exists() { return 0; }
     detect_ipv4_address() { printf '192.168.0.192\n'; }
     container_is_running() { return 0; }
     systemctl() { return 0; }
@@ -482,15 +485,16 @@ readiness_https_delayed() (
         (( https_attempts >= 3 ))
     }
     sleep() { SECONDS=$((SECONDS + $1)); }
-    restore_wait_for_post_restore_readiness 6 1 && (( https_attempts == 3 ))
+    restore_wait_for_network_health 6 1 && (( https_attempts == 3 ))
 )
-expect_success "HTTPS becoming ready after several polls succeeds" readiness_https_delayed
+expect_success "HTTPS becoming healthy after several polls succeeds" network_https_delayed
 
-readiness_mdns_and_https_delayed() (
+network_mdns_and_https_delayed() (
     local https_attempts=0
     local mdns_attempts=0
 
     SECONDS=0
+    command_exists() { return 0; }
     detect_ipv4_address() { printf '192.168.0.192\n'; }
     container_is_running() { return 0; }
     systemctl() {
@@ -508,14 +512,15 @@ readiness_mdns_and_https_delayed() (
         (( https_attempts >= 3 ))
     }
     sleep() { SECONDS=$((SECONDS + $1)); }
-    restore_wait_for_post_restore_readiness 8 1 &&
+    restore_wait_for_network_health 8 1 &&
         (( mdns_attempts >= 5 && https_attempts == 3 ))
 )
-expect_success "combined delayed mDNS and HTTPS readiness succeeds" readiness_mdns_and_https_delayed
+expect_success "combined delayed mDNS and HTTPS health succeeds" network_mdns_and_https_delayed
 
-readiness_external_dns() (
+network_external_dns() (
     RESTORE_ACCESS_MODE=dns
     RESTORE_HOSTNAME=vault.lan
+    command_exists() { return 0; }
     detect_ipv4_address() { printf '192.168.0.192\n'; }
     container_is_running() { return 0; }
     dns_resolved_ipv4s() { printf '192.168.0.192\n'; }
@@ -523,9 +528,9 @@ readiness_external_dns() (
     mdns_ready_file_matches() { return 1; }
     mdns_resolved_ipv4s() { return 1; }
     restore_https_alive_is_ready() { return 0; }
-    restore_post_restore_conditions_are_ready 192.168.0.192
+    restore_network_conditions_are_ready 192.168.0.192
 )
-expect_success "external DNS readiness does not require mDNS or Avahi" readiness_external_dns
+expect_success "external DNS health does not require mDNS or Avahi" network_external_dns
 
 dns_restore_skips_mdns_state() (
     local detection_marker="${temporary_dir}/unexpected-dns-mdns-state"
@@ -549,7 +554,7 @@ external_dns_reconciliation() (
 expect_success "restore reconciles Caddy and DOMAIN from current external DNS access" \
     external_dns_reconciliation
 
-readiness_never_available() (
+network_never_available() (
     SECONDS=0
     detect_ipv4_address() { printf '192.168.0.192\n'; }
     container_is_running() { return 0; }
@@ -557,11 +562,11 @@ readiness_never_available() (
         [[ "${3:-}" != "${MDNS_SERVICE}" ]]
     }
     sleep() { SECONDS=$((SECONDS + $1)); }
-    restore_wait_for_post_restore_readiness 3 1
+    restore_wait_for_network_health 3 1
 )
-expect_failure "readiness timeout is bounded and non-zero" readiness_never_available
+expect_failure "network-health retry is bounded and reports unhealthy" network_never_available
 
-successful_apply_runs_readiness_before_health() (
+successful_apply_verifies_data_before_network_health() (
     RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
     restore_stop_services() { return 0; }
     restore_replace_data_directory() { return 0; }
@@ -571,16 +576,16 @@ successful_apply_runs_readiness_before_health() (
     restore_write_mdns_state() { return 0; }
     restore_export_root_ca() { return 0; }
     systemctl() { return 0; }
-    restore_wait_for_post_restore_readiness() { printf 'READINESS\n'; }
-    restore_verify_result() { printf 'HEALTH\n'; }
+    restore_verify_data_recovery() { printf 'DATA\n'; }
+    restore_wait_for_network_health() { printf 'NETWORK\n'; }
     restore_write_backup_state_after_success() { return 0; }
     restore_resume_timer() { return 0; }
     restore_apply
 )
-expect_equal "authoritative health runs after readiness succeeds" \
-    $'READINESS\nHEALTH' "$(successful_apply_runs_readiness_before_health)"
+expect_equal "data recovery is verified before advisory network health" \
+    $'DATA\nNETWORK' "$(successful_apply_verifies_data_before_network_health)"
 
-simulated_health_failure() (
+simulated_data_verification_failure() (
     RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
     restore_stop_services() { return 0; }
     restore_replace_data_directory() { return 0; }
@@ -590,14 +595,15 @@ simulated_health_failure() (
     restore_write_mdns_state() { return 0; }
     restore_export_root_ca() { return 0; }
     systemctl() { return 0; }
-    restore_wait_for_post_restore_readiness() { return 0; }
-    restore_verify_result() { return 1; }
+    restore_verify_data_recovery() { return 1; }
+    restore_wait_for_network_health() { return 0; }
     restore_die() { exit 1; }
     restore_apply
 )
-expect_failure "post-restore health failure returns non-zero" simulated_health_failure
+expect_failure "post-restore data or CA verification failure remains fatal" \
+    simulated_data_verification_failure
 
-simulated_readiness_failure() (
+simulated_network_failure_is_advisory() (
     RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
     restore_stop_services() { return 0; }
     restore_replace_data_directory() { return 0; }
@@ -607,14 +613,119 @@ simulated_readiness_failure() (
     restore_write_mdns_state() { return 0; }
     restore_export_root_ca() { return 0; }
     systemctl() { return 0; }
-    restore_wait_for_post_restore_readiness() { return 1; }
-    restore_verify_result() { printf 'unexpected health\n' > "${temporary_dir}/health-after-timeout"; }
+    restore_verify_data_recovery() { return 0; }
+    restore_wait_for_network_health() { return 1; }
+    restore_write_backup_state_after_success() { return 0; }
+    restore_resume_timer() { return 0; }
     restore_die() { exit 1; }
-    restore_apply
+    restore_apply && (( RESTORE_NETWORK_HEALTHY == 0 ))
 )
-expect_failure "restore fails non-zero when readiness is never reached" simulated_readiness_failure
-expect_failure "authoritative health is not run after readiness timeout" \
-    test -e "${temporary_dir}/health-after-timeout"
+expect_success "network failure does not invalidate verified data recovery" \
+    simulated_network_failure_is_advisory
+
+network_independent_dns_restore() (
+    local resolution_case=$1
+    local result="${temporary_dir}/dns-restore-${resolution_case}"
+    local output
+
+    mkdir -p -- "${result}/vaultwarden" "${result}/caddy" "${result}/certs" \
+        "${result}/work"
+    printf 'mode=dns\nhostname=vault1.lan\n' > "${result}/.access"
+    cp -- "${result}/.access" "${result}/access-before"
+    RESTORE_ACCESS_MODE=dns
+    RESTORE_HOSTNAME=vault1.lan
+    RESTORE_SIGNUP_ALLOWED=true
+    RESTORE_WORK_DIR="${result}/work"
+    RESTORE_NETWORK_HEALTHY=0
+    command_exists() { return 0; }
+    restore_stop_services() { return 0; }
+    restore_replace_data_directory() {
+        case "$1" in
+            vaultwarden)
+                cp -a -- "${template}/vaultwarden/data/." "${result}/vaultwarden/"
+                ;;
+            caddy)
+                cp -a -- "${template}/caddy/." "${result}/caddy/"
+                ;;
+        esac
+    }
+    restore_install_database_snapshot() {
+        cp -- "${template}/vaultwarden/db.sqlite3" "${result}/vaultwarden/db.sqlite3"
+    }
+    restore_write_configuration() {
+        write_caddyfile_to "${result}/Caddyfile" "${RESTORE_HOSTNAME}" &&
+            write_vaultwarden_override_to \
+                "${result}/docker-compose.vwctl.yml" "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}"
+    }
+    restore_compose() { return 0; }
+    restore_export_root_ca() {
+        cp -- "${result}/caddy/${CADDY_ROOT_CA_RELATIVE}" "${result}/certs/caddy-root-ca.crt"
+    }
+    restore_verify_data_recovery() {
+        restore_sqlite_snapshot_is_valid "${result}/vaultwarden/db.sqlite3" &&
+            test -f "${result}/vaultwarden/attachments/item" &&
+            restore_caddy_ca_pair_is_valid \
+                "${result}/caddy/${CADDY_ROOT_CA_RELATIVE}" \
+                "${result}/caddy/${CADDY_ROOT_KEY_RELATIVE}" &&
+            cmp -s "${result}/caddy/${CADDY_ROOT_CA_RELATIVE}" \
+                "${result}/certs/caddy-root-ca.crt" &&
+            cmp -s "${result}/.access" "${result}/access-before" &&
+            grep -Fxq 'https://vault1.lan {' "${result}/Caddyfile" &&
+            grep -Fxq '      DOMAIN: "https://vault1.lan"' \
+                "${result}/docker-compose.vwctl.yml"
+    }
+    restore_write_backup_state_after_success() { return 0; }
+    restore_resume_timer() { return 0; }
+    detect_ipv4_address() { printf '192.168.0.192\n'; }
+    container_is_running() { return 0; }
+    vaultwarden_domain_matches() { return 0; }
+    restore_https_alive_is_ready() { return 0; }
+    dns_resolved_ipv4s() {
+        case "${resolution_case}" in
+            unresolved) return 1 ;;
+            unconfigured) return 0 ;;
+            old-ip) printf '192.168.0.10\n' ;;
+        esac
+    }
+    restore_wait_for_network_health() {
+        restore_network_conditions_are_ready 192.168.0.192
+    }
+
+    restore_apply || return 1
+    output=$(restore_report_completion)
+    (( RESTORE_NETWORK_HEALTHY == 0 )) &&
+        grep -Fq 'Restore completed successfully.' <<<"${output}" &&
+        grep -Fq 'Vaultwarden data: restored' <<<"${output}" &&
+        grep -Fq 'Caddy root CA: restored' <<<"${output}" &&
+        grep -Fq 'Access configuration: preserved' <<<"${output}" &&
+        grep -Fq 'WARNING: Network access is not currently healthy.' <<<"${output}" &&
+        grep -Fq 'vault1.lan -> 192.168.0.192' <<<"${output}" &&
+        grep -Fq 'sudo vwctl health' <<<"${output}"
+)
+expect_success "restore succeeds when external DNS lookup fails" \
+    network_independent_dns_restore unresolved
+expect_success "restore succeeds before external DNS is configured" \
+    network_independent_dns_restore unconfigured
+expect_success "restore succeeds after an IP change while DNS still points to the old IP" \
+    network_independent_dns_restore old-ip
+
+mdns_network_warning_is_actionable() (
+    local output
+
+    RESTORE_ACCESS_MODE=mdns
+    RESTORE_HOSTNAME=vaultwarden.local
+    RESTORE_NETWORK_HEALTHY=0
+    RESTORE_NETWORK_LAST_HTTPS_ERROR=""
+    detect_ipv4_address() { printf '192.168.0.192\n'; }
+    output=$(restore_report_completion)
+    grep -Fq 'WARNING: Network access is not currently healthy.' <<<"${output}" &&
+        grep -Fq 'The appliance mDNS publisher is not ready' <<<"${output}" &&
+        grep -Fq 'vaultwarden.local -> 192.168.0.192' <<<"${output}" &&
+        grep -Fq 'systemctl status vaultwarden-appliance-mdns.service' <<<"${output}" &&
+        grep -Fq 'sudo vwctl health' <<<"${output}"
+)
+expect_success "unhealthy mDNS produces an actionable advisory after restore" \
+    mdns_network_warning_is_actionable
 
 expect_success "vwctl exposes the root-only restore command" grep -Fq 'sudo vwctl restore' "${REPO_DIR}/vwctl"
 expect_success "vwctl restore uses the global operation lock" bash -c \
@@ -646,9 +757,9 @@ expect_success "Vaultwarden is stopped only after timer and mDNS handling" bash 
     vault=$(grep -n "restore_compose stop vaultwarden" "$file" | cut -d: -f1)
     test "$timer" -lt "$mdns" && test "$mdns" -lt "$vault"
 ' _ "${REPO_DIR}/libexec/restore"
-expect_success "backup-media adoption occurs only after health verification" bash -c '
+expect_success "backup-media adoption occurs only after data and CA verification" bash -c '
     file=$1
-    verify=$(grep -n "restore_verify_result" "$file" | tail -1 | cut -d: -f1)
+    verify=$(grep -n "restore_verify_data_recovery" "$file" | tail -1 | cut -d: -f1)
     adopt=$(grep -n "restore_write_backup_state_after_success" "$file" | tail -1 | cut -d: -f1)
     test "$verify" -lt "$adopt"
 ' _ "${REPO_DIR}/libexec/restore"
@@ -677,6 +788,30 @@ expect_failure "restore never writes the authoritative access configuration" gre
     '(^|[[:space:]])(mv|install|cp)[^#]*ACCESS_FILE' "${REPO_DIR}/libexec/restore"
 expect_success "restored Caddy root is re-exported byte-for-byte" grep -Fq \
     'cmp -s "${root_ca}" "${EXPORTED_ROOT_CA}"' "${REPO_DIR}/libexec/restore"
+expect_success "restore preflight contains no hostname-resolution gate" bash -c \
+    "! grep -Eq 'restore_hostname_is_available|current access hostname is unavailable' '$REPO_DIR/libexec/restore'"
+expect_success "restore environment preflight requires no network-health commands" bash -c '
+    file=$1
+    section=$(awk "/^restore_require_environment\\(\\)/,/^restore_prepare_runtime_root\\(\\)/" "$file")
+    ! grep -Eq "avahi-resolve-host-name|getent|curl|timeout" <<<"$section"
+' _ "${REPO_DIR}/libexec/restore"
+expect_success "restore never makes strict vwctl health authoritative" bash -c '
+    ! grep -Fq "bash \"\${vwctl_command}\" health" "$1" &&
+        ! grep -Fq "restore_verify_result" "$1"
+' _ "${REPO_DIR}/libexec/restore"
+expect_success "vwctl health remains strict for incorrect external DNS" bash -c '
+    file=$1
+    grep -Fq "dns_resolution_matches \"\${current_ip}\" \"\${resolved}\"" "$file" &&
+        grep -Fq "health_fail \"External DNS\"" "$file"
+' _ "${REPO_DIR}/vwctl"
+expect_success "restore never configures external DNS or host resolution" bash -c \
+    "! grep -Eq '/etc/(hosts|resolv\\.conf)|resolvectl|nmcli|networkctl|dhcpcd|hostnamectl' '$REPO_DIR/libexec/restore'"
+expect_success "network checks occur only after verified data recovery" bash -c '
+    file=$1
+    verify=$(grep -n "restore_verify_data_recovery" "$file" | tail -1 | cut -d: -f1)
+    network=$(grep -n "restore_wait_for_network_health" "$file" | tail -1 | cut -d: -f1)
+    test "$verify" -lt "$network"
+' _ "${REPO_DIR}/libexec/restore"
 
 printf '1..%d\n' "${TESTS}"
 (( FAILURES == 0 ))

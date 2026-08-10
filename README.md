@@ -328,12 +328,21 @@ RESTORE VAULTWARDEN
 The workflow temporarily stops automatic backup, the active appliance mDNS
 publisher when applicable, Caddy, and Vaultwarden; replaces the verified
 Vaultwarden/Caddy persistent data; regenerates Caddy and `DOMAIN` from the
-currently installed `.access`; then starts and health-checks the appliance.
+currently installed `.access`; then starts Vaultwarden and Caddy. Restore
+preflight does not require DNS, mDNS, HTTPS, or the configured hostname to be
+reachable. The restored database and Caddy CA are verified locally before
+network health is evaluated.
 Backups do not contain access configuration, so the current hostname and
 mDNS/external-DNS choice are preserved. Existing local backup generations are
 also preserved.
 The selected backup's Caddy root CA is restored and re-exported so clients that
 already trust that CA remain valid.
+
+If the current DNS, mDNS, LAN address, or HTTPS endpoint is not ready, restore
+still reports successful data and CA recovery and prints a network-health
+warning with the configured URL and next steps. It never configures external
+DNS. `sudo vwctl health` remains the strict follow-up check after network
+configuration is complete.
 
 There is no automatic pre-restore backup or automatic rollback after data
 replacement begins. Keep a separate verified copy. Only backups created by

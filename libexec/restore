@@ -85,7 +85,9 @@ RESTORE_ACCESS_MODE=""
 RESTORE_HOSTNAME=""
 RESTORE_SIGNUP_ALLOWED=""
 RESTORE_BACKUP_DEVICE_STATE=""
-RESTORE_READINESS_LAST_HTTPS_ERROR=""
+RESTORE_ACCESS_HASH=""
+RESTORE_NETWORK_HEALTHY=0
+RESTORE_NETWORK_LAST_HTTPS_ERROR=""
 
 declare -a RESTORE_GENERATION_SOURCE=()
 declare -a RESTORE_GENERATION_PATH=()
@@ -195,6 +197,10 @@ restore_require_environment() {
     parsed_access=$(read_access_config "${ACCESS_FILE}") || \
         restore_die "The current appliance access configuration is invalid."
     IFS=$'\t' read -r RESTORE_ACCESS_MODE RESTORE_HOSTNAME <<<"${parsed_access}"
+    RESTORE_ACCESS_HASH=$(sha256sum -- "${ACCESS_FILE}" | awk 'NR == 1 {print $1}') || \
+        restore_die "Unable to record the current appliance access configuration."
+    [[ "${RESTORE_ACCESS_HASH}" =~ ^[0-9a-f]{64}$ ]] || \
+        restore_die "Unable to record the current appliance access configuration."
     [[ -d "${DATA_DIR}" && ! -L "${DATA_DIR}" &&
        -d "${LOCAL_BACKUP_DIR}" && ! -L "${LOCAL_BACKUP_DIR}" ]] || \
         restore_die "The appliance data or local backup directory is missing or unsafe."
@@ -207,18 +213,11 @@ restore_require_environment() {
     (( (8#${local_backup_permissions} & 8#002) == 0 )) || \
         restore_die "The local backup directory is world-writable."
     for command in docker lsblk findmnt readlink stat mount umount tar gzip sha256sum \
-        find install mktemp awk grep sort cp mv rm mkdir rmdir chmod systemctl curl \
-        timeout cut cmp date openssl od tr df; do
+        find install mktemp awk grep sort cp mv rm mkdir rmdir chmod systemctl \
+        cut cmp date openssl od tr df; do
         command_exists "${command}" || \
             restore_die "Required restore command '${command}' is unavailable. Rerun the installer."
     done
-    if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
-        command_exists avahi-resolve-host-name || \
-            restore_die "avahi-utils is required for the configured mDNS access mode."
-    else
-        command_exists getent || \
-            restore_die "getent is required for the configured external DNS access mode."
-    fi
     docker info >/dev/null 2>&1 || restore_die "The Docker daemon is unavailable."
     docker compose version >/dev/null 2>&1 || \
         restore_die "Docker Compose v2 is unavailable as 'docker compose'."
@@ -836,21 +835,6 @@ restore_validate_reconciliation() {
         config --quiet
 }
 
-restore_hostname_is_available() {
-    local current_ip
-    local resolved
-
-    current_ip=$(detect_ipv4_address) || return 1
-    if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
-        resolved=$(mdns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
-        [[ -z "${resolved}" ]] && return 0
-        mdns_resolution_matches "${current_ip}" "${resolved}"
-    else
-        resolved=$(dns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
-        dns_resolution_matches "${current_ip}" "${resolved}"
-    fi
-}
-
 restore_stage_and_verify_selection() {
     local filename=${RESTORE_SOURCE_ARCHIVE##*/}
     local listing
@@ -876,8 +860,6 @@ restore_stage_and_verify_selection() {
         restore_die "The selected backup contents or manifest are invalid or unsupported."
     restore_validate_reconciliation || \
         restore_die "The selected backup state cannot be reconciled with the current appliance configuration."
-    restore_hostname_is_available || \
-        restore_die "The current access hostname is unavailable or does not resolve to this appliance."
 }
 
 restore_show_manifest() {
@@ -1084,9 +1066,10 @@ restore_write_backup_state_after_success() {
 
 restore_https_alive_is_ready() {
     [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || return 1
+    command_exists curl || return 1
 
-    RESTORE_READINESS_LAST_HTTPS_ERROR=""
-    if RESTORE_READINESS_LAST_HTTPS_ERROR=$(curl --fail --silent --show-error \
+    RESTORE_NETWORK_LAST_HTTPS_ERROR=""
+    if RESTORE_NETWORK_LAST_HTTPS_ERROR=$(curl --fail --silent --show-error \
         --connect-timeout 3 \
         --max-time 5 \
         --noproxy '*' \
@@ -1094,32 +1077,35 @@ restore_https_alive_is_ready() {
         --connect-to "${RESTORE_HOSTNAME}:443:127.0.0.1:443" \
         --output /dev/null \
         "https://${RESTORE_HOSTNAME}/alive" 2>&1); then
-        RESTORE_READINESS_LAST_HTTPS_ERROR=""
+        RESTORE_NETWORK_LAST_HTTPS_ERROR=""
         return 0
     fi
     return 1
 }
 
-restore_post_restore_conditions_are_ready() {
+restore_network_conditions_are_ready() {
     local expected_ip=$1
     local resolved
 
     container_is_running vaultwarden || return 1
     container_is_running caddy || return 1
+    command_exists timeout || return 1
     if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
+        command_exists avahi-resolve-host-name || return 1
         systemctl is-active --quiet avahi-daemon.service || return 1
         systemctl is-active --quiet "${MDNS_SERVICE}" || return 1
         mdns_ready_file_matches "${MDNS_READY_FILE}" "${RESTORE_HOSTNAME}" "${expected_ip}" || return 1
         resolved=$(mdns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
         mdns_resolution_matches "${expected_ip}" "${resolved}" || return 1
     else
+        command_exists getent || return 1
         resolved=$(dns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
         dns_resolution_matches "${expected_ip}" "${resolved}" || return 1
     fi
     restore_https_alive_is_ready
 }
 
-restore_wait_for_post_restore_readiness() {
+restore_wait_for_network_health() {
     local timeout_seconds=${1:-${RESTORE_READINESS_TIMEOUT}}
     local retry_interval=${2:-${RESTORE_READINESS_RETRY_INTERVAL}}
     local deadline
@@ -1131,39 +1117,93 @@ restore_wait_for_post_restore_readiness() {
     deadline=$((SECONDS + timeout_seconds))
 
     while :; do
-        if restore_post_restore_conditions_are_ready "${expected_ip}"; then
+        if restore_network_conditions_are_ready "${expected_ip}"; then
             return 0
         fi
         (( SECONDS >= deadline )) && break
         sleep "${retry_interval}"
     done
 
-    restore_error "Post-restore service readiness was not reached within ${timeout_seconds} seconds."
-    if [[ -n "${RESTORE_READINESS_LAST_HTTPS_ERROR}" ]]; then
-        restore_error "Last HTTPS readiness error: ${RESTORE_READINESS_LAST_HTTPS_ERROR}"
-    fi
     return 1
 }
 
-restore_verify_result() {
+restore_verify_data_recovery() {
     local root=$1
     local expected_ca="${root}/caddy/${CADDY_ROOT_CA_RELATIVE}"
-    local vwctl_command="/usr/local/bin/vwctl"
+    local expected_key="${root}/caddy/${CADDY_ROOT_KEY_RELATIVE}"
+    local expected_access
+    local expected_caddy="${RESTORE_WORK_DIR}/verified-Caddyfile"
+    local expected_override="${RESTORE_WORK_DIR}/verified-compose.yml"
+    local current_access
 
-    [[ -f "${expected_ca}" && ! -L "${expected_ca}" ]] || return 1
-    container_is_running vaultwarden || return 1
-    container_is_running caddy || return 1
-    vaultwarden_domain_matches "${RESTORE_HOSTNAME}" || return 1
+    [[ -f "${expected_ca}" && ! -L "${expected_ca}" &&
+       -f "${expected_key}" && ! -L "${expected_key}" ]] || return 1
+    restore_sqlite_snapshot_is_valid "${VAULTWARDEN_DATA_DIR}/db.sqlite3" || return 1
+    cmp -s "${root}/vaultwarden/db.sqlite3" "${VAULTWARDEN_DATA_DIR}/db.sqlite3" || return 1
+    restore_caddy_ca_pair_is_valid \
+        "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" \
+        "${CADDY_DATA_DIR}/${CADDY_ROOT_KEY_RELATIVE}" || return 1
     cmp -s "${expected_ca}" "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" || return 1
     cmp -s "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" "${EXPORTED_ROOT_CA}" || return 1
-    if [[ -f "${SCRIPT_DIR}/../vwctl" && ! -L "${SCRIPT_DIR}/../vwctl" ]]; then
-        vwctl_command="${SCRIPT_DIR}/../vwctl"
+    access_config_file_is_safe "${ACCESS_FILE}" || return 1
+    current_access=$(read_access_config "${ACCESS_FILE}") || return 1
+    expected_access=$(printf '%s\t%s' "${RESTORE_ACCESS_MODE}" "${RESTORE_HOSTNAME}")
+    [[ "${current_access}" == "${expected_access}" ]] || return 1
+    [[ "$(sha256sum -- "${ACCESS_FILE}" | awk 'NR == 1 {print $1}')" == \
+       "${RESTORE_ACCESS_HASH}" ]] || return 1
+    write_caddyfile_to "${expected_caddy}" "${RESTORE_HOSTNAME}" || return 1
+    cmp -s "${expected_caddy}" "${CADDYFILE}" || return 1
+    write_vaultwarden_override_to "${expected_override}" \
+        "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}" || return 1
+    cmp -s "${expected_override}" "${VWCTL_COMPOSE_FILE}"
+}
+
+restore_report_completion() {
+    local current_ip=""
+
+    printf '\nRestore completed successfully.\n\n'
+    printf 'Vaultwarden data: restored\n'
+    printf 'Caddy root CA: restored\n'
+    printf 'Access configuration: preserved\n'
+    printf 'Local backup generations: preserved\n'
+    if (( RESTORE_NETWORK_HEALTHY == 1 )); then
+        printf 'Network access: healthy\n'
+        printf '\nConfigured URL:\n  https://%s\n' "${RESTORE_HOSTNAME}"
+        return 0
     fi
-    bash "${vwctl_command}" health
+
+    printf '\nWARNING: Network access is not currently healthy.\n'
+    printf '\nConfigured URL:\n  https://%s\n' "${RESTORE_HOSTNAME}"
+    current_ip=$(detect_ipv4_address || true)
+    if [[ "${RESTORE_ACCESS_MODE}" == dns ]]; then
+        printf '\nFor external DNS configure:\n'
+        if [[ -n "${current_ip}" ]]; then
+            printf '  %s -> %s\n' "${RESTORE_HOSTNAME}" "${current_ip}"
+        else
+            printf '  %s -> <current appliance LAN IPv4>\n' "${RESTORE_HOSTNAME}"
+            printf '\nNo usable LAN IPv4 address is currently detected.\n'
+        fi
+        printf '\nThe appliance did not modify external DNS.\n'
+    else
+        printf '\nThe appliance mDNS publisher is not ready for the configured name.\n'
+        if [[ -n "${current_ip}" ]]; then
+            printf 'Expected mDNS mapping:\n  %s -> %s\n' \
+                "${RESTORE_HOSTNAME}" "${current_ip}"
+        else
+            printf 'No usable LAN IPv4 address is currently detected for mDNS publication.\n'
+        fi
+        printf 'Check after the LAN is available:\n'
+        printf '  systemctl status %s\n' "${MDNS_SERVICE}"
+    fi
+    if [[ -n "${RESTORE_NETWORK_LAST_HTTPS_ERROR}" ]]; then
+        printf '\nLast HTTPS check:\n  %s\n' "${RESTORE_NETWORK_LAST_HTTPS_ERROR}"
+    fi
+    printf '\nRun after network configuration:\n  sudo vwctl health\n'
 }
 
 restore_apply() {
     local root="${RESTORE_WORK_DIR}/extract/${ARCHIVE_ROOT}"
+    local mdns_started=1
 
     restore_stop_services || restore_die "Unable to stop appliance services cleanly; restore was not started."
     RESTORE_DATA_REPLACEMENT_STARTED=1
@@ -1177,22 +1217,30 @@ restore_apply() {
         restore_die "Appliance access configuration reconciliation failed."
     restore_compose config --quiet || \
         restore_die "The reconciled appliance Compose configuration is invalid."
-    restore_write_mdns_state || restore_die "mDNS state reconciliation failed."
+    if [[ "${RESTORE_ACCESS_MODE}" == mdns ]] && ! restore_write_mdns_state; then
+        mdns_started=0
+    fi
     restore_compose up -d vaultwarden || restore_die "Vaultwarden did not start after restore."
     restore_compose up -d caddy || restore_die "Caddy did not start after restore."
     restore_export_root_ca || restore_die "The restored public Caddy root CA could not be exported."
     if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
-        systemctl restart "${MDNS_SERVICE}" || restore_die "The appliance mDNS publisher did not restart."
-        RESTORE_MDNS_STOPPED=0
+        if (( mdns_started == 1 )) && systemctl restart "${MDNS_SERVICE}"; then
+            RESTORE_MDNS_STOPPED=0
+        else
+            mdns_started=0
+        fi
     fi
-    restore_wait_for_post_restore_readiness \
-        "${RESTORE_READINESS_TIMEOUT}" "${RESTORE_READINESS_RETRY_INTERVAL}" || \
-        restore_die "Post-restore service readiness failed. No automatic rollback was attempted."
-    restore_verify_result "${root}" || \
-        restore_die "Post-restore appliance health verification failed. No automatic rollback was attempted."
+    restore_verify_data_recovery "${root}" || \
+        restore_die "Post-restore data or Caddy CA verification failed. No automatic rollback was attempted."
     restore_write_backup_state_after_success || \
         restore_die "The restore succeeded, but backup-media state adoption failed."
     restore_resume_timer || restore_die "The restore succeeded, but the automatic-backup timer state could not be restored."
+    if (( mdns_started == 1 )) && restore_wait_for_network_health \
+        "${RESTORE_READINESS_TIMEOUT}" "${RESTORE_READINESS_RETRY_INTERVAL}"; then
+        RESTORE_NETWORK_HEALTHY=1
+    else
+        RESTORE_NETWORK_HEALTHY=0
+    fi
 }
 
 restore_find_generations() {
@@ -1236,10 +1284,7 @@ restore_main() {
     restore_revalidate_source || \
         restore_die "The selected source changed or became unsafe after confirmation; no appliance data was modified."
     restore_apply
-    printf '\nRestore completed successfully.\n'
-    printf '  HTTPS URL: https://%s\n' "${RESTORE_HOSTNAME}"
-    printf '  Caddy internal root CA: preserved from the selected backup\n'
-    printf '  Local backup generations: preserved\n'
+    restore_report_completion
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

@@ -717,6 +717,12 @@ verifies all of the following:
 - Caddy's internal root certificate and private key are present, parseable,
   and form one cryptographic key pair.
 
+Restore preflight and backup selection MUST NOT require hostname resolution,
+DNS resolution, mDNS readiness, an active mDNS publisher, a working HTTPS
+endpoint, a current server certificate, or the configured hostname to resolve
+to the current LAN IPv4 address. Data recovery MUST remain possible before DNS
+configuration and after LAN, address, DNS-server, or router changes.
+
 Manifest metadata and the source are shown before the exact, case-sensitive
 confirmation:
 
@@ -745,10 +751,22 @@ publisher. Backed-up scripts or executables are never run or installed.
 
 The restored Caddy data includes the selected backup's original internal root
 CA and private key. The public root is exported again, preserving trust for
-clients that already trust that backup's CA. Vaultwarden and Caddy are started,
-the selected name resolution, `DOMAIN`, networks, host-port policy, HTTPS
-endpoint, and CA continuity are checked through `vwctl health`, and only then
-may USB UUID state be adopted and the prior timer state restored.
+clients that already trust that backup's CA. Vaultwarden and Caddy are started;
+the mDNS publisher is started only when the current mode is `mdns`. Successful
+data recovery requires local verification of the restored SQLite database,
+Caddy CA certificate/private-key pair, exported public root, unchanged current
+`.access`, regenerated Caddyfile, and regenerated Vaultwarden `DOMAIN` override.
+USB UUID state may be adopted and the prior timer state restored after those
+local recovery checks succeed.
+
+Name resolution, mDNS publisher readiness, container reachability, and HTTPS
+are post-restore network-health checks only. Their failure MUST NOT prevent,
+roll back, or invalidate an otherwise verified Vaultwarden data and Caddy CA
+restore. Restore MUST report success for the recovered data and CA, preserve
+the current access configuration, and print a mode-specific warning with the
+configured URL, expected name-to-address mapping where available, and `sudo
+vwctl health` as the strict follow-up command. External DNS MUST NOT be modified
+automatically. `vwctl health` remains strict and independent of restore success.
 
 Restore does not create an automatic pre-restore backup and does not perform an
 automatic data rollback after replacement begins. A critical post-confirmation
