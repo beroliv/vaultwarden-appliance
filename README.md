@@ -1,8 +1,8 @@
 # Vaultwarden Appliance
 
 A LAN-only Vaultwarden appliance for Debian and Raspberry Pi OS using Docker,
-Caddy HTTPS, mDNS, simple `vwctl` management, verified local-first backups, and
-an appliance-format restore workflow.
+Caddy HTTPS, optional mDNS or existing local DNS, simple `vwctl` management,
+verified local-first backups, and an appliance-format restore workflow.
 
 Version 0.1.0 is the first tested release. Real-system validation on Atlas, a
 Raspberry Pi, covers the public `curl` bootstrap, installation, complete
@@ -16,9 +16,8 @@ remains pending. Retain independent verified backup copies.
 ## What it does
 
 - Runs the official Vaultwarden and Caddy images with Docker Compose.
-- Serves Vaultwarden as `https://vaultwarden.local` using Caddy's internal CA.
-- Advertises the local name with mDNS; no router or DNS changes are normally
-  required.
+- Serves Vaultwarden as `https://vaultwarden.local` by default using Caddy's
+  internal CA and mDNS, with an existing local DNS server as an alternative.
 - Publishes only Caddy on TCP port 443. Vaultwarden has no direct LAN port.
 - Provides an interactive `vwctl` menu and direct commands for administration.
 - Creates verified local backups and keeps the newest 7 generations.
@@ -40,7 +39,8 @@ router settings, static addresses, or external backup services.
 - Root access through `sudo`
 - A LAN with TCP port 443 available on the appliance host
 - Internet access for the initial source, package, and container downloads
-- An mDNS-capable client for `.local` name resolution
+- An mDNS-capable client for the default `.local` name, or an existing local DNS
+  server for a custom name
 
 The normal reference platform is 64-bit Raspberry Pi OS on ARM64. TCP port 80
 is not used or required.
@@ -83,8 +83,10 @@ missing. A working Docker installation is reused without modification.
 
 ## First use
 
-1. Run the installer and accept or adjust the proposed local hostname.
-2. Open `https://vaultwarden.local` from a client on the same LAN.
+1. Run the installer and choose a hostname and name-resolution mode. Press Enter
+   for the default `vaultwarden.local` via mDNS.
+2. Open the selected URL (default: `https://vaultwarden.local`) from a client on
+   the same LAN.
 3. Trust the exported Caddy root CA on every client that should accept the
    appliance certificate.
 4. Run `vwctl` for the interactive menu.
@@ -97,6 +99,20 @@ mDNS and HTTPS trust are separate. mDNS resolves `vaultwarden.local` to the
 appliance's LAN address; it does not make the certificate trusted. The Caddy
 root CA establishes HTTPS trust; installing it does not configure mDNS. Both
 must work on a client.
+
+If you already operate local DNS, enter a name such as `vault.lan`, answer Yes
+to the external-DNS prompt, and manually create `vault.lan -> <Raspberry Pi LAN
+IP>` on that DNS server. The appliance never changes DNS, hosts, router, DHCP,
+or system-hostname settings. Rerun `sudo ./install.sh` to change the hostname or
+switch between mDNS and external DNS later.
+
+The current choice is stored as root-owned runtime configuration in
+`/opt/vaultwarden/.access`:
+
+```text
+mode=mdns
+hostname=vaultwarden.local
+```
 
 The public root certificate is exported to:
 
@@ -304,10 +320,13 @@ case-sensitive text:
 RESTORE VAULTWARDEN
 ```
 
-The workflow temporarily stops automatic backup, mDNS, Caddy, and Vaultwarden;
-replaces the verified Vaultwarden/Caddy persistent data; regenerates managed
-hostname, Caddy, mDNS, `DOMAIN`, and signup configuration; then starts and
-health-checks the appliance. Existing local backup generations are preserved.
+The workflow temporarily stops automatic backup, the active appliance mDNS
+publisher when applicable, Caddy, and Vaultwarden; replaces the verified
+Vaultwarden/Caddy persistent data; regenerates Caddy and `DOMAIN` from the
+currently installed `.access`; then starts and health-checks the appliance.
+Backups do not contain access configuration, so the current hostname and
+mDNS/external-DNS choice are preserved. Existing local backup generations are
+also preserved.
 The selected backup's Caddy root CA is restored and re-exported so clients that
 already trust that CA remain valid.
 

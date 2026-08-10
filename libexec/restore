@@ -28,7 +28,7 @@ unset library library_path
 readonly INSTALL_DIR="/opt/vaultwarden"
 readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
 readonly APPLIANCE_VERSION_FILE="${INSTALL_DIR}/.appliance-version"
-readonly ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
+readonly ACCESS_FILE="${INSTALL_DIR}/.access"
 readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
 readonly BASE_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
@@ -81,6 +81,7 @@ RESTORE_CADDY_WAS_RUNNING=0
 RESTORE_DATA_REPLACEMENT_STARTED=0
 RESTORE_NEW_DATA_DIRECTORY=""
 RESTORE_CONFIG_TEMP_FILES=()
+RESTORE_ACCESS_MODE=""
 RESTORE_HOSTNAME=""
 RESTORE_SIGNUP_ALLOWED=""
 RESTORE_BACKUP_DEVICE_STATE=""
@@ -130,7 +131,8 @@ restore_cleanup() {
         if (( RESTORE_CADDY_WAS_RUNNING == 1 )); then
             restore_compose start caddy >/dev/null 2>&1 || final_status=1
         fi
-        if (( RESTORE_MDNS_WAS_ACTIVE == 1 && RESTORE_MDNS_STOPPED == 1 )); then
+        if [[ "${RESTORE_ACCESS_MODE}" == mdns ]] &&
+           (( RESTORE_MDNS_WAS_ACTIVE == 1 && RESTORE_MDNS_STOPPED == 1 )); then
             systemctl start "${MDNS_SERVICE}" >/dev/null 2>&1 || final_status=1
         fi
     fi
@@ -174,6 +176,7 @@ restore_cleanup() {
 restore_require_environment() {
     local command
     local local_backup_permissions
+    local parsed_access
 
     (( EUID == 0 )) || restore_die "Restore must run as root through sudo vwctl restore."
     [[ -d "${INSTALL_DIR}" && ! -L "${INSTALL_DIR}" ]] || \
@@ -187,6 +190,11 @@ restore_require_environment() {
         [[ -f "${path}" && ! -L "${path}" ]] || \
             restore_die "Required appliance configuration is missing or unsafe: ${path}"
     done
+    access_config_file_is_safe "${ACCESS_FILE}" || \
+        restore_die "The current appliance access configuration is unsafe."
+    parsed_access=$(read_access_config "${ACCESS_FILE}") || \
+        restore_die "The current appliance access configuration is invalid."
+    IFS=$'\t' read -r RESTORE_ACCESS_MODE RESTORE_HOSTNAME <<<"${parsed_access}"
     [[ -d "${DATA_DIR}" && ! -L "${DATA_DIR}" &&
        -d "${LOCAL_BACKUP_DIR}" && ! -L "${LOCAL_BACKUP_DIR}" ]] || \
         restore_die "The appliance data or local backup directory is missing or unsafe."
@@ -200,10 +208,17 @@ restore_require_environment() {
         restore_die "The local backup directory is world-writable."
     for command in docker lsblk findmnt readlink stat mount umount tar gzip sha256sum \
         find install mktemp awk grep sort cp mv rm mkdir rmdir chmod systemctl curl \
-        timeout cut cmp date openssl od tr df avahi-resolve-host-name; do
+        timeout cut cmp date openssl od tr df; do
         command_exists "${command}" || \
             restore_die "Required restore command '${command}' is unavailable. Rerun the installer."
     done
+    if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
+        command_exists avahi-resolve-host-name || \
+            restore_die "avahi-utils is required for the configured mDNS access mode."
+    else
+        command_exists getent || \
+            restore_die "getent is required for the configured external DNS access mode."
+    fi
     docker info >/dev/null 2>&1 || restore_die "The Docker daemon is unavailable."
     docker compose version >/dev/null 2>&1 || \
         restore_die "Docker Compose v2 is unavailable as 'docker compose'."
@@ -334,7 +349,6 @@ restore_verify_archive_structure() {
         "${ARCHIVE_ROOT}/vaultwarden/db.sqlite3"
         "${ARCHIVE_ROOT}/appliance/.vaultwarden-appliance"
         "${ARCHIVE_ROOT}/appliance/.appliance-version"
-        "${ARCHIVE_ROOT}/appliance/.caddy-access"
         "${ARCHIVE_ROOT}/appliance/docker-compose.yml"
         "${ARCHIVE_ROOT}/appliance/docker-compose.override.yml"
         "${ARCHIVE_ROOT}/appliance/docker-compose.vwctl.yml"
@@ -374,7 +388,7 @@ restore_read_manifest() {
     local value
     local extra
     local -a required_keys=(
-        backup_schema appliance_version created_at_utc access_hostname signup_allowed
+        backup_schema appliance_version created_at_utc signup_allowed
         vaultwarden_image vaultwarden_version caddy_image caddy_version source_architecture
         caddy_ca_included top_level_contents
     )
@@ -385,7 +399,7 @@ restore_read_manifest() {
         restore_manifest_value_is_safe "${value}" || return 1
         [[ -z "${RESTORE_MANIFEST[${key}]+set}" ]] || return 1
         case "${key}" in
-            backup_schema|appliance_version|created_at_utc|access_hostname|signup_allowed|vaultwarden_image|vaultwarden_version|caddy_image|caddy_version|source_architecture|caddy_ca_included|top_level_contents) ;;
+            backup_schema|appliance_version|created_at_utc|signup_allowed|vaultwarden_image|vaultwarden_version|caddy_image|caddy_version|source_architecture|caddy_ca_included|top_level_contents) ;;
             *) return 1 ;;
         esac
         RESTORE_MANIFEST["${key}"]=${value}
@@ -398,7 +412,6 @@ restore_read_manifest() {
     [[ "${RESTORE_MANIFEST[created_at_utc]}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
     [[ "${RESTORE_MANIFEST[appliance_version]}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 1
     [[ "${RESTORE_MANIFEST[source_architecture]}" =~ ^[A-Za-z0-9._+-]+$ ]] || return 1
-    validate_local_hostname "${RESTORE_MANIFEST[access_hostname]}" || return 1
     [[ "${RESTORE_MANIFEST[signup_allowed]}" == true ||
        "${RESTORE_MANIFEST[signup_allowed]}" == false ||
        "${RESTORE_MANIFEST[signup_allowed]}" == unknown ]] || return 1
@@ -467,8 +480,6 @@ restore_backed_compose_is_recognized() {
 restore_validate_extracted_backup() {
     local root=$1
     local appliance="${root}/appliance"
-    local backed_access
-    local backed_caddy
     local backed_signup
     local unexpected
 
@@ -484,7 +495,6 @@ restore_validate_extracted_backup() {
         "${root}/caddy/${CADDY_ROOT_KEY_RELATIVE}" \
         "${appliance}/.vaultwarden-appliance" \
         "${appliance}/.appliance-version" \
-        "${appliance}/.caddy-access" \
         "${appliance}/docker-compose.yml" \
         "${appliance}/docker-compose.override.yml" \
         "${appliance}/docker-compose.vwctl.yml" \
@@ -502,10 +512,6 @@ restore_validate_extracted_backup() {
     restore_backed_compose_is_recognized "${appliance}" || return 1
     restore_read_manifest "${root}/manifest" || return $?
     [[ "$(<"${appliance}/.appliance-version")" == "${RESTORE_MANIFEST[appliance_version]}" ]] || return 1
-    backed_access=$(read_access_hostname "${appliance}/.caddy-access") || return 1
-    backed_caddy=$(read_caddyfile_hostname "${appliance}/Caddyfile") || return 1
-    [[ "${backed_access}" == "${RESTORE_MANIFEST[access_hostname]}" &&
-       "${backed_caddy}" == "${RESTORE_MANIFEST[access_hostname]}" ]] || return 1
     backed_signup=$(restore_signup_from_override "${appliance}/docker-compose.vwctl.yml") || return 1
     if [[ "${RESTORE_MANIFEST[signup_allowed]}" == unknown ]]; then
         RESTORE_SIGNUP_ALLOWED=${backed_signup}
@@ -513,7 +519,6 @@ restore_validate_extracted_backup() {
         [[ "${backed_signup}" == "${RESTORE_MANIFEST[signup_allowed]}" ]] || return 1
         RESTORE_SIGNUP_ALLOWED=${backed_signup}
     fi
-    RESTORE_HOSTNAME=${RESTORE_MANIFEST[access_hostname]}
     RESTORE_BACKUP_DEVICE_STATE=""
     if [[ -e "${appliance}/.backup-device" || -L "${appliance}/.backup-device" ]]; then
         [[ -f "${appliance}/.backup-device" && ! -L "${appliance}/.backup-device" ]] || return 1
@@ -836,9 +841,14 @@ restore_hostname_is_available() {
     local resolved
 
     current_ip=$(detect_ipv4_address) || return 1
-    resolved=$(mdns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
-    [[ -z "${resolved}" ]] && return 0
-    mdns_resolution_matches "${current_ip}" "${resolved}"
+    if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
+        resolved=$(mdns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
+        [[ -z "${resolved}" ]] && return 0
+        mdns_resolution_matches "${current_ip}" "${resolved}"
+    else
+        resolved=$(dns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
+        dns_resolution_matches "${current_ip}" "${resolved}"
+    fi
 }
 
 restore_stage_and_verify_selection() {
@@ -867,7 +877,7 @@ restore_stage_and_verify_selection() {
     restore_validate_reconciliation || \
         restore_die "The selected backup state cannot be reconciled with the current appliance configuration."
     restore_hostname_is_available || \
-        restore_die "The backed-up hostname is currently advertised by another LAN device."
+        restore_die "The current access hostname is unavailable or does not resolve to this appliance."
 }
 
 restore_show_manifest() {
@@ -877,7 +887,8 @@ restore_show_manifest() {
     printf '  Created (UTC):       %s\n' "${RESTORE_MANIFEST[created_at_utc]}"
     printf '  Backup schema:       %s\n' "${RESTORE_MANIFEST[backup_schema]}"
     printf '  Appliance version:   %s\n' "${RESTORE_MANIFEST[appliance_version]}"
-    printf '  Access hostname:     %s\n' "${RESTORE_HOSTNAME}"
+    printf '  Current access mode: %s\n' "${RESTORE_ACCESS_MODE}"
+    printf '  Current hostname:    %s\n' "${RESTORE_HOSTNAME}"
     printf '  Account registration:%s\n' " ${RESTORE_SIGNUP_ALLOWED}"
     printf '  Source architecture: %s\n' "${RESTORE_MANIFEST[source_architecture]}"
     printf '  Vaultwarden image:   %s\n' "${RESTORE_MANIFEST[vaultwarden_image]}"
@@ -937,12 +948,21 @@ restore_record_and_stop_timer() {
 }
 
 restore_stop_services() {
-    systemctl is-active --quiet "${MDNS_SERVICE}" && RESTORE_MDNS_WAS_ACTIVE=1 || true
+    local mdns_is_active=0
+
+    if systemctl is-active --quiet "${MDNS_SERVICE}"; then
+        mdns_is_active=1
+        if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
+            RESTORE_MDNS_WAS_ACTIVE=1
+        fi
+    fi
     container_is_running vaultwarden && RESTORE_VAULTWARDEN_WAS_RUNNING=1 || true
     container_is_running caddy && RESTORE_CADDY_WAS_RUNNING=1 || true
     restore_record_and_stop_timer || return 1
-    systemctl stop "${MDNS_SERVICE}" || return 1
-    RESTORE_MDNS_STOPPED=1
+    if (( mdns_is_active == 1 )); then
+        systemctl stop "${MDNS_SERVICE}" || return 1
+        RESTORE_MDNS_STOPPED=1
+    fi
     restore_compose stop caddy || return 1
     restore_compose stop vaultwarden || return 1
     ! container_is_running caddy && ! container_is_running vaultwarden
@@ -984,22 +1004,16 @@ restore_replace_data_directory() {
 
 restore_write_configuration() {
     local root=$1
-    local access_candidate
     local caddy_candidate
     local override_candidate
 
-    access_candidate=$(mktemp "${INSTALL_DIR}/.restore-access.XXXXXXXX") || return 1
-    RESTORE_CONFIG_TEMP_FILES=("${access_candidate}")
     caddy_candidate=$(mktemp "${INSTALL_DIR}/.restore-caddy.XXXXXXXX") || return 1
-    RESTORE_CONFIG_TEMP_FILES+=("${caddy_candidate}")
+    RESTORE_CONFIG_TEMP_FILES=("${caddy_candidate}")
     override_candidate=$(mktemp "${INSTALL_DIR}/.restore-compose.XXXXXXXX") || return 1
     RESTORE_CONFIG_TEMP_FILES+=("${override_candidate}")
-    printf 'hostname=%s\n' "${RESTORE_HOSTNAME}" > "${access_candidate}" || return 1
-    chmod 0644 "${access_candidate}" || return 1
     write_caddyfile_to "${caddy_candidate}" "${RESTORE_HOSTNAME}" || return 1
     write_vaultwarden_override_to "${override_candidate}" \
         "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}" || return 1
-    mv -f -- "${access_candidate}" "${ACCESS_FILE}" || return 1
     mv -f -- "${caddy_candidate}" "${CADDYFILE}" || return 1
     mv -f -- "${override_candidate}" "${VWCTL_COMPOSE_FILE}" || return 1
     RESTORE_CONFIG_TEMP_FILES=()
@@ -1010,6 +1024,7 @@ restore_write_mdns_state() {
     local current_ip
     local candidate
 
+    [[ "${RESTORE_ACCESS_MODE}" == mdns ]] || return 0
     current_ip=$(detect_ipv4_address) || return 1
     candidate=$(mktemp "${INSTALL_DIR}/.restore-mdns.XXXXXXXX") || return 1
     RESTORE_CONFIG_TEMP_FILES=("${candidate}")
@@ -1091,11 +1106,16 @@ restore_post_restore_conditions_are_ready() {
 
     container_is_running vaultwarden || return 1
     container_is_running caddy || return 1
-    systemctl is-active --quiet avahi-daemon.service || return 1
-    systemctl is-active --quiet "${MDNS_SERVICE}" || return 1
-    mdns_ready_file_matches "${MDNS_READY_FILE}" "${RESTORE_HOSTNAME}" "${expected_ip}" || return 1
-    resolved=$(mdns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
-    mdns_resolution_matches "${expected_ip}" "${resolved}" || return 1
+    if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
+        systemctl is-active --quiet avahi-daemon.service || return 1
+        systemctl is-active --quiet "${MDNS_SERVICE}" || return 1
+        mdns_ready_file_matches "${MDNS_READY_FILE}" "${RESTORE_HOSTNAME}" "${expected_ip}" || return 1
+        resolved=$(mdns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
+        mdns_resolution_matches "${expected_ip}" "${resolved}" || return 1
+    else
+        resolved=$(dns_resolved_ipv4s "${RESTORE_HOSTNAME}" || true)
+        dns_resolution_matches "${expected_ip}" "${resolved}" || return 1
+    fi
     restore_https_alive_is_ready
 }
 
@@ -1161,8 +1181,10 @@ restore_apply() {
     restore_compose up -d vaultwarden || restore_die "Vaultwarden did not start after restore."
     restore_compose up -d caddy || restore_die "Caddy did not start after restore."
     restore_export_root_ca || restore_die "The restored public Caddy root CA could not be exported."
-    systemctl restart "${MDNS_SERVICE}" || restore_die "The appliance mDNS publisher did not restart."
-    RESTORE_MDNS_STOPPED=0
+    if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
+        systemctl restart "${MDNS_SERVICE}" || restore_die "The appliance mDNS publisher did not restart."
+        RESTORE_MDNS_STOPPED=0
+    fi
     restore_wait_for_post_restore_readiness \
         "${RESTORE_READINESS_TIMEOUT}" "${RESTORE_READINESS_RETRY_INTERVAL}" || \
         restore_die "Post-restore service readiness failed. No automatic rollback was attempted."

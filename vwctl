@@ -31,7 +31,7 @@ readonly BASE_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
 readonly VWCTL_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.vwctl.yml"
 readonly CADDYFILE="${INSTALL_DIR}/Caddyfile"
-readonly ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
+readonly ACCESS_FILE="${INSTALL_DIR}/.access"
 readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
 readonly CADDY_ROOT_CA="${INSTALL_DIR}/data/caddy/data/caddy/pki/authorities/local/root.crt"
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
@@ -67,6 +67,7 @@ fi
 readonly RESTORE_HELPER
 
 ACCESS_ADDRESS=""
+ACCESS_MODE=""
 HTTPS_LAST_ERROR=""
 HEALTH_FAILURES=0
 UPDATE_CHECK_AVAILABLE=0
@@ -216,6 +217,7 @@ compose_with_vaultwarden_candidate() {
 }
 
 require_mdns_runtime() {
+    [[ "${ACCESS_MODE}" == dns ]] && return 0
     command_exists avahi-resolve-host-name || die "avahi-utils is required. Rerun the appliance installer."
     command_exists avahi-publish-address || die "avahi-utils is required. Rerun the appliance installer."
     command_exists systemctl || die "systemd is required for appliance mDNS."
@@ -357,15 +359,18 @@ verify_mdns_hostname() {
 }
 
 load_access_state() {
-    ACCESS_ADDRESS=$(read_access_hostname "${ACCESS_FILE}") || return 1
+    local parsed
+
+    access_config_file_is_safe "${ACCESS_FILE}" || return 1
+    parsed=$(read_access_config "${ACCESS_FILE}") || return 1
+    IFS=$'\t' read -r ACCESS_MODE ACCESS_ADDRESS <<<"${parsed}"
 }
 
 write_access_state_to() {
     local destination=$1
     local address=$2
 
-    printf 'hostname=%s\n' "${address}" > "${destination}"
-    chmod 0644 "${destination}"
+    write_access_config_atomic "${destination}" mdns "${address}"
 }
 
 container_state() {
@@ -655,6 +660,9 @@ verify_root_ca_unchanged() {
 }
 
 verify_appliance() {
+    local current_ip=""
+    local resolved=""
+
     if ! load_access_state; then
         printf 'Error: The appliance access state is invalid.\n' >&2
         return 1
@@ -688,8 +696,18 @@ verify_appliance() {
         printf 'Error: Caddy is not connected to %s.\n' "${APPLIANCE_NETWORK}" >&2
         return 1
     fi
-    if ! verify_mdns_hostname "${ACCESS_ADDRESS}"; then
-        return 1
+    if [[ "${ACCESS_MODE}" == mdns ]]; then
+        if ! verify_mdns_hostname "${ACCESS_ADDRESS}"; then
+            return 1
+        fi
+    else
+        current_ip=$(detect_ipv4_address) || return 1
+        resolved=$(dns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
+        if ! dns_resolution_matches "${current_ip}" "${resolved}"; then
+            printf 'Error: External DNS does not resolve %s exclusively to %s.\n' \
+                "${ACCESS_ADDRESS}" "${current_ip}" >&2
+            return 1
+        fi
     fi
     if ! verify_https "${ACCESS_ADDRESS}"; then
         printf 'Error: HTTPS verification failed for https://%s.\n' "${ACCESS_ADDRESS}" >&2
@@ -740,12 +758,18 @@ command_health() {
     local available_mb=0
     local current_ip=""
     local docker_ready=0
-    local mdns_ready=0
+    local resolution_ready=0
     local resolved=""
 
     require_appliance
     HEALTH_FAILURES=0
     printf 'Vaultwarden Appliance health\n\n'
+
+    if load_access_state; then
+        health_ok "Access configuration (${ACCESS_MODE})"
+    else
+        health_fail "Access configuration" "${ACCESS_FILE} is missing, unsafe, or invalid"
+    fi
 
     if command_exists docker &&
        docker compose version >/dev/null 2>&1 &&
@@ -778,25 +802,37 @@ command_health() {
         health_fail "Caddy" "container is missing, stopped, not publishing only TCP 443, or disconnected from ${APPLIANCE_NETWORK}"
     fi
 
-    if load_access_state &&
-       current_ip=$(detect_ipv4_address) &&
-       command_exists systemctl &&
-       command_exists avahi-resolve-host-name &&
-       systemctl is-active --quiet avahi-daemon.service &&
-       systemctl is-active --quiet "${MDNS_SERVICE}" &&
-       mdns_service_is_ready "${ACCESS_ADDRESS}" "${current_ip}"; then
-        resolved=$(mdns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
-        if mdns_resolution_matches "${current_ip}" "${resolved}"; then
-            mdns_ready=1
-            health_ok "mDNS"
+    if [[ -n "${ACCESS_MODE}" ]] && current_ip=$(detect_ipv4_address); then
+        if [[ "${ACCESS_MODE}" == mdns ]]; then
+            if command_exists systemctl &&
+               command_exists avahi-resolve-host-name &&
+               systemctl is-active --quiet avahi-daemon.service &&
+               systemctl is-active --quiet "${MDNS_SERVICE}" &&
+               mdns_service_is_ready "${ACCESS_ADDRESS}" "${current_ip}"; then
+                resolved=$(mdns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
+                if mdns_resolution_matches "${current_ip}" "${resolved}"; then
+                    resolution_ready=1
+                    health_ok "mDNS"
+                else
+                    health_fail "mDNS" "${ACCESS_ADDRESS} does not resolve exclusively to ${current_ip}"
+                fi
+            else
+                health_fail "mDNS" "Avahi, publisher state, or LAN IPv4 verification failed"
+            fi
         else
-            health_fail "mDNS" "${ACCESS_ADDRESS} does not resolve exclusively to ${current_ip}"
+            resolved=$(dns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
+            if dns_resolution_matches "${current_ip}" "${resolved}"; then
+                resolution_ready=1
+                health_ok "External DNS"
+            else
+                health_fail "External DNS" "${ACCESS_ADDRESS} does not resolve exclusively to ${current_ip}"
+            fi
         fi
     else
-        health_fail "mDNS" "Avahi, publisher state, access state, or LAN IPv4 verification failed"
+        health_fail "Name resolution" "access state or LAN IPv4 detection failed"
     fi
 
-    if (( docker_ready == 1 && mdns_ready == 1 )) &&
+    if (( docker_ready == 1 && resolution_ready == 1 )) &&
        command_exists curl &&
        verify_https "${ACCESS_ADDRESS}" 10 2; then
         health_ok "HTTPS"
@@ -838,7 +874,6 @@ command_health() {
 command_status() {
     local caddy_state
     local current_ip="not detected"
-    local mdns_name
     local mdns_state="inactive"
     local network_state="incomplete"
     local resolved_ip="not resolved"
@@ -854,16 +889,22 @@ command_status() {
     caddy_state=$(container_state caddy)
     current_ip=$(detect_ipv4_address || printf 'not detected')
 
-    mdns_name=${ACCESS_ADDRESS}
-    if command_exists systemctl &&
-       systemctl is-active --quiet avahi-daemon.service &&
-       systemctl is-active --quiet "${MDNS_SERVICE}"; then
-        mdns_state="active"
+    if [[ "${ACCESS_MODE}" == mdns ]]; then
+        if command_exists systemctl &&
+           systemctl is-active --quiet avahi-daemon.service &&
+           systemctl is-active --quiet "${MDNS_SERVICE}"; then
+            mdns_state="active"
+        fi
+        if command_exists avahi-resolve-host-name; then
+            resolved_ip=$(mdns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
+        fi
+    else
+        resolved_ip=$(dns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
     fi
-    if command_exists avahi-resolve-host-name; then
-        resolved_ip=$(mdns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
-        [[ -n "${resolved_ip}" ]] || resolved_ip="not resolved"
+    if [[ -n "${resolved_ip}" ]]; then
         resolved_ip=${resolved_ip//$'\n'/, }
+    else
+        resolved_ip="not resolved"
     fi
 
     if container_is_connected_to_network vaultwarden "${APPLIANCE_NETWORK}" &&
@@ -884,10 +925,18 @@ command_status() {
     printf 'Vaultwarden Appliance status\n\n'
     printf '%-15s %s\n' 'Vaultwarden:' "${vaultwarden_state}"
     printf '%-15s %s\n' 'Caddy:' "${caddy_state}"
+    if [[ "${ACCESS_MODE}" == mdns ]]; then
+        printf '%-15s %s\n' 'Access mode:' 'mDNS'
+    else
+        printf '%-15s %s\n' 'Access mode:' 'external DNS'
+    fi
     printf '%-15s https://%s\n' 'URL:' "${ACCESS_ADDRESS}"
-    printf '%-15s %s\n' 'mDNS:' "${mdns_state}"
-    printf '%-15s %s\n' 'mDNS name:' "${mdns_name}"
-    printf '%-15s %s\n' 'Resolved IP:' "${resolved_ip}"
+    if [[ "${ACCESS_MODE}" == mdns ]]; then
+        printf '%-15s %s\n' 'mDNS:' "${mdns_state}"
+        printf '%-15s %s\n' 'Resolved IP:' "${resolved_ip}"
+    else
+        printf '%-15s %s\n' 'DNS resolution:' "${resolved_ip}"
+    fi
     printf '%-15s %s\n' 'Current IP:' "${current_ip}"
     printf '%-15s %s\n' 'Network:' "${network_state} (${APPLIANCE_NETWORK})"
     printf '%-15s %s\n' 'VW image:' "$(container_image vaultwarden)"
@@ -930,15 +979,17 @@ command_start() {
 
     if container_is_running vaultwarden &&
        container_is_running caddy &&
-       systemctl is-active --quiet "${MDNS_SERVICE}"; then
+       { [[ "${ACCESS_MODE}" == dns ]] || systemctl is-active --quiet "${MDNS_SERVICE}"; }; then
         already_running=1
-        info "Vaultwarden, Caddy, and the mDNS publisher are already running."
+        info "Vaultwarden and Caddy are already running with the configured name resolution."
     else
         info "Starting Vaultwarden and Caddy without recreating existing containers..."
         compose up -d --no-recreate vaultwarden caddy || \
             die "Docker Compose could not start the appliance containers."
-        systemctl start "${MDNS_SERVICE}" || \
-            die "The appliance mDNS publisher could not be started."
+        if [[ "${ACCESS_MODE}" == mdns ]]; then
+            systemctl start "${MDNS_SERVICE}" || \
+                die "The appliance mDNS publisher could not be started."
+        fi
     fi
 
     verify_appliance || die "Started appliance verification failed."
@@ -957,18 +1008,21 @@ command_stop() {
     require_operation_lock
     require_appliance
     require_docker
+    load_access_state || die "The appliance access state is missing or invalid."
     require_mdns_runtime
     compose config --quiet || die "The appliance Compose configuration is invalid."
 
     if ! container_is_running vaultwarden &&
        ! container_is_running caddy &&
-       ! systemctl is-active --quiet "${MDNS_SERVICE}"; then
+       { [[ "${ACCESS_MODE}" == dns ]] || ! systemctl is-active --quiet "${MDNS_SERVICE}"; }; then
         already_stopped=1
-        info "Vaultwarden, Caddy, and the mDNS publisher are already stopped."
+        info "Vaultwarden and Caddy are already stopped."
     else
-        info "Stopping the appliance mDNS advertisement..."
-        systemctl stop "${MDNS_SERVICE}" || \
-            die "The appliance mDNS publisher could not be stopped."
+        if [[ "${ACCESS_MODE}" == mdns ]]; then
+            info "Stopping the appliance mDNS advertisement..."
+            systemctl stop "${MDNS_SERVICE}" || \
+                die "The appliance mDNS publisher could not be stopped."
+        fi
         info "Stopping Caddy and Vaultwarden without removing containers..."
         compose stop caddy vaultwarden || \
             die "Docker Compose could not stop the appliance containers."
@@ -977,17 +1031,17 @@ command_stop() {
     if container_is_running vaultwarden || container_is_running caddy; then
         die "One or more appliance containers are still running."
     fi
-    if systemctl is-active --quiet "${MDNS_SERVICE}"; then
+    if [[ "${ACCESS_MODE}" == mdns ]] && systemctl is-active --quiet "${MDNS_SERVICE}"; then
         die "The appliance mDNS publisher is still active."
     fi
 
     if (( already_stopped == 1 )); then
         info "No changes were needed."
     else
-        info "Vaultwarden, Caddy, and the mDNS publisher are stopped."
+        info "Vaultwarden and Caddy are stopped."
     fi
     info "Containers, Docker network, persistent data, and Caddy CA data were preserved."
-    info "Avahi remains running for unrelated services."
+    [[ "${ACCESS_MODE}" == dns ]] || info "Avahi remains running for unrelated services."
 }
 
 command_version() {
@@ -1227,7 +1281,7 @@ apply_access_change() {
 
     caddy_candidate=$(mktemp "${INSTALL_DIR}/.Caddyfile.vwctl.XXXXXXXX") || \
         die "Unable to create a temporary Caddyfile."
-    state_candidate=$(mktemp "${INSTALL_DIR}/.caddy-access.vwctl.XXXXXXXX") || {
+    state_candidate=$(mktemp "${INSTALL_DIR}/.access.vwctl.XXXXXXXX") || {
         rm -f -- "${caddy_candidate}"
         die "Unable to create a temporary access state file."
     }
@@ -1293,6 +1347,7 @@ apply_access_change() {
     fi
 
     ACCESS_ADDRESS=${new_address}
+    ACCESS_MODE=mdns
     info "Access configuration changed successfully."
     info "URL: https://${new_address}"
 }
@@ -1322,6 +1377,8 @@ access_hostname() {
     local default_hostname=${ACCESS_ADDRESS:-${DEFAULT_MDNS_HOSTNAME}}
     local suggestion=""
 
+    [[ "${ACCESS_MODE}" == mdns ]] || \
+        die "This appliance uses external DNS. Rerun install.sh to change its hostname or access mode."
     require_mdns_runtime
     current_ip=$(detect_ipv4_address) || die "Unable to detect a usable LAN IPv4 address for mDNS verification."
     while true; do

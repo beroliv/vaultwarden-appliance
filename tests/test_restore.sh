@@ -40,7 +40,6 @@ MSYS2_ARG_CONV_EXCL='/CN=' openssl req -x509 -newkey rsa:2048 -nodes -days 1 -su
 printf 'config\n' > "${template}/caddy/config/autosave.json"
 printf 'Vaultwarden Appliance\n' > "${template}/appliance/.vaultwarden-appliance"
 printf '1.0.0\n' > "${template}/appliance/.appliance-version"
-printf 'hostname=vaultwarden.local\n' > "${template}/appliance/.caddy-access"
 write_caddyfile_to "${template}/appliance/Caddyfile" vaultwarden.local
 cat > "${template}/appliance/docker-compose.yml" <<'COMPOSE'
 services:
@@ -85,7 +84,6 @@ write_manifest() {
 backup_schema=${schema}
 appliance_version=${version_value}
 created_at_utc=2026-08-09T02:30:00Z
-access_hostname=vaultwarden.local
 signup_allowed=true
 vaultwarden_image=vaultwarden/server:latest
 vaultwarden_version=1.34.3
@@ -97,6 +95,8 @@ top_level_contents=manifest,vaultwarden,caddy,appliance
 MANIFEST
 }
 write_manifest "${template}/manifest"
+RESTORE_ACCESS_MODE=mdns
+RESTORE_HOSTNAME=vaultwarden.local
 
 make_generation() {
     local output_directory=$1
@@ -127,7 +127,7 @@ valid_archive=$(make_generation "${valid_dir}")
 expect_success "schema-one archive and checksum are accepted" restore_generation_is_valid "${valid_archive}" "${temporary_dir}"
 expect_success "valid backup extracts and passes semantic validation" \
     verify_extracted_generation "${valid_archive}" "${temporary_dir}/valid-work"
-expect_equal "manifest hostname is retained" vaultwarden.local "${RESTORE_HOSTNAME}"
+expect_equal "current hostname remains authoritative" vaultwarden.local "${RESTORE_HOSTNAME}"
 expect_equal "manifest signup setting is retained" true "${RESTORE_SIGNUP_ALLOWED}"
 valid_hash=$(restore_checksum_hash "${valid_archive}")
 expect_equal "verified checksum is 64 characters" 64 "${#valid_hash}"
@@ -257,12 +257,6 @@ mismatch_archive=$(make_generation "${temporary_dir}/mismatch" 20260809-023009)
 expect_failure "mismatched Caddy root certificate and private key are rejected" \
     verify_extracted_generation "${mismatch_archive}" "${temporary_dir}/mismatch-work"
 cp -- "${temporary_dir}/original.key" "${template}/caddy/data/caddy/pki/authorities/local/root.key"
-
-printf 'hostname=other.local\n' > "${template}/appliance/.caddy-access"
-hostname_archive=$(make_generation "${temporary_dir}/hostname" 20260809-023010)
-expect_failure "manifest, access state, and Caddy hostname disagreement is rejected" \
-    verify_extracted_generation "${hostname_archive}" "${temporary_dir}/hostname-work"
-printf 'hostname=vaultwarden.local\n' > "${template}/appliance/.caddy-access"
 
 cp -- "${template}/manifest" "${temporary_dir}/manifest.original"
 printf 'vaultwarden_version=$(touch %s)\n' "${temporary_dir}/manifest-pwned" >> "${template}/manifest"
@@ -519,6 +513,42 @@ readiness_mdns_and_https_delayed() (
 )
 expect_success "combined delayed mDNS and HTTPS readiness succeeds" readiness_mdns_and_https_delayed
 
+readiness_external_dns() (
+    RESTORE_ACCESS_MODE=dns
+    RESTORE_HOSTNAME=vault.lan
+    detect_ipv4_address() { printf '192.168.0.192\n'; }
+    container_is_running() { return 0; }
+    dns_resolved_ipv4s() { printf '192.168.0.192\n'; }
+    systemctl() { return 1; }
+    mdns_ready_file_matches() { return 1; }
+    mdns_resolved_ipv4s() { return 1; }
+    restore_https_alive_is_ready() { return 0; }
+    restore_post_restore_conditions_are_ready 192.168.0.192
+)
+expect_success "external DNS readiness does not require mDNS or Avahi" readiness_external_dns
+
+dns_restore_skips_mdns_state() (
+    local detection_marker="${temporary_dir}/unexpected-dns-mdns-state"
+
+    RESTORE_ACCESS_MODE=dns
+    detect_ipv4_address() { printf 'called\n' > "${detection_marker}"; }
+    restore_write_mdns_state && [[ ! -e "${detection_marker}" ]]
+)
+expect_success "external DNS restore does not recreate mDNS state" dns_restore_skips_mdns_state
+
+external_dns_reconciliation() (
+    RESTORE_WORK_DIR="${temporary_dir}/dns-reconciliation"
+    RESTORE_HOSTNAME=vault.lan
+    RESTORE_SIGNUP_ALLOWED=true
+    mkdir -p -- "${RESTORE_WORK_DIR}"
+    docker() { return 0; }
+    restore_validate_reconciliation &&
+        grep -Fxq 'https://vault.lan {' "${RESTORE_WORK_DIR}/reconciled-Caddyfile" &&
+        grep -Fxq '      DOMAIN: "https://vault.lan"' "${RESTORE_WORK_DIR}/reconciled-compose.yml"
+)
+expect_success "restore reconciles Caddy and DOMAIN from current external DNS access" \
+    external_dns_reconciliation
+
 readiness_never_available() (
     SECONDS=0
     detect_ipv4_address() { printf '192.168.0.192\n'; }
@@ -643,6 +673,8 @@ expect_success "current code regenerates Caddy hostname configuration" grep -Fq 
     'write_caddyfile_to "${caddy_candidate}" "${RESTORE_HOSTNAME}"' "${REPO_DIR}/libexec/restore"
 expect_success "current code reconciles Vaultwarden DOMAIN and signup" grep -Fq \
     'write_vaultwarden_override_to "${override_candidate}"' "${REPO_DIR}/libexec/restore"
+expect_failure "restore never writes the authoritative access configuration" grep -Eq \
+    '(^|[[:space:]])(mv|install|cp)[^#]*ACCESS_FILE' "${REPO_DIR}/libexec/restore"
 expect_success "restored Caddy root is re-exported byte-for-byte" grep -Fq \
     'cmp -s "${root_ca}" "${EXPORTED_ROOT_CA}"' "${REPO_DIR}/libexec/restore"
 

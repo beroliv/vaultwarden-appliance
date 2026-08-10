@@ -28,7 +28,6 @@ unset library library_path
 readonly INSTALL_DIR="/opt/vaultwarden"
 readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
 readonly APPLIANCE_VERSION_FILE="${INSTALL_DIR}/.appliance-version"
-readonly ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
 readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
 readonly LOCAL_BACKUP_DIR="${INSTALL_DIR}/backups"
 readonly VAULTWARDEN_DATA_DIR="${INSTALL_DIR}/data/vaultwarden"
@@ -152,8 +151,6 @@ backup_require_environment() {
         backup_die "The appliance marker is missing or unsafe."
     [[ -f "${APPLIANCE_VERSION_FILE}" && ! -L "${APPLIANCE_VERSION_FILE}" ]] || \
         backup_die "The appliance version state is missing or unsafe."
-    [[ -f "${ACCESS_FILE}" && ! -L "${ACCESS_FILE}" ]] || \
-        backup_die "The appliance access state is missing or unsafe."
     [[ -d "${VAULTWARDEN_DATA_DIR}" && ! -L "${VAULTWARDEN_DATA_DIR}" ]] || \
         backup_die "Vaultwarden persistent data is missing or unsafe."
     [[ -d "${CADDY_DATA_DIR}" && ! -L "${CADDY_DATA_DIR}" ]] || \
@@ -379,7 +376,6 @@ backup_copy_appliance_configuration() {
     local -a files=(
         .vaultwarden-appliance
         .appliance-version
-        .caddy-access
         .backup-device
         docker-compose.yml
         docker-compose.override.yml
@@ -393,7 +389,6 @@ backup_copy_appliance_configuration() {
         install -m 0600 -- "${appliance_directory}/${source}" "${destination}/${source}" || return 1
     done
     [[ -f "${destination}/.appliance-version" &&
-       -f "${destination}/.caddy-access" &&
        -f "${destination}/docker-compose.yml" &&
        -f "${destination}/docker-compose.override.yml" ]]
 }
@@ -411,16 +406,15 @@ backup_write_manifest() {
     local destination=$1
     local appliance_version=$2
     local created_at=$3
-    local hostname=$4
-    local signup_allowed=$5
-    local vaultwarden_image=$6
-    local vaultwarden_version=$7
-    local caddy_image=$8
-    local caddy_version=$9
-    local architecture=${10}
+    local signup_allowed=$4
+    local vaultwarden_image=$5
+    local vaultwarden_version=$6
+    local caddy_image=$7
+    local caddy_version=$8
+    local architecture=$9
     local value
 
-    for value in "${appliance_version}" "${created_at}" "${hostname}" \
+    for value in "${appliance_version}" "${created_at}" \
         "${signup_allowed}" "${vaultwarden_image}" "${vaultwarden_version}" \
         "${caddy_image}" "${caddy_version}" "${architecture}"; do
         backup_manifest_value "${value}" >/dev/null || return 1
@@ -429,7 +423,6 @@ backup_write_manifest() {
         "backup_schema=${BACKUP_SCHEMA}" \
         "appliance_version=${appliance_version}" \
         "created_at_utc=${created_at}" \
-        "access_hostname=${hostname}" \
         "signup_allowed=${signup_allowed}" \
         "vaultwarden_image=${vaultwarden_image}" \
         "vaultwarden_version=${vaultwarden_version}" \
@@ -830,7 +823,6 @@ backup_create_local_generation() {
     local caddy_version
     local created_at
     local destination_archive
-    local hostname
     local signup_allowed
     local staged_archive
     local timestamp
@@ -845,7 +837,6 @@ backup_create_local_generation() {
     mapfile -t version_lines < "${APPLIANCE_VERSION_FILE}"
     ((${#version_lines[@]} == 1)) || backup_die "The appliance version state is invalid."
     appliance_version=${version_lines[0]}
-    hostname=$(read_access_hostname "${ACCESS_FILE}") || backup_die "The access state is invalid."
     signup_allowed=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' vaultwarden |
         awk -F= '$1 == "SIGNUPS_ALLOWED" {print tolower(substr($0, index($0, "=") + 1)); exit}') || true
     [[ "${signup_allowed}" == "true" || "${signup_allowed}" == "false" ]] || signup_allowed=unknown
@@ -860,7 +851,7 @@ backup_create_local_generation() {
     created_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     backup_write_manifest \
         "${BACKUP_WORK_DIR}/vaultwarden-appliance-backup/manifest" \
-        "${appliance_version}" "${created_at}" "${hostname}" "${signup_allowed}" \
+        "${appliance_version}" "${created_at}" "${signup_allowed}" \
         "${vaultwarden_image}" "${vaultwarden_version}" \
         "${caddy_image}" "${caddy_version}" "$(uname -m)" || \
         backup_die "Unable to create backup manifest."

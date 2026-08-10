@@ -10,9 +10,34 @@ command_exists() {
 validate_local_hostname() {
     local hostname=$1
 
-    (( ${#hostname} <= 69 )) || return 1
+    validate_hostname "${hostname}" || return 1
+    [[ "${hostname}" == *.local ]]
+}
+
+validate_dns_hostname() {
+    local hostname=$1
+
+    validate_hostname "${hostname}" || return 1
+    [[ "${hostname}" != *.local ]]
+}
+
+validate_hostname() {
+    local hostname=$1
+    local label
+    local -a labels
+
+    [[ -n "${hostname}" && ${#hostname} -le 253 ]] || return 1
     [[ "${hostname}" == "${hostname,,}" ]] || return 1
-    [[ "${hostname}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.local$ ]]
+    [[ "${hostname}" == *.* && "${hostname}" != .* && "${hostname}" != *. ]] || return 1
+    [[ ! "${hostname}" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+    validate_ipv4_address "${hostname}" && return 1
+
+    IFS='.' read -r -a labels <<<"${hostname}"
+    (( ${#labels[@]} >= 2 )) || return 1
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 ]] || return 1
+        [[ "${label}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+    done
 }
 
 validate_ipv4_address() {
@@ -35,22 +60,95 @@ validate_ipv4_address() {
 appliance_url_for_hostname() {
     local hostname=$1
 
-    validate_local_hostname "${hostname}" || return 1
+    validate_hostname "${hostname}" || return 1
     printf 'https://%s\n' "${hostname}"
 }
 
-read_access_hostname() {
+validate_access_configuration() {
+    local mode=$1
+    local hostname=$2
+
+    case "${mode}" in
+        mdns) validate_local_hostname "${hostname}" ;;
+        dns) validate_dns_hostname "${hostname}" ;;
+        *) return 1 ;;
+    esac
+}
+
+access_config_file_is_safe() {
     local state_file=$1
+    local owner
+    local permissions
+
+    [[ -f "${state_file}" && ! -L "${state_file}" ]] || return 1
+    owner=$(stat -c '%u' "${state_file}" 2>/dev/null) || return 1
+    permissions=$(stat -c '%a' "${state_file}" 2>/dev/null) || return 1
+    [[ "${owner}" == 0 && "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#${permissions} & 8#002) == 0 ))
+}
+
+read_access_config() {
+    local state_file=$1
+    local key
+    local mode=""
     local hostname
+    local value
+    local line
     local -a lines
 
     [[ -f "${state_file}" && ! -L "${state_file}" ]] || return 1
     mapfile -t lines < "${state_file}" || return 1
-    (( ${#lines[@]} == 1 )) || return 1
-    [[ "${lines[0]}" == hostname=* ]] || return 1
-    hostname=${lines[0]#hostname=}
-    validate_local_hostname "${hostname}" || return 1
-    printf '%s\n' "${hostname}"
+    (( ${#lines[@]} == 2 )) || return 1
+    [[ "${lines[0]}" == mode=* && "${lines[1]}" == hostname=* ]] || return 1
+    hostname=""
+    for line in "${lines[@]}"; do
+        [[ "${line}" =~ ^([a-z]+)=([^=]+)$ ]] || return 1
+        key=${BASH_REMATCH[1]}
+        value=${BASH_REMATCH[2]}
+        case "${key}" in
+            mode)
+                [[ -z "${mode}" ]] || return 1
+                mode=${value}
+                ;;
+            hostname)
+                [[ -z "${hostname}" ]] || return 1
+                hostname=${value}
+                ;;
+            *) return 1 ;;
+        esac
+    done
+    validate_access_configuration "${mode}" "${hostname}" || return 1
+    printf '%s\t%s\n' "${mode}" "${hostname}"
+}
+
+write_access_config_atomic() {
+    local destination=$1
+    local mode=$2
+    local hostname=$3
+    local directory
+    local temporary=""
+
+    validate_access_configuration "${mode}" "${hostname}" || return 1
+    directory=$(dirname -- "${destination}") || return 1
+    [[ -d "${directory}" && ! -L "${directory}" ]] || return 1
+    if [[ -e "${destination}" || -L "${destination}" ]]; then
+        [[ -f "${destination}" && ! -L "${destination}" ]] || return 1
+    fi
+    temporary=$(mktemp "${directory}/.access.XXXXXXXX") || return 1
+    if ! printf 'mode=%s\nhostname=%s\n' "${mode}" "${hostname}" > "${temporary}" ||
+       ! chmod 0644 "${temporary}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    if [[ -f "${destination}" ]] && cmp -s "${temporary}" "${destination}" &&
+       access_config_file_is_safe "${destination}"; then
+        rm -f -- "${temporary}"
+        return 0
+    fi
+    if ! mv -f -- "${temporary}" "${destination}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
 }
 
 acquire_appliance_lock() {

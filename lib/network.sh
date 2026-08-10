@@ -50,3 +50,20 @@ port_is_in_use() {
             /proc/net/tcp /proc/net/tcp6 2>/dev/null
     fi
 }
+
+dns_resolved_ipv4s() {
+    local hostname=$1
+
+    validate_hostname "${hostname}" || return 1
+    command_exists getent || return 1
+    timeout 4 getent ahostsv4 "${hostname}" 2>/dev/null |
+        awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ && !seen[$1]++ {print $1}' |
+        sort -u
+}
+
+dns_resolution_matches() {
+    local expected_ip=$1
+    local resolved=$2
+
+    [[ "${resolved}" == "${expected_ip}" ]]
+}

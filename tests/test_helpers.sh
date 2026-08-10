@@ -52,22 +52,49 @@ expect_success "valid private IPv4 address" validate_ipv4_address 192.168.0.192
 expect_failure "IPv4 octet above 255" validate_ipv4_address 192.168.0.256
 expect_failure "unspecified IPv4 address" validate_ipv4_address 0.0.0.0
 expect_failure "non-numeric IPv4 address" validate_ipv4_address 192.168.one.1
+expect_success "external DNS health accepts the exact LAN IPv4" \
+    dns_resolution_matches 192.168.0.192 192.168.0.192
+expect_failure "external DNS health rejects a wrong IPv4" \
+    dns_resolution_matches 192.168.0.192 192.168.0.193
+expect_failure "external DNS health rejects multiple IPv4 results" \
+    dns_resolution_matches 192.168.0.192 $'192.168.0.192\n192.168.0.193'
 
 expect_success "valid .local hostname" validate_local_hostname vaultwarden.local
 expect_success "valid hyphenated .local hostname" validate_local_hostname vault-2.local
 expect_failure "uppercase hostname" validate_local_hostname Vaultwarden.local
 expect_failure "non-local hostname" validate_local_hostname vaultwarden.example
+expect_success "valid external DNS hostname" validate_dns_hostname vault.home.arpa
+expect_failure "external DNS rejects .local" validate_dns_hostname vaultwarden.local
+expect_failure "hostname validator rejects URL" validate_hostname https://vault.lan
+expect_failure "hostname validator rejects port" validate_hostname vault.lan:443
+expect_failure "hostname validator rejects path" validate_hostname vault.lan/path
+expect_failure "hostname validator rejects IP" validate_hostname 192.168.0.192
+expect_failure "hostname validator rejects malformed IP text" validate_hostname 999.168.0.192
 
-printf 'hostname=vaultwarden.local\n' > "${temporary_dir}/access"
-if [[ "$(read_access_hostname "${temporary_dir}/access")" == "vaultwarden.local" ]]; then
-    pass "current access state parses"
+printf 'mode=mdns\nhostname=vaultwarden.local\n' > "${temporary_dir}/access"
+if [[ "$(read_access_config "${temporary_dir}/access")" == $'mdns\tvaultwarden.local' ]]; then
+    pass "mDNS access state parses"
 else
-    fail "current access state parses"
+    fail "mDNS access state parses"
 fi
-printf 'mode=hostname\naddress=vaultwarden.local\n' > "${temporary_dir}/legacy-access"
-expect_failure "legacy two-line access state is rejected" read_access_hostname "${temporary_dir}/legacy-access"
-printf 'hostname=192.168.0.192\n' > "${temporary_dir}/ip-access"
-expect_failure "IP access state is rejected" read_access_hostname "${temporary_dir}/ip-access"
+printf 'mode=dns\nhostname=vault.lan\n' > "${temporary_dir}/dns-access"
+if [[ "$(read_access_config "${temporary_dir}/dns-access")" == $'dns\tvault.lan' ]]; then
+    pass "external DNS access state parses"
+else
+    fail "external DNS access state parses"
+fi
+printf 'mode=mdns\nmode=dns\n' > "${temporary_dir}/duplicate-access"
+expect_failure "duplicate access key is rejected" read_access_config "${temporary_dir}/duplicate-access"
+printf 'hostname=vaultwarden.local\nmode=mdns\n' > "${temporary_dir}/reversed-access"
+expect_failure "reordered access keys are rejected" read_access_config "${temporary_dir}/reversed-access"
+printf 'mode=mdns\naddress=vaultwarden.local\n' > "${temporary_dir}/unknown-access"
+expect_failure "unknown access key is rejected" read_access_config "${temporary_dir}/unknown-access"
+printf 'mode=hostname\nhostname=vaultwarden.local\n' > "${temporary_dir}/mode-access"
+expect_failure "unknown access mode is rejected" read_access_config "${temporary_dir}/mode-access"
+printf 'mode=mdns\nhostname=192.168.0.192\n' > "${temporary_dir}/ip-access"
+expect_failure "IP access state is rejected" read_access_config "${temporary_dir}/ip-access"
+printf 'mode=dns\nhostname=vaultwarden.local\n' > "${temporary_dir}/dns-local-access"
+expect_failure "external DNS .local state is rejected" read_access_config "${temporary_dir}/dns-local-access"
 
 write_caddyfile_to "${temporary_dir}/Caddyfile" vaultwarden.local
 if grep -Fxq 'https://vaultwarden.local {' "${temporary_dir}/Caddyfile" &&
@@ -82,6 +109,12 @@ if [[ "$(read_caddyfile_hostname "${temporary_dir}/Caddyfile")" == "vaultwarden.
 else
     fail "generated Caddyfile hostname parses"
 fi
+write_caddyfile_to "${temporary_dir}/Caddyfile-dns" vault.lan
+if [[ "$(read_caddyfile_hostname "${temporary_dir}/Caddyfile-dns")" == "vault.lan" ]]; then
+    pass "external DNS Caddyfile hostname parses"
+else
+    fail "external DNS Caddyfile hostname parses"
+fi
 
 if [[ "$(vaultwarden_domain_for_hostname vaultwarden.local)" == "https://vaultwarden.local" ]]; then
     pass "DOMAIN URL generation"
@@ -95,6 +128,9 @@ if grep -Fxq '      DOMAIN: "https://vaultwarden.local"' "${temporary_dir}/overr
 else
     fail "managed Compose override contains DOMAIN and signup state"
 fi
+write_vaultwarden_override_to "${temporary_dir}/override-dns.yml" vault.lan true
+expect_success "external DNS DOMAIN is generated" grep -Fxq \
+    '      DOMAIN: "https://vault.lan"' "${temporary_dir}/override-dns.yml"
 
 if command_exists flock; then
     lock_file="${temporary_dir}/operation.lock"

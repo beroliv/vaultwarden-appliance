@@ -197,14 +197,29 @@ printf 'private root\n' > "${data_dir}/caddy/data/caddy/pki/authorities/local/ro
 
 manifest_test="${temporary_dir}/manifest"
 expect_success "schema-one manifest is generated" backup_write_manifest \
-    "${manifest_test}" 0.1.0 2026-08-08T23:30:00Z vaultwarden.local true \
+    "${manifest_test}" 0.1.0 2026-08-08T23:30:00Z true \
     vaultwarden/server:latest 'Vaultwarden 1.37.0' caddy:2 v2.10.0 aarch64
 expect_success "manifest records CA inclusion and expected contents" grep -Fxq \
     'caddy_ca_included=yes' "${manifest_test}"
+expect_failure "manifest does not contain access configuration" grep -Eq \
+    '^(access_|hostname=)' "${manifest_test}"
 expect_failure "manifest rejects newline injection" backup_write_manifest \
     "${temporary_dir}/unsafe-manifest" 0.1.0 2026-08-08T23:30:00Z \
-    $'vaultwarden.local\nunexpected=value' true vaultwarden/server:latest \
+    $'true\nunexpected=value' vaultwarden/server:latest \
     'Vaultwarden 1.37.0' caddy:2 v2.10.0 aarch64
+
+appliance_fixture="${temporary_dir}/appliance"
+appliance_copy="${temporary_dir}/appliance-copy"
+mkdir -p -- "${appliance_fixture}" "${appliance_copy}"
+printf 'Vaultwarden Appliance\n' > "${appliance_fixture}/.vaultwarden-appliance"
+printf '0.1.0\n' > "${appliance_fixture}/.appliance-version"
+printf 'mode=dns\nhostname=vault.lan\n' > "${appliance_fixture}/.access"
+printf 'compose\n' > "${appliance_fixture}/docker-compose.yml"
+printf 'caddy compose\n' > "${appliance_fixture}/docker-compose.override.yml"
+expect_success "appliance configuration is staged without access state" \
+    backup_copy_appliance_configuration "${appliance_fixture}" "${appliance_copy}"
+expect_failure "access configuration is excluded from backup staging" \
+    test -e "${appliance_copy}/.access"
 
 tar() {
     return 1

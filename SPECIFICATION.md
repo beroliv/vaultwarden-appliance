@@ -6,9 +6,10 @@ Vaultwarden Appliance deploys and operates a LAN-only Vaultwarden service on a
 supported Debian-based Linux system. It combines upstream Vaultwarden, Caddy,
 Docker, Docker Compose, and Avahi rather than modifying those projects.
 
-The implemented appliance includes installation, local HTTPS, mDNS access,
-`vwctl` lifecycle management, verified local-first backups, optional USB
-replication, automatic retention, restore, and complete local removal.
+The implemented appliance includes installation, local HTTPS, selectable mDNS
+or existing local-DNS access, `vwctl` lifecycle management, verified local-first
+backups, optional USB replication, automatic retention, restore, and complete
+local removal.
 
 Restore is implemented for the appliance's schema-1 backup format, covered by
 non-destructive fixture tests, and validated through a real appliance-backup
@@ -32,8 +33,9 @@ free space is required at installation time.
 
 Root privileges are required for installation and every mutating management
 operation. Internet access is required for initial source, package, and
-container-image downloads. LAN clients require working mDNS support to resolve
-the appliance's `.local` hostname.
+container-image downloads. LAN clients require working mDNS support for the
+default `.local` name or access to the administrator's selected local DNS
+server.
 
 ## 3. Scope and exclusions
 
@@ -76,7 +78,7 @@ The runtime layout includes:
 /opt/vaultwarden/
   .vaultwarden-appliance
   .appliance-version
-  .caddy-access
+  .access
   .backup-device                  # only after USB setup
   docker-compose.yml
   docker-compose.override.yml
@@ -228,10 +230,11 @@ left untouched and MUST NOT be adopted.
 Marked installations are reconciled idempotently. Safe missing project files,
 runtime directories, systemd units, managed overrides, and containers may be
 recreated. Existing Vaultwarden data, Caddy persistent data and root CA, local
-backups, access state, and USB state MUST NOT be overwritten or deleted.
+backups and USB state MUST NOT be overwritten or deleted.
 
-Reruns MUST preserve an existing configured hostname and MUST NOT silently
-select a new one.
+Every interactive rerun MUST offer the current hostname and mode as defaults and
+ask again. Unchanged answers are idempotent; changed answers reconcile only the
+access-related configuration.
 
 ## 8. Docker and network architecture
 
@@ -251,21 +254,24 @@ the same Docker network, and binds only `443:443/tcp` on the host. Caddy reaches
 Vaultwarden by the service name `vaultwarden`, never by a hard-coded container
 IP address. The Caddy admin API is not exposed to the LAN.
 
-## 9. Local HTTPS and mDNS
+## 9. Local HTTPS and name resolution
 
-The single supported access model is a valid lowercase single-label `.local`
-hostname. The default is:
+The default is `https://vaultwarden.local` through mDNS. An administrator may
+instead select an existing local DNS server and a valid non-`.local` name such
+as `vault.lan` or `vault.home.arpa`.
 
-```text
-https://vaultwarden.local
-```
-
-The selected hostname is stored as one non-secret line in
-`/opt/vaultwarden/.caddy-access`:
+The authoritative runtime access configuration is `/opt/vaultwarden/.access`:
 
 ```text
+mode=mdns
 hostname=vaultwarden.local
 ```
+
+The only valid modes are `mdns` and `dns`. The file MUST be root-owned,
+non-world-writable, atomically written, and strictly parsed without `source` or
+`eval`; duplicate, unknown, or malformed keys MUST be rejected. mDNS requires a
+`.local` suffix and DNS mode rejects it. IP addresses, URLs, ports, paths,
+whitespace, shell syntax, and malformed DNS labels MUST be rejected.
 
 Caddy's generated configuration is equivalent to:
 
@@ -280,32 +286,27 @@ https://vaultwarden.local {
 }
 ```
 
-`tls internal` MUST be used. Public ACME issuers MUST NOT be configured. Caddy's
-persistent data MUST survive container recreation so its internal root CA
-remains stable.
+The selected hostname replaces `vaultwarden.local` in DNS mode. `tls internal`
+MUST be used. Public ACME issuers MUST NOT be configured. Caddy's persistent
+data MUST survive hostname and container changes so its internal root CA remains
+stable.
 
-The installer and `vwctl access` validate the hostname and detect an existing
-remote mDNS advertisement. A conflict MUST be rejected; duplicate ownership
-MUST NOT be forced. A conflict-free alternative may be proposed.
+Every interactive installer run asks for hostname and mode. In mDNS mode it
+detects remote advertisements, rejects duplicate ownership, and may propose a
+conflict-free alternative. It publishes an explicit hostname-to-LAN-IPv4 mapping
+through the appliance systemd service and `avahi-publish-address -R --no-fail`.
+The publisher declares readiness only after `avahi-resolve-host-name -4`
+resolves exclusively to that IPv4 address.
 
-The appliance publishes an explicit mapping from the hostname to the detected
-default-route LAN IPv4 address through an appliance-owned systemd service and
-`avahi-publish-address -R --no-fail`. `-R` prevents creation of a competing
-reverse record for the machine's existing LAN address. The Linux hostname and
-Avahi global hostname MUST remain unchanged.
+In DNS mode the installer removes/disables only the appliance-owned publisher,
+preserves Avahi and its packages, prints the required DNS record, and warns
+without aborting when the record is not ready. It MUST NOT configure any DNS
+server. Switching back to mDNS reinstalls or re-enables the same publisher
+architecture.
 
-The publisher wrapper stays attached to systemd and writes readiness state only
-after `avahi-resolve-host-name -4` resolves exclusively to the configured LAN
-IPv4 address. Early publisher exit, collision, wrong address, or inactive
-service is a failure and recent journal output is diagnostic evidence.
-
-mDNS resolution and certificate trust are independent. Resolving the hostname
-does not trust Caddy's CA, and trusting the CA does not provide `.local` name
-resolution. mDNS is link-local and may be blocked across VLANs, guest networks,
-VPNs, multicast filters, or incompatible client resolver policies.
-
-The appliance MUST NOT change router, DNS, DHCP, interface, gateway, static-IP,
-or client hosts-file configuration.
+The Linux hostname and Avahi global hostname MUST remain unchanged. The
+appliance MUST NOT change router, DNS, DHCP, interface, gateway, static-IP,
+system-hostname, or client hosts-file configuration.
 
 ## 10. Vaultwarden defaults
 
@@ -315,7 +316,7 @@ Fresh installations use:
 Account registration: enabled
 Admin panel:          not configured
 Admin token:          not configured
-DOMAIN:               https://<selected-name>.local
+DOMAIN:               https://<selected-hostname>
 ```
 
 The external `DOMAIN` and signup state are appliance-managed in
@@ -378,20 +379,24 @@ not acquire the lock.
 
 ### 11.2 Status and health
 
-`vwctl status` reports container, access URL, mDNS, resolved/current IPv4,
-network, image, signup, and public root CA state.
+`vwctl status` reports the selected access mode, URL, applicable mDNS or DNS
+resolution, current IPv4, containers, network, images, signup, and public root
+CA state.
 
 `vwctl health` is read-only and reports every failed check before returning
 non-zero. It verifies Docker and Compose, both containers, network membership,
-host port exposure, Avahi and publisher readiness, mDNS address, Vaultwarden
-`DOMAIN`, HTTPS `/alive` using the exported root CA, consistency of the public
-CA export, persistent data directories, and free space.
+host port exposure, selected name resolution, Vaultwarden `DOMAIN`, HTTPS
+`/alive` using the exported root CA, consistency of the public CA export,
+persistent data directories, and free space. Avahi and publisher readiness are
+required only in mDNS mode; external DNS MUST resolve exclusively to the current
+LAN IPv4.
 
 ### 11.3 Lifecycle operations
 
-`start` starts existing containers without unnecessary recreation, starts mDNS,
-and verifies the endpoint. `stop` stops mDNS and both containers without
-removing containers, the network, data, or Caddy CA. Avahi remains running.
+`start` starts existing containers without unnecessary recreation, starts mDNS
+when configured, and verifies the endpoint. `stop` stops the configured mDNS
+publisher when applicable and both containers without removing containers, the
+network, data, or Caddy CA. Avahi remains running.
 `restart` recreates only the appliance containers using existing bind mounts and
 verifies the result.
 
@@ -400,9 +405,11 @@ does not follow indefinitely.
 
 ### 11.4 Hostname changes
 
-`sudo vwctl access [hostname]` supports `.local` hostname changes only. It
-validates conflicts and confirmation, stores the persistent Caddy root CA hash,
-regenerates the complete Caddyfile and access state, updates mDNS and
+`sudo vwctl access [hostname]` supports `.local` hostname changes within mDNS
+mode only. Installer reruns are the supported way to select external DNS or
+switch modes. The command validates conflicts and confirmation, stores the
+persistent Caddy root CA hash, regenerates the complete Caddyfile and access
+state, updates mDNS and
 Vaultwarden `DOMAIN`, removes and recreates only Caddy where possible, and
 verifies the resulting HTTPS endpoint with the exported CA.
 
@@ -562,12 +569,13 @@ Vaultwarden's supported built-in backup command creates the SQLite snapshot
 with `VACUUM INTO`. Live `db.sqlite3`, WAL, and SHM files MUST NOT be copied as
 the snapshot. Vaultwarden remains running.
 
-The archive contains remaining persistent Vaultwarden files, selected appliance
-configuration/state, and complete Caddy persistent data so a future restore can
-preserve the internal root CA. The manifest uses `backup_schema=1`, records
-version, UTC time, hostname, signup state, image/version data where available,
-architecture, CA inclusion, and expected contents, and contains no credential
-or private-key content itself.
+The archive contains remaining persistent Vaultwarden files, selected
+non-access appliance configuration/state, and complete Caddy persistent data so
+a future restore can preserve the internal root CA. `/opt/vaultwarden/.access`
+MUST NOT be included. The manifest uses `backup_schema=1` and records version,
+UTC time, signup state, image/version data where available, architecture, CA
+inclusion, and expected contents. It contains no hostname/mode field,
+credential, or private-key content itself.
 
 Complete Caddy data includes sensitive CA private-key material as opaque backup
 files. Backups are not encrypted and MUST be protected physically and by access
@@ -704,8 +712,8 @@ verifies all of the following:
 - the exact schema-1 manifest keys and safe values without sourcing or
   evaluating backup content;
 - a valid SQLite snapshot header;
-- the appliance marker, version, access, Caddyfile, official-image Compose,
-  internal network, and signup state agree with the manifest; and
+- the appliance marker, version, official-image Compose, internal network, and
+  signup state agree with the manifest; and
 - Caddy's internal root certificate and private key are present, parseable,
   and form one cryptographic key pair.
 
@@ -721,25 +729,26 @@ checksum, USB identity, topology, and read-only mount are revalidated after
 confirmation.
 
 Restore records and suspends the automatic-backup timer, stops the backup
-service and appliance mDNS publisher, then stops Caddy and Vaultwarden. It
+service and the appliance mDNS publisher when active, then stops Caddy and
+Vaultwarden. It
 replaces only `/opt/vaultwarden/data/vaultwarden` and
 `/opt/vaultwarden/data/caddy` from the verified staging tree and installs the
 verified database snapshot without stale WAL/SHM files. Existing local backup
 generations under `/opt/vaultwarden/backups` are outside that replacement and
 MUST remain intact.
 
-The currently installed management code and base/Caddy Compose files remain
-authoritative. Restore regenerates only the appliance-managed access state,
-Caddyfile, Vaultwarden `DOMAIN`/signup override, and mDNS state from the
-validated backup manifest. Backed-up scripts or executables are never run or
-installed.
+The currently installed management code, `.access`, and base/Caddy Compose files
+remain authoritative. Restore MUST preserve `.access`, regenerate Caddyfile and
+Vaultwarden `DOMAIN` from its current hostname, and reconcile mDNS only when its
+current mode is `mdns`. External DNS mode remains free of an appliance
+publisher. Backed-up scripts or executables are never run or installed.
 
 The restored Caddy data includes the selected backup's original internal root
 CA and private key. The public root is exported again, preserving trust for
 clients that already trust that backup's CA. Vaultwarden and Caddy are started,
-the hostname, mDNS mapping, `DOMAIN`, networks, host-port policy, HTTPS endpoint,
-and CA continuity are checked through `vwctl health`, and only then may USB
-UUID state be adopted and the prior timer state restored.
+the selected name resolution, `DOMAIN`, networks, host-port policy, HTTPS
+endpoint, and CA continuity are checked through `vwctl health`, and only then
+may USB UUID state be adopted and the prior timer state restored.
 
 Restore does not create an automatic pre-restore backup and does not perform an
 automatic data rollback after replacement begins. A critical post-confirmation

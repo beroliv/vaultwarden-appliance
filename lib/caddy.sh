@@ -4,7 +4,7 @@ write_caddyfile_to() {
     local destination=$1
     local hostname=$2
 
-    validate_local_hostname "${hostname}" || return 1
+    validate_hostname "${hostname}" || return 1
     printf '%s\n' \
         '{' \
         $'\tauto_https disable_redirects' \
@@ -30,6 +30,6 @@ read_caddyfile_hostname() {
     }' "${caddyfile}")
     (( ${#hostnames[@]} == 1 )) || return 1
     hostname=${hostnames[0]}
-    validate_local_hostname "${hostname}" || return 1
+    validate_hostname "${hostname}" || return 1
     printf '%s\n' "${hostname}"
 }

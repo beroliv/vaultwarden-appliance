@@ -24,7 +24,7 @@ readonly INSTALL_DIR="/opt/vaultwarden"
 readonly APPLIANCE_MARKER="${INSTALL_DIR}/.vaultwarden-appliance"
 readonly BASE_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 readonly VWCTL_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.vwctl.yml"
-readonly CADDY_ACCESS_FILE="${INSTALL_DIR}/.caddy-access"
+readonly ACCESS_FILE="${INSTALL_DIR}/.access"
 readonly CADDYFILE="${INSTALL_DIR}/Caddyfile"
 readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
 readonly CADDY_DATA_DIR="${INSTALL_DIR}/data/caddy/data"
@@ -98,8 +98,9 @@ DOCKER_CODENAME=""
 DOCKER_USER=""
 DOCKER_GROUP_CHANGED=0
 APPLIANCE_STATE="fresh"
-CADDY_STATE="absent"
+ACCESS_MODE="mdns"
 CADDY_ACCESS_ADDRESS=""
+CADDY_CONFIG_CHANGED=0
 
 info() {
     printf '  [INFO] %s\n' "$*"
@@ -183,7 +184,7 @@ check_required_basic_tools() {
     local -a missing=()
 
     section "Required basic tools"
-    for command in curl ip timeout sha256sum cmp flock lsblk findmnt; do
+    for command in curl getent ip timeout sha256sum cmp flock lsblk findmnt; do
         if ! command_exists "${command}"; then
             missing+=("${command}")
         fi
@@ -249,6 +250,7 @@ check_existing_installation() {
 }
 
 detect_caddy_configuration() {
+    local parsed_access=""
     local parsed_address=""
     local core_files=0
 
@@ -261,41 +263,44 @@ detect_caddy_configuration() {
         core_files=$((core_files + 1))
     fi
 
-    if (( core_files == 0 )) && [[ ! -e "${CADDY_ACCESS_FILE}" ]]; then
-        CADDY_STATE="absent"
+    if [[ -e "${ACCESS_FILE}" || -L "${ACCESS_FILE}" ]]; then
+        if ! access_config_file_is_safe "${ACCESS_FILE}" ||
+           ! parsed_access=$(read_access_config "${ACCESS_FILE}"); then
+            error "The appliance access configuration is unsafe or invalid; existing access files will not be changed."
+            return
+        fi
+        IFS=$'\t' read -r ACCESS_MODE CADDY_ACCESS_ADDRESS <<<"${parsed_access}"
+    fi
+
+    if (( core_files == 0 )) && [[ ! -e "${ACCESS_FILE}" ]]; then
         info "Caddy is not configured yet."
         return
     fi
 
-    if [[ -e "${CADDY_ACCESS_FILE}" ]]; then
-        if ! parsed_address=$(read_access_hostname "${CADDY_ACCESS_FILE}"); then
-            error "The stored Caddy access state is missing or invalid; existing Caddy files will not be changed."
+    if [[ ! -e "${ACCESS_FILE}" ]]; then
+        info "No appliance access configuration exists yet; it will be created from your choices."
+        return
+    fi
+
+    if [[ -e "${CADDYFILE}" ]]; then
+        if ! parsed_address=$(read_caddyfile_hostname "${CADDYFILE}"); then
+            error "The existing Caddyfile does not contain one valid appliance hostname."
             return
         fi
-        CADDY_ACCESS_ADDRESS=${parsed_address}
-    else
-        if [[ -e "${CADDYFILE}" ]]; then
-            if ! parsed_address=$(read_caddyfile_hostname "${CADDYFILE}"); then
-                error "The partial Caddyfile does not contain one valid appliance .local hostname."
-                return
-            fi
-            CADDY_ACCESS_ADDRESS=${parsed_address}
-            info "Recovered the selected hostname from the appliance Caddyfile: ${CADDY_ACCESS_ADDRESS}."
+        if [[ "${parsed_address}" != "${CADDY_ACCESS_ADDRESS}" ]]; then
+            info "The Caddy hostname will be reconciled with the appliance access configuration."
+            return
         fi
-        CADDY_STATE="partial"
-        info "Appliance-owned partial Caddy configuration detected; missing files will be reconciled."
-        return
     fi
 
     if (( core_files == 2 )) && \
        [[ -f "${CADDYFILE}" && ! -L "${CADDYFILE}" ]] && \
        [[ -f "${CADDY_COMPOSE_FILE}" && ! -L "${CADDY_COMPOSE_FILE}" ]]; then
-        CADDY_STATE="configured"
         ok "Existing Caddy configuration detected."
     else
-        CADDY_STATE="partial"
         info "Appliance-owned partial Caddy configuration detected; missing files will be reconciled."
     fi
+    info "Configured access mode: ${ACCESS_MODE}"
     info "Configured HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
 }
 
@@ -325,7 +330,8 @@ check_docker() {
 }
 
 caddy_owns_port_443() {
-    [[ "${CADDY_STATE}" == "configured" ]] || return 1
+    container_exists caddy || return 1
+    container_is_connected_to_network caddy vaultwarden-appliance || return 1
     docker inspect --format '{{with (index .HostConfig.PortBindings "443/tcp")}}{{range .}}{{println .HostPort}}{{end}}{{end}}' caddy 2>/dev/null |
         grep -Fxq 443
 }
@@ -992,63 +998,93 @@ next_available_mdns_hostname() {
     return 1
 }
 
-prompt_for_local_hostname() {
-    local default_hostname=${DEFAULT_MDNS_HOSTNAME}
+prompt_for_access_configuration() {
+    local default_hostname=${CADDY_ACCESS_ADDRESS:-${DEFAULT_MDNS_HOSTNAME}}
     local answer=""
-    local conflict_answer=""
-    local suggestion=""
+    local dns_answer=""
+    local dns_prompt='Use your own local DNS server for this hostname? [y/N]: '
 
-    section "Local HTTPS name"
+    section "Access configuration"
 
     validate_ipv4_address "${IPV4_ADDRESS}" || {
-        error "A LAN IPv4 address is required to configure and verify mDNS."
+        error "A LAN IPv4 address is required to configure and verify appliance access."
         return 1
     }
 
     info "Detected LAN IPv4 address: ${IPV4_ADDRESS}"
+    if [[ -n "${CADDY_ACCESS_ADDRESS}" ]]; then
+        info "Current access:"
+        if [[ "${ACCESS_MODE}" == dns ]]; then
+            info "  mode: external DNS"
+            dns_prompt='Use your own local DNS server for this hostname? [Y/n]: '
+        else
+            info "  mode: mDNS"
+        fi
+        info "  hostname: ${CADDY_ACCESS_ADDRESS}"
+    fi
 
     while true; do
-        if ! read -r -p "Local Vaultwarden name [${default_hostname}]: " answer </dev/tty; then
-            error "Unable to read the local Vaultwarden name."
+        if ! read -r -p "Vaultwarden hostname [${default_hostname}]: " answer </dev/tty; then
+            error "Unable to read the Vaultwarden hostname."
             return 1
         fi
-
         CADDY_ACCESS_ADDRESS=${answer:-${default_hostname}}
         CADDY_ACCESS_ADDRESS=${CADDY_ACCESS_ADDRESS,,}
-        if ! validate_local_hostname "${CADDY_ACCESS_ADDRESS}"; then
-            warn "Invalid local name. Use one DNS label followed by .local, without spaces or underscores."
-            continue
-        fi
 
-        if ! mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
-            break
-        fi
-
-        warn "The mDNS name ${CADDY_ACCESS_ADDRESS} is already advertised by another LAN device."
-        suggestion=$(next_available_mdns_hostname "${CADDY_ACCESS_ADDRESS}") || {
-            error "Unable to find an available alternative .local name."
-            return 1
-        }
-        if ! read -r -p "Use available alternative ${suggestion}? [Y/n] " conflict_answer </dev/tty; then
-            error "Unable to read the mDNS conflict choice."
+        if ! read -r -p "${dns_prompt}" dns_answer </dev/tty; then
+            error "Unable to read the DNS mode choice."
             return 1
         fi
-        case "${conflict_answer}" in
-            ""|y|Y|yes|YES|Yes)
-                CADDY_ACCESS_ADDRESS=${suggestion}
-                break
-                ;;
+        case "${dns_answer}" in
+            "") ;;
+            y|Y|yes|YES|Yes) ACCESS_MODE=dns ;;
+            n|N|no|NO|No) ACCESS_MODE=mdns ;;
             *)
-                info "Choose a different .local name."
+                warn "Please answer yes or no."
+                continue
                 ;;
         esac
+        if [[ -z "${dns_answer}" && "${dns_prompt}" == *'[Y/n]'* ]]; then
+            ACCESS_MODE=dns
+        elif [[ -z "${dns_answer}" ]]; then
+            ACCESS_MODE=mdns
+        fi
+
+        if validate_access_configuration "${ACCESS_MODE}" "${CADDY_ACCESS_ADDRESS}"; then
+            break
+        fi
+        if validate_ipv4_address "${CADDY_ACCESS_ADDRESS}"; then
+            warn "IP addresses are not valid hostnames."
+        elif [[ "${ACCESS_MODE}" == mdns ]]; then
+            warn "mDNS requires a valid lowercase hostname ending in .local."
+        else
+            warn "External DNS requires a valid lowercase DNS hostname and does not accept .local."
+        fi
     done
 
-    info "mDNS name: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
-    info "Vaultwarden will be available on your local network at https://${CADDY_ACCESS_ADDRESS}."
-    info "No local DNS configuration is required; this name is advertised using mDNS."
-    info "Client devices must separately trust the exported Caddy root CA."
-    info "The appliance will not change the system hostname, DNS, router, hosts files, or IP configuration."
+    ok "Selected ${ACCESS_MODE} access at https://${CADDY_ACCESS_ADDRESS}."
+}
+
+resolve_selected_mdns_conflict() {
+    local conflict_answer=""
+    local suggestion=""
+
+    if ! mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
+        return 0
+    fi
+    warn "The mDNS name ${CADDY_ACCESS_ADDRESS} is already advertised by another LAN device."
+    suggestion=$(next_available_mdns_hostname "${CADDY_ACCESS_ADDRESS}") || {
+        error "Unable to find an available alternative .local name."
+        return 1
+    }
+    if ! read -r -p "Use available alternative ${suggestion}? [Y/n] " conflict_answer </dev/tty; then
+        error "Unable to read the mDNS conflict choice."
+        return 1
+    fi
+    case "${conflict_answer}" in
+        ""|y|Y|yes|YES|Yes) CADDY_ACCESS_ADDRESS=${suggestion} ;;
+        *) error "The selected mDNS hostname conflicts with another LAN device."; return 1 ;;
+    esac
 }
 
 write_mdns_service_configuration() {
@@ -1183,10 +1219,61 @@ configure_mdns() {
     verify_mdns
 }
 
+remove_appliance_mdns_configuration() {
+    local path
+    local marker
+
+    section "mDNS publisher"
+    for path in "${MDNS_ENV_FILE}" "${MDNS_SERVICE_FILE}" "${MDNS_WRAPPER_FILE}"; do
+        case "${path}" in
+            "${MDNS_WRAPPER_FILE}") marker='# Vaultwarden Appliance mDNS publisher' ;;
+            *) marker='# Vaultwarden Appliance mDNS' ;;
+        esac
+        if [[ -e "${path}" || -L "${path}" ]]; then
+            if [[ ! -f "${path}" || -L "${path}" ]] || ! grep -Fxq "${marker}" "${path}"; then
+                error "Existing mDNS path is not appliance-managed and will not be removed: ${path}"
+                return 1
+            fi
+        fi
+    done
+
+    if [[ -f "${MDNS_SERVICE_FILE}" && ! -L "${MDNS_SERVICE_FILE}" ]]; then
+        systemctl disable --now "${MDNS_SERVICE}" >/dev/null || return 1
+    fi
+    rm -f -- "${MDNS_ENV_FILE}" "${MDNS_SERVICE_FILE}" "${MDNS_WRAPPER_FILE}" "${MDNS_READY_FILE}"
+    systemctl daemon-reload
+    systemctl reset-failed "${MDNS_SERVICE}" >/dev/null 2>&1 || true
+    ok "The appliance mDNS publisher is disabled and removed."
+    info "Avahi itself and all installed Avahi packages were preserved."
+}
+
+report_external_dns() {
+    local resolved=""
+
+    section "External DNS"
+    info "External DNS selected."
+    info "Configure this DNS record on your local DNS server:"
+    info "  ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+    resolved=$(dns_resolved_ipv4s "${CADDY_ACCESS_ADDRESS}" || true)
+    if dns_resolution_matches "${IPV4_ADDRESS}" "${resolved}"; then
+        ok "${CADDY_ACCESS_ADDRESS} resolves to ${IPV4_ADDRESS}."
+    else
+        warn "${CADDY_ACCESS_ADDRESS} does not currently resolve to ${IPV4_ADDRESS}."
+        info "Configure the DNS record on your local DNS server."
+        [[ -z "${resolved}" ]] || info "Current IPv4 address(es): ${resolved//$'\n'/, }"
+    fi
+    info "The appliance did not modify DNS, hosts files, DHCP, the router, or the system hostname."
+}
+
 report_configured_caddy_access() {
-    info "Configured access: local mDNS hostname."
+    if [[ "${ACCESS_MODE}" == mdns ]]; then
+        info "Configured access: local mDNS hostname."
+        info "mDNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+    else
+        info "Configured access: external DNS hostname."
+        info "Required DNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+    fi
     info "HTTPS URL: https://${CADDY_ACCESS_ADDRESS}"
-    info "mDNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
 }
 
 reconcile_caddy_data_directories() {
@@ -1202,9 +1289,10 @@ reconcile_caddy_data_directories() {
 }
 
 create_caddy_configuration() {
-    local access_candidate
     local caddy_candidate
     local compose_candidate
+    local existing_caddy_hostname=""
+    local managed_caddy_candidate=""
     local path
 
     section "Caddy configuration"
@@ -1214,11 +1302,6 @@ create_caddy_configuration() {
         rm -f -- "${caddy_candidate}"
         return 1
     }
-    access_candidate=$(mktemp "${INSTALL_DIR}/.caddy-access.install.XXXXXXXX") || {
-        rm -f -- "${caddy_candidate}" "${compose_candidate}"
-        return 1
-    }
-
     if ! write_caddyfile_to "${caddy_candidate}" "${CADDY_ACCESS_ADDRESS}" ||
        ! printf '%s\n' \
             'services:' \
@@ -1234,40 +1317,55 @@ create_caddy_configuration() {
             '      - ./data/caddy/config:/config' \
             '    networks:' \
             '      - appliance' > "${compose_candidate}" ||
-       ! printf 'hostname=%s\n' "${CADDY_ACCESS_ADDRESS}" > "${access_candidate}" ||
-       ! chmod 0644 "${compose_candidate}" "${access_candidate}"; then
-        rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
+       ! chmod 0644 "${compose_candidate}"; then
+        rm -f -- "${caddy_candidate}" "${compose_candidate}"
         error "Unable to generate the appliance Caddy configuration."
         return 1
     fi
 
-    for path in "${CADDYFILE}" "${CADDY_COMPOSE_FILE}" "${CADDY_ACCESS_FILE}"; do
+    for path in "${CADDYFILE}" "${CADDY_COMPOSE_FILE}" "${ACCESS_FILE}"; do
         if [[ -e "${path}" && ( ! -f "${path}" || -L "${path}" ) ]]; then
-            rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
+            rm -f -- "${caddy_candidate}" "${compose_candidate}"
             error "The appliance Caddy path is unsafe: ${path}."
             return 1
         fi
     done
     if [[ -e "${CADDYFILE}" ]] && ! cmp -s "${CADDYFILE}" "${caddy_candidate}"; then
-        rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
-        error "The existing Caddyfile differs from the appliance-managed configuration; it will not be overwritten."
-        return 1
+        existing_caddy_hostname=$(read_caddyfile_hostname "${CADDYFILE}" || true)
+        managed_caddy_candidate=$(mktemp "${INSTALL_DIR}/.Caddyfile.current.XXXXXXXX") || {
+            rm -f -- "${caddy_candidate}" "${compose_candidate}"
+            return 1
+        }
+        if [[ -z "${existing_caddy_hostname}" ]] ||
+           ! write_caddyfile_to "${managed_caddy_candidate}" "${existing_caddy_hostname}" ||
+           ! cmp -s "${CADDYFILE}" "${managed_caddy_candidate}"; then
+            rm -f -- "${caddy_candidate}" "${compose_candidate}" "${managed_caddy_candidate}"
+            error "The existing Caddyfile is not appliance-managed; it will not be overwritten."
+            return 1
+        fi
+        rm -f -- "${managed_caddy_candidate}"
     fi
     if [[ -e "${CADDY_COMPOSE_FILE}" ]] && ! cmp -s "${CADDY_COMPOSE_FILE}" "${compose_candidate}"; then
-        rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
+        rm -f -- "${caddy_candidate}" "${compose_candidate}"
         error "The existing Caddy Compose file differs from the appliance-managed configuration; it will not be overwritten."
         return 1
     fi
-    if [[ -e "${CADDY_ACCESS_FILE}" ]] && ! cmp -s "${CADDY_ACCESS_FILE}" "${access_candidate}"; then
-        rm -f -- "${caddy_candidate}" "${compose_candidate}" "${access_candidate}"
-        error "The existing Caddy access state disagrees with the selected hostname."
-        return 1
-    fi
 
-    if [[ -e "${CADDYFILE}" ]]; then rm -f -- "${caddy_candidate}"; else mv -- "${caddy_candidate}" "${CADDYFILE}"; fi
+    if [[ -e "${CADDYFILE}" ]] && cmp -s "${CADDYFILE}" "${caddy_candidate}"; then
+        rm -f -- "${caddy_candidate}"
+    else
+        mv -f -- "${caddy_candidate}" "${CADDYFILE}"
+        CADDY_CONFIG_CHANGED=1
+    fi
     if [[ -e "${CADDY_COMPOSE_FILE}" ]]; then rm -f -- "${compose_candidate}"; else mv -- "${compose_candidate}" "${CADDY_COMPOSE_FILE}"; fi
-    if [[ -e "${CADDY_ACCESS_FILE}" ]]; then rm -f -- "${access_candidate}"; else mv -- "${access_candidate}" "${CADDY_ACCESS_FILE}"; fi
-    CADDY_STATE="configured"
+    write_access_config_atomic "${ACCESS_FILE}" "${ACCESS_MODE}" "${CADDY_ACCESS_ADDRESS}" || {
+        error "Unable to write the appliance access configuration atomically."
+        return 1
+    }
+    access_config_file_is_safe "${ACCESS_FILE}" || {
+        error "The appliance access configuration is not root-owned and safely permissioned."
+        return 1
+    }
     ok "Reconciled Caddy configuration for https://${CADDY_ACCESS_ADDRESS}."
 }
 
@@ -1288,7 +1386,11 @@ deploy_caddy() {
         compose pull caddy
     fi
 
-    compose up -d caddy
+    if (( CADDY_CONFIG_CHANGED == 1 )); then
+        compose up -d --force-recreate caddy
+    else
+        compose up -d caddy
+    fi
     ok "Caddy deployment requested without publishing TCP port 80."
 }
 
@@ -1337,7 +1439,9 @@ verify_phase3() {
 
     section "Phase 3 verification"
 
-    verify_mdns
+    if [[ "${ACCESS_MODE}" == mdns ]]; then
+        verify_mdns
+    fi
 
     if ! container_is_running vaultwarden; then
         error "Vaultwarden is not running."
@@ -1551,11 +1655,17 @@ print_completion_summary() {
     info "Compose file: ${INSTALL_DIR}/docker-compose.yml"
     info "Persistent data: ${INSTALL_DIR}/data/vaultwarden"
     info "Docker network: vaultwarden-appliance"
-    info "Access: local mDNS hostname"
+    if [[ "${ACCESS_MODE}" == mdns ]]; then
+        info "Access mode: mDNS"
+        info "mDNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+        info "No local DNS configuration is required; Avahi advertises this name using mDNS."
+    else
+        info "Access mode: external DNS"
+        info "Required DNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
+        info "The DNS record must be maintained on your local DNS server."
+    fi
     info "HTTPS endpoint: https://${CADDY_ACCESS_ADDRESS}"
     info "Vaultwarden DOMAIN: https://${CADDY_ACCESS_ADDRESS}"
-    info "mDNS mapping: ${CADDY_ACCESS_ADDRESS} -> ${IPV4_ADDRESS}"
-    info "No local DNS configuration is required; Avahi advertises this name using mDNS."
     info "Exported root CA: ${EXPORTED_ROOT_CA}"
     info "Management command: ${VWCTL_TARGET}"
     info "Local backups: ${LOCAL_BACKUP_DIR} (newest 7 valid generations)"
@@ -1594,7 +1704,6 @@ main() {
     fi
 
     configure_docker_group
-    install_mdns_support
     install_usb_setup_support
     install_backup_support
 
@@ -1606,23 +1715,20 @@ main() {
             ;;
     esac
 
-    if [[ "${CADDY_STATE}" == "absent" ||
-          ( "${CADDY_STATE}" == "partial" && -z "${CADDY_ACCESS_ADDRESS}" ) ]]; then
-        prompt_for_local_hostname
+    prompt_for_access_configuration
+
+    if [[ "${ACCESS_MODE}" == mdns ]]; then
+        install_mdns_support
+        resolve_selected_mdns_conflict
+        configure_mdns
     else
-        if mdns_name_conflicts "${CADDY_ACCESS_ADDRESS}"; then
-            error "The configured mDNS name ${CADDY_ACCESS_ADDRESS} is now advertised by another LAN device."
-            return 1
-        fi
+        remove_appliance_mdns_configuration
+        report_external_dns
     fi
 
     reconcile_caddy_data_directories
-    configure_mdns
-    if [[ "${CADDY_STATE}" != "configured" ]]; then
-        create_caddy_configuration
-    else
-        ok "Preserved the existing Caddy configuration and persistent CA data."
-    fi
+    create_caddy_configuration
+    ok "Preserved the existing Caddy persistent CA data."
     report_configured_caddy_access
     reconcile_vaultwarden_configuration
     deploy_vaultwarden
@@ -1637,4 +1743,6 @@ main() {
     print_completion_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
