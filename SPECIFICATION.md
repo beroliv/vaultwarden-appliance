@@ -15,7 +15,7 @@ Restore is implemented for the appliance's schema-1 backup format, covered by
 non-destructive fixture tests, and validated through a real appliance-backup
 restore on the Atlas reference Raspberry Pi. A complete disaster-recovery
 exercise starting from a freshly flashed SD card remains pending and MUST NOT be
-claimed as validated for release 0.1.0.
+claimed as validated for release 0.1.1.
 
 ## 2. Supported platform
 
@@ -799,13 +799,19 @@ Required validation for changes includes:
 - targeted audits for prohibited destructive commands when storage, bootstrap,
   or removal behavior changes.
 
-Release 0.1.0 is the first tested release. Real-system validation on the Atlas
-reference Raspberry Pi includes the public `curl` bootstrap, installation,
-complete removal, reinstallation, manual backup, USB backup replication,
-restore from an appliance backup, restored Vaultwarden account login, exact
-Caddy root CA fingerprint continuity across removal and restore, and a passing
-post-restore health check. Complete disaster recovery starting from a freshly
-flashed SD card remains pending as stated in section 18.
+Release 0.1.1 builds on the first tested release, 0.1.0. It adds a configurable
+Vaultwarden hostname, selectable mDNS or existing local-DNS access, and safe
+switching between both modes by rerunning `install.sh`. The root-owned
+`/opt/vaultwarden/.access` file is the local runtime access configuration and is
+deliberately excluded from backup and restore.
+
+Real-system validation on the Atlas reference Raspberry Pi includes the public
+`curl` bootstrap, installation, complete removal, reinstallation, manual
+backup, USB backup replication, restore from an appliance backup, restored
+Vaultwarden account login, exact Caddy root CA fingerprint continuity across
+removal and restore, and a passing post-restore health check. Complete disaster
+recovery starting from a freshly flashed SD card remains pending as stated in
+section 18.
 
 ## 21. Project principles
 
