@@ -374,6 +374,152 @@ fingerprint exactly matched its pre-removal value, and the post-restore health
 check passed. A complete disaster-recovery exercise starting from a freshly
 flashed SD card remains pending.
 
+## Last-resort manual recovery
+
+**Preferred recovery:** `sudo vwctl restore`
+
+**Last-resort recovery:** manually extract a verified appliance backup and
+migrate its data into a normal new Vaultwarden installation. This fallback does
+not require GitHub, this repository, `bootstrap.sh`, `vwctl`, the appliance
+installer, Caddy, DNS, or mDNS after the archive and its adjacent checksum have
+been obtained. It uses ordinary SHA-256, gzip/tar, SQLite, persistent files,
+and standard PEM certificate/private-key material.
+
+Manual extraction does not perform the appliance restore's strict checks for
+duplicate or unsafe member names, unexpected file types, manifest/schema
+consistency, or appliance identity. Use only a backup whose source you trust;
+the checksum detects changes or corruption, not a malicious original archive.
+Never extract an untrusted archive into `/`, `/opt`, or a live application
+directory.
+
+### Verify and extract into an empty directory
+
+Set `ARCHIVE` to the obtained archive. Its `.sha256` file must be beside it and
+must retain the appliance-generated filename recorded inside the checksum:
+
+```bash
+ARCHIVE=/path/to/vaultwarden-appliance-YYYYMMDD-HHMMSS.tar.gz
+CHECKSUM="${ARCHIVE}.sha256"
+RECOVERY_DIR="${PWD}/vaultwarden-manual-recovery"
+
+cd -- "$(dirname -- "${ARCHIVE}")"
+sha256sum --check --strict -- "$(basename -- "${CHECKSUM}")"
+tar --list --verbose --gzip --file "$(basename -- "${ARCHIVE}")"
+
+# RECOVERY_DIR must not already exist; stop if mkdir reports an error.
+mkdir --mode=0700 -- "${RECOVERY_DIR}"
+tar --extract --gzip --file "$(basename -- "${ARCHIVE}")" \
+  --directory "${RECOVERY_DIR}" \
+  --no-same-owner --no-same-permissions --delay-directory-restore
+
+RECOVERY_ROOT="${RECOVERY_DIR}/vaultwarden-appliance-backup"
+```
+
+Before extraction, inspect the verbose listing. Every member in the current
+format must be a regular file or directory below
+`vaultwarden-appliance-backup/`; stop if it contains an absolute path, `..`, a
+link, device, FIFO, or any other unexpected member.
+
+The schema-1 archive has these recovery-relevant locations:
+
+```text
+vaultwarden-appliance-backup/
+  manifest
+  vaultwarden/
+    db.sqlite3                    # consistent SQLite snapshot
+    data/                         # remaining persistent /data contents
+      attachments/               # when attachments existed
+      sends/                     # when file-backed sends existed
+      ...                         # keys and other persistent files, as present
+  caddy/
+    data/caddy/pki/authorities/local/root.crt
+    data/caddy/pki/authorities/local/root.key
+    ...                           # complete persistent Caddy data/config state
+  appliance/                      # selected appliance metadata/configuration
+```
+
+The `manifest` identifies `backup_schema=1`, versions, creation time,
+architecture, and the top-level content groups, but it is not a complete path
+inventory or a replacement for these recovery instructions. `.access` is
+deliberately absent because a recovered installation supplies its own current
+hostname and access configuration.
+
+### Recover Vaultwarden into a normal installation
+
+First verify the independent SQLite snapshot. A successful check prints
+exactly `ok`:
+
+```bash
+sqlite3 "${RECOVERY_ROOT}/vaultwarden/db.sqlite3" 'PRAGMA integrity_check;'
+```
+
+Create a normal new Vaultwarden installation using upstream instructions and
+identify its persistent `/data` directory. Then:
+
+1. Stop Vaultwarden completely. Never replace a running SQLite database.
+2. Back up or move aside the new installation's generated data and prepare an
+   empty target data directory.
+3. Copy the complete contents of `${RECOVERY_ROOT}/vaultwarden/data/` into that
+   target. Do not select only familiar filenames: this directory preserves all
+   ordinary persistent Vaultwarden files and directories that existed, except
+   the database and explicitly excluded transient files.
+4. Copy `${RECOVERY_ROOT}/vaultwarden/db.sqlite3` to `db.sqlite3` at the root of
+   the target data directory.
+5. Ensure `db.sqlite3-wal` and `db.sqlite3-shm` are absent before startup. The
+   backup intentionally contains neither, and stale files from another running
+   instance must not be copied.
+6. Set ownership and permissions required by the new deployment. The database
+   and private key material must remain restricted; files extracted with
+   `--no-same-owner` intentionally do not retain the old system's numeric
+   owner.
+7. Start the new Vaultwarden instance and verify account login plus any
+   attachments and sends.
+
+The archive maps the appliance's remaining Vaultwarden `/data` tree directly
+under `vaultwarden/data/`. Thus attachments are recovered from
+`vaultwarden/data/attachments/`, file-backed sends from
+`vaultwarden/data/sends/`, and RSA keys or other required persistent state from
+their unchanged relative locations when they existed in the source data.
+Always migrate the whole directory. Database-only recovery can lose
+file-backed attachments, sends, keys, or other persistent state.
+
+The backup excludes the live `db.sqlite3`, its WAL/SHM files, old built-in
+`db_*.sqlite3` snapshots, and `tmp/` from that data tree because the separate
+`vaultwarden/db.sqlite3` is the consistent snapshot created by Vaultwarden's
+built-in backup command.
+
+### Optionally preserve the old Caddy trust anchor
+
+The old Caddy CA is not needed to recover Vaultwarden passwords, accounts,
+attachments, sends, or other Vaultwarden data. A new reverse proxy may use a
+new CA. Preserve the old CA only when existing clients should keep trusting the
+same private trust anchor.
+
+The backed-up public root and its corresponding private key are exactly:
+
+```bash
+CA_CERT="${RECOVERY_ROOT}/caddy/data/caddy/pki/authorities/local/root.crt"
+CA_KEY="${RECOVERY_ROOT}/caddy/data/caddy/pki/authorities/local/root.key"
+
+openssl x509 -in "${CA_CERT}" -noout -subject -issuer -sha256 -fingerprint
+openssl pkey -in "${CA_KEY}" -check -noout
+cmp <(openssl x509 -in "${CA_CERT}" -pubkey -noout) \
+    <(openssl pkey -in "${CA_KEY}" -pubout)
+```
+
+The final command is silent and exits successfully only when the certificate
+and private key match. The private key is highly sensitive: keep the recovery
+directory mode `0700`, never publish or casually copy the key, and do not use
+insecure TLS workarounds. If retaining the CA, restore the complete archived
+`caddy/` tree into the corresponding persistent Caddy storage while Caddy is
+stopped and apply the ownership/permissions required by that Caddy deployment.
+How that volume is attached is specific to the replacement deployment.
+
+The existing manifest is sufficient to identify schema 1 and its top-level
+groups, but not to teach this procedure if all project documentation has
+disappeared. A future backup format should therefore consider embedding a
+small plain-text `RECOVERY.txt`; release 0.1.2 does not add or require one.
+
 ## Security and scope
 
 - The appliance is LAN-only and has no public Internet exposure feature.

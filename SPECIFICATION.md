@@ -603,6 +603,27 @@ UTC time, signup state, image/version data where available, architecture, CA
 inclusion, and expected contents. It contains no hostname/mode field,
 credential, or private-key content itself.
 
+Schema 1 MUST remain independently recoverable as ordinary SHA-256 plus
+gzip/tar content without executing appliance code. The verified SQLite snapshot
+is exactly `vaultwarden-appliance-backup/vaultwarden/db.sqlite3`. Every ordinary
+file and directory from the Vaultwarden persistent `/data` tree is mapped below
+`vaultwarden-appliance-backup/vaultwarden/data/`, preserving relative paths,
+except the live `db.sqlite3`, `db.sqlite3-wal`, `db.sqlite3-shm`, built-in
+`db_*.sqlite3` snapshots, and `tmp/`, which are intentionally excluded. This
+includes attachments, file-backed sends, RSA keys, and other persistent state
+when present; a manual recovery MUST migrate the complete data tree and install
+the separate snapshot as the target `db.sqlite3` while Vaultwarden is stopped.
+
+The complete Caddy persistent tree is mapped below
+`vaultwarden-appliance-backup/caddy/`. Its internal root certificate and
+matching private key are exactly
+`caddy/data/caddy/pki/authorities/local/root.crt` and
+`caddy/data/caddy/pki/authorities/local/root.key` relative to the archive root.
+They are optional for Vaultwarden data recovery and exist only to preserve the
+old private trust anchor when required. Manual extraction is a last resort and
+does not replace the restore command's stronger archive, schema, CA, and
+filesystem validation.
+
 Complete Caddy data includes sensitive CA private-key material as opaque backup
 files. Backups are not encrypted and MUST be protected physically and by access
 controls.
