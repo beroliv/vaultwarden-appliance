@@ -4,11 +4,13 @@ A LAN-only Vaultwarden appliance for Debian and Raspberry Pi OS using Docker,
 Caddy HTTPS, optional mDNS or existing local DNS, simple `vwctl` management,
 verified local-first backups, and an appliance-format restore workflow.
 
-Version 0.1.1 builds on the first tested release, 0.1.0. It adds a configurable
-Vaultwarden hostname, a choice between mDNS and an existing local DNS server,
-and safe switching between those modes by rerunning `install.sh`. The selected
-mode and hostname are stored locally in `/opt/vaultwarden/.access`; access
-configuration is deliberately excluded from backup and restore.
+Version 0.1.2 is a maintenance and usability release after 0.1.1. Data and CA
+restore no longer depends on DNS, mDNS, or HTTPS readiness, and post-restore
+SQLite verification has been corrected. Existing `VWBACKUP` media can be
+adopted safely without formatting, and backup-device state permissions support
+unprivileged status checks. Privileged operations can be launched directly from
+the `vwctl` menu, whose labels are clearer; restore selection now also offers
+`0) Back`.
 
 Real-system validation on Atlas, a Raspberry Pi, covers the public `curl`
 bootstrap, installation, complete removal, reinstallation, manual backup, USB
