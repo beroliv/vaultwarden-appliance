@@ -577,13 +577,14 @@ successful_apply_verifies_data_before_network_health() (
     restore_export_root_ca() { return 0; }
     systemctl() { return 0; }
     restore_verify_data_recovery() { printf 'DATA\n'; }
+    restore_verify_runtime_domain() { printf 'DOMAIN\n'; }
     restore_wait_for_network_health() { printf 'NETWORK\n'; }
     restore_write_backup_state_after_success() { return 0; }
     restore_resume_timer() { return 0; }
     restore_apply
 )
 expect_equal "data recovery is verified before advisory network health" \
-    $'DATA\nNETWORK' "$(successful_apply_verifies_data_before_network_health)"
+    $'DATA\nDOMAIN\nNETWORK' "$(successful_apply_verifies_data_before_network_health)"
 
 simulated_data_verification_failure() (
     RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
@@ -614,6 +615,7 @@ simulated_network_failure_is_advisory() (
     restore_export_root_ca() { return 0; }
     systemctl() { return 0; }
     restore_verify_data_recovery() { return 0; }
+    restore_verify_runtime_domain() { return 0; }
     restore_wait_for_network_health() { return 1; }
     restore_write_backup_state_after_success() { return 0; }
     restore_resume_timer() { return 0; }
@@ -627,6 +629,7 @@ network_independent_dns_restore() (
     local resolution_case=$1
     local result="${temporary_dir}/dns-restore-${resolution_case}"
     local output
+    local snapshot_verified=0
 
     mkdir -p -- "${result}/vaultwarden" "${result}/caddy" "${result}/certs" \
         "${result}/work"
@@ -657,12 +660,20 @@ network_independent_dns_restore() (
             write_vaultwarden_override_to \
                 "${result}/docker-compose.vwctl.yml" "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}"
     }
-    restore_compose() { return 0; }
+    restore_compose() {
+        if [[ "$*" == "up -d vaultwarden" ]]; then
+            (( snapshot_verified == 1 )) || return 1
+            printf 'vaultwarden startup write\n' >> "${result}/vaultwarden/db.sqlite3"
+        fi
+        return 0
+    }
     restore_export_root_ca() {
         cp -- "${result}/caddy/${CADDY_ROOT_CA_RELATIVE}" "${result}/certs/caddy-root-ca.crt"
     }
     restore_verify_data_recovery() {
         restore_sqlite_snapshot_is_valid "${result}/vaultwarden/db.sqlite3" &&
+            cmp -s "${template}/vaultwarden/db.sqlite3" \
+                "${result}/vaultwarden/db.sqlite3" &&
             test -f "${result}/vaultwarden/attachments/item" &&
             restore_caddy_ca_pair_is_valid \
                 "${result}/caddy/${CADDY_ROOT_CA_RELATIVE}" \
@@ -672,7 +683,8 @@ network_independent_dns_restore() (
             cmp -s "${result}/.access" "${result}/access-before" &&
             grep -Fxq 'https://vault1.lan {' "${result}/Caddyfile" &&
             grep -Fxq '      DOMAIN: "https://vault1.lan"' \
-                "${result}/docker-compose.vwctl.yml"
+                "${result}/docker-compose.vwctl.yml" &&
+            snapshot_verified=1
     }
     restore_write_backup_state_after_success() { return 0; }
     restore_resume_timer() { return 0; }
@@ -693,7 +705,8 @@ network_independent_dns_restore() (
 
     restore_apply || return 1
     output=$(restore_report_completion)
-    (( RESTORE_NETWORK_HEALTHY == 0 )) &&
+    (( RESTORE_NETWORK_HEALTHY == 0 && snapshot_verified == 1 )) &&
+        grep -Fq 'vaultwarden startup write' "${result}/vaultwarden/db.sqlite3" &&
         grep -Fq 'Restore completed successfully.' <<<"${output}" &&
         grep -Fq 'Vaultwarden data: restored' <<<"${output}" &&
         grep -Fq 'Caddy root CA: restored' <<<"${output}" &&
@@ -708,6 +721,41 @@ expect_success "restore succeeds before external DNS is configured" \
     network_independent_dns_restore unconfigured
 expect_success "restore succeeds after an IP change while DNS still points to the old IP" \
     network_independent_dns_restore old-ip
+
+persistent_file_verification_is_strict() (
+    local source_directory="${temporary_dir}/persistent-source"
+    local destination="${temporary_dir}/persistent-destination"
+
+    mkdir -p -- "${source_directory}/attachments" "${destination}/attachments"
+    printf 'attachment\n' > "${source_directory}/attachments/item"
+    cp -- "${source_directory}/attachments/item" "${destination}/attachments/item"
+    printf 'SQLite format 3\000runtime database\n' > "${destination}/db.sqlite3"
+    restore_vaultwarden_persistent_files_match "${source_directory}" "${destination}"
+)
+expect_success "persistent-file verification accepts only the installed database as an extra file" \
+    persistent_file_verification_is_strict
+
+persistent_file_content_mismatch_is_rejected() (
+    local source_directory="${temporary_dir}/persistent-mismatch-source"
+    local destination="${temporary_dir}/persistent-mismatch-destination"
+
+    mkdir -p -- "${source_directory}" "${destination}"
+    printf 'expected\n' > "${source_directory}/rsa_key.pem"
+    printf 'changed\n' > "${destination}/rsa_key.pem"
+    restore_vaultwarden_persistent_files_match "${source_directory}" "${destination}"
+)
+expect_failure "persistent-file content mismatch remains fatal" \
+    persistent_file_content_mismatch_is_rejected
+
+local_verification_reports_exact_failure() (
+    local output
+    local status=0
+
+    output=$(restore_local_verification_failed "Restored SQLite verification" 2>&1) || status=$?
+    (( status != 0 )) && grep -Fxq '[FAIL] Restored SQLite verification' <<<"${output}"
+)
+expect_success "local restore verification reports the exact failed check" \
+    local_verification_reports_exact_failure
 
 mdns_network_warning_is_actionable() (
     local output
@@ -811,6 +859,18 @@ expect_success "network checks occur only after verified data recovery" bash -c 
     verify=$(grep -n "restore_verify_data_recovery" "$file" | tail -1 | cut -d: -f1)
     network=$(grep -n "restore_wait_for_network_health" "$file" | tail -1 | cut -d: -f1)
     test "$verify" -lt "$network"
+' _ "${REPO_DIR}/libexec/restore"
+expect_success "strict snapshot verification precedes Vaultwarden startup" bash -c '
+    file=$1
+    verify=$(grep -n "restore_verify_data_recovery.*root" "$file" | tail -1 | cut -d: -f1)
+    start=$(grep -n "restore_compose up -d vaultwarden" "$file" | tail -1 | cut -d: -f1)
+    test "$verify" -lt "$start"
+' _ "${REPO_DIR}/libexec/restore"
+expect_success "running Vaultwarden DOMAIN is verified after startup" bash -c '
+    file=$1
+    start=$(grep -n "restore_compose up -d vaultwarden" "$file" | tail -1 | cut -d: -f1)
+    domain=$(grep -n "restore_verify_runtime_domain" "$file" | tail -1 | cut -d: -f1)
+    test "$start" -lt "$domain"
 ' _ "${REPO_DIR}/libexec/restore"
 
 printf '1..%d\n' "${TESTS}"

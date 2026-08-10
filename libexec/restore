@@ -1127,6 +1127,48 @@ restore_wait_for_network_health() {
     return 1
 }
 
+restore_local_verification_failed() {
+    printf '[FAIL] %s\n' "$*" >&2
+    return 1
+}
+
+restore_vaultwarden_persistent_files_match() {
+    local source_directory=$1
+    local destination=$2
+    local path
+    local relative
+    local counterpart
+
+    [[ -d "${source_directory}" && ! -L "${source_directory}" &&
+       -d "${destination}" && ! -L "${destination}" ]] || return 1
+    while IFS= read -r -d '' path; do
+        relative=${path#"${source_directory}/"}
+        [[ "${relative}" != "${path}" ]] || return 1
+        counterpart="${destination}/${relative}"
+        if [[ -d "${path}" && ! -L "${path}" ]]; then
+            [[ -d "${counterpart}" && ! -L "${counterpart}" ]] || return 1
+        elif [[ -f "${path}" && ! -L "${path}" ]]; then
+            [[ -f "${counterpart}" && ! -L "${counterpart}" ]] || return 1
+            cmp -s "${path}" "${counterpart}" || return 1
+        else
+            return 1
+        fi
+    done < <(find "${source_directory}" -mindepth 1 -print0)
+    while IFS= read -r -d '' path; do
+        relative=${path#"${destination}/"}
+        [[ "${relative}" != "${path}" ]] || return 1
+        [[ "${relative}" == db.sqlite3 ]] && continue
+        counterpart="${source_directory}/${relative}"
+        if [[ -d "${path}" && ! -L "${path}" ]]; then
+            [[ -d "${counterpart}" && ! -L "${counterpart}" ]] || return 1
+        elif [[ -f "${path}" && ! -L "${path}" ]]; then
+            [[ -f "${counterpart}" && ! -L "${counterpart}" ]] || return 1
+        else
+            return 1
+        fi
+    done < <(find "${destination}" -mindepth 1 -print0)
+}
+
 restore_verify_data_recovery() {
     local root=$1
     local expected_ca="${root}/caddy/${CADDY_ROOT_CA_RELATIVE}"
@@ -1136,26 +1178,65 @@ restore_verify_data_recovery() {
     local expected_override="${RESTORE_WORK_DIR}/verified-compose.yml"
     local current_access
 
-    [[ -f "${expected_ca}" && ! -L "${expected_ca}" &&
-       -f "${expected_key}" && ! -L "${expected_key}" ]] || return 1
-    restore_sqlite_snapshot_is_valid "${VAULTWARDEN_DATA_DIR}/db.sqlite3" || return 1
-    cmp -s "${root}/vaultwarden/db.sqlite3" "${VAULTWARDEN_DATA_DIR}/db.sqlite3" || return 1
-    restore_caddy_ca_pair_is_valid \
+    if [[ ! -f "${expected_ca}" || -L "${expected_ca}" ||
+          ! -f "${expected_key}" || -L "${expected_key}" ]]; then
+        restore_local_verification_failed "Selected Caddy CA files verification"
+        return 1
+    fi
+    if ! restore_sqlite_snapshot_is_valid "${VAULTWARDEN_DATA_DIR}/db.sqlite3" ||
+       ! cmp -s "${root}/vaultwarden/db.sqlite3" "${VAULTWARDEN_DATA_DIR}/db.sqlite3"; then
+        restore_local_verification_failed "Restored SQLite verification"
+        return 1
+    fi
+    if ! restore_vaultwarden_persistent_files_match \
+        "${root}/vaultwarden/data" "${VAULTWARDEN_DATA_DIR}"; then
+        restore_local_verification_failed "Restored Vaultwarden persistent files verification"
+        return 1
+    fi
+    if ! restore_caddy_ca_pair_is_valid \
         "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" \
-        "${CADDY_DATA_DIR}/${CADDY_ROOT_KEY_RELATIVE}" || return 1
-    cmp -s "${expected_ca}" "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" || return 1
-    cmp -s "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" "${EXPORTED_ROOT_CA}" || return 1
-    access_config_file_is_safe "${ACCESS_FILE}" || return 1
-    current_access=$(read_access_config "${ACCESS_FILE}") || return 1
+        "${CADDY_DATA_DIR}/${CADDY_ROOT_KEY_RELATIVE}"; then
+        restore_local_verification_failed "Caddy root certificate/private-key verification"
+        return 1
+    fi
+    if ! cmp -s "${expected_ca}" "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}"; then
+        restore_local_verification_failed "Caddy root CA verification"
+        return 1
+    fi
+    if ! cmp -s "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" "${EXPORTED_ROOT_CA}"; then
+        restore_local_verification_failed "Exported Caddy root CA verification"
+        return 1
+    fi
+    if ! access_config_file_is_safe "${ACCESS_FILE}" ||
+       ! current_access=$(read_access_config "${ACCESS_FILE}"); then
+        restore_local_verification_failed "Preserved access configuration verification"
+        return 1
+    fi
     expected_access=$(printf '%s\t%s' "${RESTORE_ACCESS_MODE}" "${RESTORE_HOSTNAME}")
-    [[ "${current_access}" == "${expected_access}" ]] || return 1
-    [[ "$(sha256sum -- "${ACCESS_FILE}" | awk 'NR == 1 {print $1}')" == \
-       "${RESTORE_ACCESS_HASH}" ]] || return 1
-    write_caddyfile_to "${expected_caddy}" "${RESTORE_HOSTNAME}" || return 1
-    cmp -s "${expected_caddy}" "${CADDYFILE}" || return 1
-    write_vaultwarden_override_to "${expected_override}" \
-        "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}" || return 1
-    cmp -s "${expected_override}" "${VWCTL_COMPOSE_FILE}"
+    if [[ "${current_access}" != "${expected_access}" ]] ||
+       [[ "$(sha256sum -- "${ACCESS_FILE}" | awk 'NR == 1 {print $1}')" != \
+          "${RESTORE_ACCESS_HASH}" ]]; then
+        restore_local_verification_failed "Preserved access configuration verification"
+        return 1
+    fi
+    if ! write_caddyfile_to "${expected_caddy}" "${RESTORE_HOSTNAME}" ||
+       ! cmp -s "${expected_caddy}" "${CADDYFILE}"; then
+        restore_local_verification_failed "Generated Caddy configuration verification"
+        return 1
+    fi
+    if ! write_vaultwarden_override_to "${expected_override}" \
+        "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}" ||
+       ! cmp -s "${expected_override}" "${VWCTL_COMPOSE_FILE}"; then
+        restore_local_verification_failed "Vaultwarden DOMAIN configuration verification"
+        return 1
+    fi
+}
+
+restore_verify_runtime_domain() {
+    if ! vaultwarden_domain_matches "${RESTORE_HOSTNAME}"; then
+        restore_local_verification_failed "Vaultwarden DOMAIN verification"
+        return 1
+    fi
 }
 
 restore_report_completion() {
@@ -1220,9 +1301,13 @@ restore_apply() {
     if [[ "${RESTORE_ACCESS_MODE}" == mdns ]] && ! restore_write_mdns_state; then
         mdns_started=0
     fi
+    restore_export_root_ca || restore_die "The restored public Caddy root CA could not be exported."
+    restore_verify_data_recovery "${root}" || \
+        restore_die "Post-restore data or Caddy CA verification failed. No automatic rollback was attempted."
     restore_compose up -d vaultwarden || restore_die "Vaultwarden did not start after restore."
     restore_compose up -d caddy || restore_die "Caddy did not start after restore."
-    restore_export_root_ca || restore_die "The restored public Caddy root CA could not be exported."
+    restore_verify_runtime_domain || \
+        restore_die "Post-restore local configuration verification failed. No automatic rollback was attempted."
     if [[ "${RESTORE_ACCESS_MODE}" == mdns ]]; then
         if (( mdns_started == 1 )) && systemctl restart "${MDNS_SERVICE}"; then
             RESTORE_MDNS_STOPPED=0
@@ -1230,8 +1315,6 @@ restore_apply() {
             mdns_started=0
         fi
     fi
-    restore_verify_data_recovery "${root}" || \
-        restore_die "Post-restore data or Caddy CA verification failed. No automatic rollback was attempted."
     restore_write_backup_state_after_success || \
         restore_die "The restore succeeded, but backup-media state adoption failed."
     restore_resume_timer || restore_die "The restore succeeded, but the automatic-backup timer state could not be restored."

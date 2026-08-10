@@ -331,7 +331,9 @@ Vaultwarden/Caddy persistent data; regenerates Caddy and `DOMAIN` from the
 currently installed `.access`; then starts Vaultwarden and Caddy. Restore
 preflight does not require DNS, mDNS, HTTPS, or the configured hostname to be
 reachable. The restored database and Caddy CA are verified locally before
-network health is evaluated.
+Vaultwarden is started and before network health is evaluated. This preserves a
+byte-for-byte snapshot check before Vaultwarden can legitimately write to the
+restored SQLite database during startup.
 Backups do not contain access configuration, so the current hostname and
 mDNS/external-DNS choice are preserved. Existing local backup generations are
 also preserved.

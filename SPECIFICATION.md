@@ -759,6 +759,13 @@ Caddy CA certificate/private-key pair, exported public root, unchanged current
 USB UUID state may be adopted and the prior timer state restored after those
 local recovery checks succeed.
 
+The installed SQLite database MUST be validated and compared byte-for-byte with
+the selected backup snapshot before Vaultwarden is started. Vaultwarden may
+legitimately modify SQLite runtime state during startup, so that strict snapshot
+comparison MUST NOT be deferred until after container startup. The running
+container's `DOMAIN` is verified separately against the current `.access` and
+does not require name resolution or HTTPS reachability.
+
 Name resolution, mDNS publisher readiness, container reachability, and HTTPS
 are post-restore network-health checks only. Their failure MUST NOT prevent,
 roll back, or invalidate an otherwise verified Vaultwarden data and Caddy CA
