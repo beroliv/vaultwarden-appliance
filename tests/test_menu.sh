@@ -23,6 +23,14 @@ expect_failure() { local description=$1; shift; if "$@"; then fail "${descriptio
 
 menu_output=$(main <<<"0")
 expect_success "no arguments enter the interactive menu" grep -Fq 'Vaultwarden Appliance' <<<"${menu_output}"
+expect_success "main menu labels selection 3 as Create backup" \
+    grep -Fxq '3) Create backup' <<<"${menu_output}"
+expect_success "main menu labels selection 5 as Restore backup" \
+    grep -Fxq '5) Restore backup' <<<"${menu_output}"
+expect_success "main menu labels selection 7 as Check for updates" \
+    grep -Fxq '7) Check for updates' <<<"${menu_output}"
+expect_success "main menu labels selection 8 as Install update" \
+    grep -Fxq '8) Install update' <<<"${menu_output}"
 process_menu_output=$(printf '0\n' | bash "${REPO_DIR}/vwctl")
 expect_success "argument-free vwctl process opens the menu" grep -Fq '0) Exit' <<<"${process_menu_output}"
 menu_zero_exits() { interactive_menu <<<"0" >/dev/null; }
@@ -80,6 +88,17 @@ expect_success "read-only status selection uses the existing command path" \
 expect_success "completed menu command shows the continue prompt" \
     grep -Fq 'Press Enter to continue...' <<<"${readonly_output}"
 expect_failure "read-only status does not use sudo" grep -Fq 'SUDO_ARG:' <<<"${readonly_output}"
+
+command_update_check() { printf 'UPDATE_CHECK_DISPATCHED\n'; }
+update_check_output=$(interactive_menu <<'INPUT'
+7
+
+0
+INPUT
+)
+expect_success "selection 7 still dispatches the unprivileged update check" \
+    grep -Fq 'UPDATE_CHECK_DISPATCHED' <<<"${update_check_output}"
+expect_failure "selection 7 does not use sudo" grep -Fq 'SUDO_ARG:' <<<"${update_check_output}"
 
 menu_is_root() { return 1; }
 command_backup() { printf 'ROOT_BYPASS\n'; }
