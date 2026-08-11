@@ -232,9 +232,10 @@ runtime directories, systemd units, managed overrides, and containers may be
 recreated. Existing Vaultwarden data, Caddy persistent data and root CA, local
 backups and USB state MUST NOT be overwritten or deleted.
 
-Every interactive rerun MUST offer the current hostname and mode as defaults and
-ask again. Unchanged answers are idempotent; changed answers reconcile only the
-access-related configuration.
+Every interactive rerun MUST ask for the access mode before the hostname. It
+MUST offer the current mode as the mode default and, when that mode is retained,
+the current valid hostname as the hostname default. Unchanged answers are
+idempotent; changed answers reconcile only the access-related configuration.
 
 ## 8. Docker and network architecture
 
@@ -291,12 +292,15 @@ MUST be used. Public ACME issuers MUST NOT be configured. Caddy's persistent
 data MUST survive hostname and container changes so its internal root CA remains
 stable.
 
-Every interactive installer run asks for hostname and mode. In mDNS mode it
-detects remote advertisements, rejects duplicate ownership, and may propose a
-conflict-free alternative. It publishes an explicit hostname-to-LAN-IPv4 mapping
-through the appliance systemd service and `avahi-publish-address -R --no-fail`.
-The publisher declares readiness only after `avahi-resolve-host-name -4`
-resolves exclusively to that IPv4 address.
+Every interactive installer run explains and asks for the mode first, then asks
+for a hostname valid for that mode. Fresh defaults are mDNS with
+`vaultwarden.local`; the external-DNS hostname default is `vault.lan`. When
+switching modes, a hostname from the old mode MUST NOT become the new mode's
+default. In mDNS mode the installer detects remote advertisements, rejects
+duplicate ownership, and may propose a conflict-free alternative. It publishes
+an explicit hostname-to-LAN-IPv4 mapping through the appliance systemd service
+and `avahi-publish-address -R --no-fail`. The publisher declares readiness only
+after `avahi-resolve-host-name -4` resolves exclusively to that IPv4 address.
 
 In DNS mode the installer removes/disables only the appliance-owned publisher,
 preserves Avahi and its packages, prints the required DNS record, and warns

@@ -90,8 +90,8 @@ missing. A working Docker installation is reused without modification.
 
 ## First use
 
-1. Run the installer and choose a hostname and name-resolution mode. Press Enter
-   for the default `vaultwarden.local` via mDNS.
+1. Run the installer, choose the access mode, and then choose its hostname.
+   Press Enter twice for the default `vaultwarden.local` via mDNS.
 2. Open the selected URL (default: `https://vaultwarden.local`) from a client on
    the same LAN.
 3. Trust the exported Caddy root CA on every client that should accept the

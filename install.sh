@@ -51,6 +51,7 @@ readonly VERSION_SOURCE="${SCRIPT_DIR}/VERSION"
 readonly VERSION_TARGET="${INSTALL_DIR}/.appliance-version"
 readonly OPERATION_LOCK="/run/lock/vaultwarden-appliance.lock"
 readonly DEFAULT_MDNS_HOSTNAME="vaultwarden.local"
+readonly DEFAULT_DNS_HOSTNAME="vault.lan"
 readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
 readonly MDNS_SERVICE_FILE="/etc/systemd/system/vaultwarden-appliance-mdns.service"
 readonly MDNS_SERVICE="vaultwarden-appliance-mdns.service"
@@ -1026,70 +1027,106 @@ next_available_mdns_hostname() {
     return 1
 }
 
-prompt_for_access_configuration() {
-    local default_hostname=${CADDY_ACCESS_ADDRESS:-${DEFAULT_MDNS_HOSTNAME}}
-    local answer=""
-    local dns_answer=""
-    local dns_prompt='Use your own local DNS server for this hostname? [y/N]: '
+read_installer_answer() {
+    local prompt=$1
+    local destination=$2
+    local value=""
 
-    section "Access configuration"
+    IFS= read -r -p "${prompt}" value </dev/tty || return 1
+    printf -v "${destination}" '%s' "${value}"
+}
+
+prompt_for_access_configuration() {
+    local current_mode=${ACCESS_MODE}
+    local current_hostname=${CADDY_ACCESS_ADDRESS}
+    local default_mode=1
+    local default_hostname
+    local answer=""
+    local selected_hostname
+    local selected_mode
+
+    section "Vaultwarden access mode"
 
     validate_ipv4_address "${IPV4_ADDRESS}" || {
         error "A LAN IPv4 address is required to configure and verify appliance access."
         return 1
     }
 
+    if [[ "${current_mode}" == dns ]]; then
+        default_mode=2
+    fi
+    printf '\n1) mDNS\n'
+    printf '   Simple setup for home networks.\n'
+    printf '   No local DNS server is required.\n'
+    printf '   The appliance publishes a .local hostname automatically.\n'
+    printf '\n2) External/local DNS\n'
+    printf '   Use this if you already run AdGuard, Pi-hole, Unbound,\n'
+    printf '   router DNS, or another local DNS server.\n'
+    printf '   You must create the DNS record yourself.\n\n'
+
     info "Detected LAN IPv4 address: ${IPV4_ADDRESS}"
-    if [[ -n "${CADDY_ACCESS_ADDRESS}" ]]; then
-        info "Current access:"
-        if [[ "${ACCESS_MODE}" == dns ]]; then
-            info "  mode: external DNS"
-            dns_prompt='Use your own local DNS server for this hostname? [Y/n]: '
-        else
-            info "  mode: mDNS"
-        fi
-        info "  hostname: ${CADDY_ACCESS_ADDRESS}"
+    if [[ -n "${current_hostname}" ]] &&
+       validate_access_configuration "${current_mode}" "${current_hostname}"; then
+        printf '\nCurrent configuration:\n'
+        printf 'mode=%s\n' "${current_mode}"
+        printf 'hostname=%s\n' "${current_hostname}"
     fi
 
     while true; do
-        if ! read -r -p "Vaultwarden hostname [${default_hostname}]: " answer </dev/tty; then
-            error "Unable to read the Vaultwarden hostname."
+        if ! read_installer_answer "Select access mode [${default_mode}]: " answer; then
+            error "Unable to read the access mode choice."
             return 1
         fi
-        CADDY_ACCESS_ADDRESS=${answer:-${default_hostname}}
-        CADDY_ACCESS_ADDRESS=${CADDY_ACCESS_ADDRESS,,}
-
-        if ! read -r -p "${dns_prompt}" dns_answer </dev/tty; then
-            error "Unable to read the DNS mode choice."
-            return 1
-        fi
-        case "${dns_answer}" in
-            "") ;;
-            y|Y|yes|YES|Yes) ACCESS_MODE=dns ;;
-            n|N|no|NO|No) ACCESS_MODE=mdns ;;
+        answer=${answer:-${default_mode}}
+        case "${answer}" in
+            1) selected_mode=mdns ;;
+            2) selected_mode=dns ;;
             *)
-                warn "Please answer yes or no."
+                warn "Please enter 1 or 2."
                 continue
                 ;;
         esac
-        if [[ -z "${dns_answer}" && "${dns_prompt}" == *'[Y/n]'* ]]; then
-            ACCESS_MODE=dns
-        elif [[ -z "${dns_answer}" ]]; then
-            ACCESS_MODE=mdns
-        fi
+        break
+    done
 
-        if validate_access_configuration "${ACCESS_MODE}" "${CADDY_ACCESS_ADDRESS}"; then
+    if [[ "${selected_mode}" == "${current_mode}" ]] &&
+       validate_access_configuration "${current_mode}" "${current_hostname}"; then
+        default_hostname=${current_hostname}
+    elif [[ "${selected_mode}" == mdns ]]; then
+        default_hostname=${DEFAULT_MDNS_HOSTNAME}
+    else
+        default_hostname=${DEFAULT_DNS_HOSTNAME}
+    fi
+
+    while true; do
+        if [[ "${selected_mode}" == mdns ]]; then
+            if ! read_installer_answer \
+                "Vaultwarden mDNS hostname [${default_hostname}]: " answer; then
+                error "Unable to read the Vaultwarden mDNS hostname."
+                return 1
+            fi
+        elif ! read_installer_answer \
+            "Vaultwarden DNS hostname [${default_hostname}]: " answer; then
+            error "Unable to read the Vaultwarden DNS hostname."
+            return 1
+        fi
+        selected_hostname=${answer:-${default_hostname}}
+        selected_hostname=${selected_hostname,,}
+
+        if validate_access_configuration "${selected_mode}" "${selected_hostname}"; then
             break
         fi
-        if validate_ipv4_address "${CADDY_ACCESS_ADDRESS}"; then
+        if validate_ipv4_address "${selected_hostname}"; then
             warn "IP addresses are not valid hostnames."
-        elif [[ "${ACCESS_MODE}" == mdns ]]; then
+        elif [[ "${selected_mode}" == mdns ]]; then
             warn "mDNS requires a valid lowercase hostname ending in .local."
         else
             warn "External DNS requires a valid lowercase DNS hostname and does not accept .local."
         fi
     done
 
+    ACCESS_MODE=${selected_mode}
+    CADDY_ACCESS_ADDRESS=${selected_hostname}
     ok "Selected ${ACCESS_MODE} access at https://${CADDY_ACCESS_ADDRESS}."
 }
 
