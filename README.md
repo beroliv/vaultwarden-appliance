@@ -107,6 +107,14 @@ appliance's LAN address; it does not make the certificate trusted. The Caddy
 root CA establishes HTTPS trust; installing it does not configure mDNS. Both
 must work on a client.
 
+mDNS uses local multicast name resolution, so `.local` normally works on the
+local LAN. Normal routed VPN configurations such as WireGuard do not
+automatically forward mDNS multicast or its name resolution. The appliance may
+therefore be reachable by IP through the VPN while `vaultwarden.local` does not
+resolve. External/local DNS is the recommended access mode for VPN use, and VPN
+clients must be able to reach and use the DNS server that resolves the selected
+Vaultwarden hostname.
+
 If you already operate local DNS, enter a name such as `vault.lan`, answer Yes
 to the external-DNS prompt, and manually create `vault.lan -> <Raspberry Pi LAN
 IP>` on that DNS server. The appliance never changes DNS, hosts, router, DHCP,

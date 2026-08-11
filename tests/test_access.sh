@@ -110,8 +110,14 @@ expect_success "every installer run invokes access prompting" grep -Fq \
 fresh_mdns=$(run_access_prompt_case mdns '' '' '')
 expect_contains "installer explains the mDNS access mode" \
     '1) mDNS' "${fresh_mdns}"
+expect_contains "installer explains the local scope of mDNS" \
+    'Simple setup for the local home network.' "${fresh_mdns}"
+expect_contains "installer explains the routed VPN limitation of mDNS" \
+    'Not intended for access through normal routed VPN connections.' "${fresh_mdns}"
 expect_contains "installer explains the external DNS access mode" \
     '2) External/local DNS' "${fresh_mdns}"
+expect_contains "installer recommends external DNS for VPN access" \
+    'Recommended if Vaultwarden should also be reachable through a VPN.' "${fresh_mdns}"
 expect_in_order "access mode is asked before the hostname" \
     'Select access mode [1]:' 'Vaultwarden mDNS hostname [vaultwarden.local]:' "${fresh_mdns}"
 expect_contains "fresh installation defaults to mDNS" \

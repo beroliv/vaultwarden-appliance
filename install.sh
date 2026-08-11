@@ -1056,12 +1056,14 @@ prompt_for_access_configuration() {
         default_mode=2
     fi
     printf '\n1) mDNS\n'
-    printf '   Simple setup for home networks.\n'
+    printf '   Simple setup for the local home network.\n'
     printf '   No local DNS server is required.\n'
     printf '   The appliance publishes a .local hostname automatically.\n'
+    printf '   Not intended for access through normal routed VPN connections.\n'
     printf '\n2) External/local DNS\n'
     printf '   Use this if you already run AdGuard, Pi-hole, Unbound,\n'
     printf '   router DNS, or another local DNS server.\n'
+    printf '   Recommended if Vaultwarden should also be reachable through a VPN.\n'
     printf '   You must create the DNS record yourself.\n\n'
 
     info "Detected LAN IPv4 address: ${IPV4_ADDRESS}"

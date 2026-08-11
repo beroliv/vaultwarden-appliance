@@ -261,6 +261,12 @@ The default is `https://vaultwarden.local` through mDNS. An administrator may
 instead select an existing local DNS server and a valid non-`.local` name such
 as `vault.lan` or `vault.home.arpa`.
 
+mDNS is intended for local-LAN multicast name resolution. Normal routed VPN
+configurations such as WireGuard generally do not carry that multicast/name
+resolution automatically. External/local DNS is therefore the recommended mode
+for VPN access, with the chosen DNS server reachable and usable by VPN clients.
+The appliance does not configure VPN or DNS infrastructure.
+
 The authoritative runtime access configuration is `/opt/vaultwarden/.access`:
 
 ```text
