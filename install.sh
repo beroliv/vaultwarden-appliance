@@ -31,6 +31,7 @@ readonly CADDY_COMPOSE_FILE="${INSTALL_DIR}/docker-compose.override.yml"
 readonly CADDY_DATA_DIR="${INSTALL_DIR}/data/caddy/data"
 readonly CADDY_CONFIG_DIR="${INSTALL_DIR}/data/caddy/config"
 readonly CADDY_ROOT_CA="${CADDY_DATA_DIR}/caddy/pki/authorities/local/root.crt"
+readonly CADDY_PKI_PRESEED_DIR="${CADDY_DATA_DIR}/caddy/pki/authorities/local"
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
 readonly VWCTL_SOURCE="${SCRIPT_DIR}/vwctl"
 readonly VWCTL_TARGET="/usr/local/bin/vwctl"
@@ -186,7 +187,7 @@ check_required_basic_tools() {
     local -a missing=()
 
     section "Required basic tools"
-    for command in curl getent ip timeout sha256sum cmp flock lsblk findmnt; do
+    for command in curl getent ip timeout sha256sum cmp flock lsblk findmnt find; do
         if ! command_exists "${command}"; then
             missing+=("${command}")
         fi
@@ -194,7 +195,7 @@ check_required_basic_tools() {
 
     if (( ${#missing[@]} > 0 )); then
         error "Required command(s) missing: ${missing[*]}."
-        info "On Debian install the corresponding packages: curl iproute2 coreutils diffutils util-linux."
+        info "On Debian install the corresponding packages: curl iproute2 coreutils diffutils util-linux findutils."
         return
     fi
     ok "Required networking, verification, comparison, and locking tools are available."
@@ -231,24 +232,93 @@ check_disk_space() {
     fi
 }
 
+caddy_pki_preseed_is_exact() {
+    local find_complete=0
+    local installation_dir=$1
+    local preseed_dir="${installation_dir}/data/caddy/data/caddy/pki/authorities/local"
+    local path
+    local -a expected_directories=(
+        "${installation_dir}"
+        "${installation_dir}/data"
+        "${installation_dir}/data/caddy"
+        "${installation_dir}/data/caddy/data"
+        "${installation_dir}/data/caddy/data/caddy"
+        "${installation_dir}/data/caddy/data/caddy/pki"
+        "${installation_dir}/data/caddy/data/caddy/pki/authorities"
+        "${preseed_dir}"
+    )
+    local -a expected_files=(
+        "${preseed_dir}/root.crt"
+        "${preseed_dir}/root.key"
+        "${preseed_dir}/intermediate.crt"
+        "${preseed_dir}/intermediate.key"
+    )
+
+    for path in "${expected_directories[@]}"; do
+        [[ -d "${path}" && ! -L "${path}" ]] || return 1
+    done
+    for path in "${expected_files[@]}"; do
+        [[ -f "${path}" && ! -L "${path}" ]] || return 1
+    done
+
+    while IFS= read -r -d '' path; do
+        if [[ -z "${path}" ]]; then
+            find_complete=1
+            continue
+        fi
+        case "${path}" in
+            "${installation_dir}/data"|\
+            "${installation_dir}/data/caddy"|\
+            "${installation_dir}/data/caddy/data"|\
+            "${installation_dir}/data/caddy/data/caddy"|\
+            "${installation_dir}/data/caddy/data/caddy/pki"|\
+            "${installation_dir}/data/caddy/data/caddy/pki/authorities"|\
+            "${preseed_dir}"|\
+            "${preseed_dir}/root.crt"|\
+            "${preseed_dir}/root.key"|\
+            "${preseed_dir}/intermediate.crt"|\
+            "${preseed_dir}/intermediate.key") ;;
+            *) return 1 ;;
+        esac
+    done < <(find "${installation_dir}" -mindepth 1 -print0 2>/dev/null && printf '\0')
+    (( find_complete == 1 ))
+}
+
+classify_installation_path() {
+    local installation_dir=$1
+    local marker="${installation_dir}/.vaultwarden-appliance"
+
+    if [[ ! -e "${installation_dir}" && ! -L "${installation_dir}" ]]; then
+        printf 'fresh\n'
+    elif [[ -f "${marker}" && ! -L "${marker}" ]]; then
+        printf 'existing\n'
+    elif caddy_pki_preseed_is_exact "${installation_dir}"; then
+        printf 'preseed\n'
+    else
+        printf 'unknown\n'
+    fi
+}
+
 check_existing_installation() {
+    local detected_state
+
     section "Installation path"
 
-    if [[ ! -e "${INSTALL_DIR}" ]]; then
-        APPLIANCE_STATE="fresh"
-        ok "${INSTALL_DIR} does not already exist."
-        return
-    fi
-
-    if [[ -f "${APPLIANCE_MARKER}" && ! -L "${APPLIANCE_MARKER}" ]]; then
-        APPLIANCE_STATE="existing"
-        ok "Existing Vaultwarden Appliance installation detected."
-        return
-    fi
-
-    APPLIANCE_STATE="unknown"
-    error "${INSTALL_DIR} exists without a valid appliance marker."
-    info "The existing directory will not be modified."
+    detected_state=$(classify_installation_path "${INSTALL_DIR}") || detected_state=unknown
+    APPLIANCE_STATE=${detected_state}
+    case "${APPLIANCE_STATE}" in
+        fresh) ok "${INSTALL_DIR} does not already exist." ;;
+        preseed)
+            ok "Exact Caddy PKI preseed detected at ${CADDY_PKI_PRESEED_DIR}."
+            info "The preseed CA will be preserved while the fresh appliance is initialized."
+            ;;
+        existing) ok "Existing Vaultwarden Appliance installation detected." ;;
+        *)
+            APPLIANCE_STATE="unknown"
+            error "${INSTALL_DIR} exists without a valid appliance marker."
+            info "The existing directory will not be modified."
+            ;;
+    esac
 }
 
 detect_caddy_configuration() {
@@ -663,6 +733,11 @@ create_appliance_files() {
         error "${INSTALL_DIR} appeared during installation; refusing to overwrite it."
         return 1
     fi
+    if [[ "${APPLIANCE_STATE}" == "preseed" ]] &&
+       ! caddy_pki_preseed_is_exact "${INSTALL_DIR}"; then
+        error "The Caddy PKI preseed changed after preflight; refusing to modify the installation path."
+        return 1
+    fi
 
     if [[ ! -e "${INSTALL_DIR}" ]]; then
         install -d -m 0755 "${INSTALL_DIR}"
@@ -695,7 +770,7 @@ create_appliance_files() {
         ok "Created the missing base Compose configuration."
     fi
 
-    if [[ "${APPLIANCE_STATE}" == "fresh" ]]; then
+    if [[ "${APPLIANCE_STATE}" == "fresh" || "${APPLIANCE_STATE}" == "preseed" ]]; then
         create_appliance_marker
         APPLIANCE_STATE="existing"
         ok "Created the appliance marker after initializing the appliance directory."
@@ -1775,7 +1850,7 @@ main() {
     install_backup_support
 
     case "${APPLIANCE_STATE}" in
-        fresh|existing) create_appliance_files ;;
+        fresh|preseed|existing) create_appliance_files ;;
         *)
             error "Unexpected or unsafe appliance state '${APPLIANCE_STATE}'."
             return 1

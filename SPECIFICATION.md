@@ -223,9 +223,21 @@ implemented feature requires them. It MUST NOT make unrelated system changes.
 
 ### 7.1 Existing appliance reruns
 
-An existing `/opt/vaultwarden` is recognized only when the exact regular
-`.vaultwarden-appliance` marker exists. An unmarked or unsafe directory MUST be
+An existing `/opt/vaultwarden` is normally recognized only when the exact
+regular `.vaultwarden-appliance` marker exists. The sole unmarked fresh-install
+exception is a Caddy PKI preseed consisting exclusively of the regular,
+non-symlink directory hierarchy ending at
+`data/caddy/data/caddy/pki/authorities/local/` and exactly the four regular,
+non-symlink files `root.crt`, `root.key`, `intermediate.crt`, and
+`intermediate.key` there. All four files MUST be present and no other entry may
+exist below `/opt/vaultwarden`. Every other unmarked or unsafe directory MUST be
 left untouched and MUST NOT be adopted.
+
+The exact preseed MUST be revalidated before initialization. The installer
+MUST preserve its files in their final persistent Caddy location, create the
+remaining fresh appliance structure and marker around them, and start no Caddy
+container before that initialization. Existing Vaultwarden data is never an
+eligible preseed and MUST continue to fail closed without a valid marker.
 
 Marked installations are reconciled idempotently. Safe missing project files,
 runtime directories, systemd units, managed overrides, and containers may be
