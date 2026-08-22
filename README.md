@@ -4,13 +4,14 @@ A LAN-only Vaultwarden appliance for Debian and Raspberry Pi OS using Docker,
 Caddy HTTPS, optional mDNS or existing local DNS, simple `vwctl` management,
 verified local-first backups, and an appliance-format restore workflow.
 
-Version 0.1.2 is a maintenance and usability release after 0.1.1. Data and CA
-restore no longer depends on DNS, mDNS, or HTTPS readiness, and post-restore
-SQLite verification has been corrected. Existing `VWBACKUP` media can be
-adopted safely without formatting, and backup-device state permissions support
-unprivileged status checks. Privileged operations can be launched directly from
-the `vwctl` menu, whose labels are clearer; restore selection now also offers
-`0) Back`.
+Version 0.1.3 is a maintenance, documentation, and usability release after
+0.1.2. It documents and regression-tests last-resort manual disaster recovery
+without GitHub, `bootstrap.sh`, or `vwctl`, using standard tar/gzip, SHA-256,
+SQLite, and ordinary persistent files. The installer now asks for mDNS versus
+external/local DNS before asking for the hostname, with mode-appropriate
+defaults. Documentation also clarifies that normal routed VPN connections such
+as WireGuard generally do not carry mDNS name resolution automatically and
+recommends external/local DNS for VPN access.
 
 Real-system validation on Atlas, a Raspberry Pi, covers the public `curl`
 bootstrap, installation, complete removal, reinstallation, manual backup, USB
@@ -526,7 +527,7 @@ How that volume is attached is specific to the replacement deployment.
 The existing manifest is sufficient to identify schema 1 and its top-level
 groups, but not to teach this procedure if all project documentation has
 disappeared. A future backup format should therefore consider embedding a
-small plain-text `RECOVERY.txt`; release 0.1.2 does not add or require one.
+small plain-text `RECOVERY.txt`; release 0.1.3 does not add or require one.
 
 ## Security and scope
 
