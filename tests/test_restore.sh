@@ -37,6 +37,13 @@ printf 'attachment\n' > "${template}/vaultwarden/data/attachments/item"
 MSYS2_ARG_CONV_EXCL='/CN=' openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=Fixture Root' \
     -keyout "${template}/caddy/data/caddy/pki/authorities/local/root.key" \
     -out "${template}/caddy/data/caddy/pki/authorities/local/root.crt" >/dev/null 2>&1
+cp -- "${template}/caddy/data/caddy/pki/authorities/local/root.crt" \
+    "${template}/caddy/data/caddy/pki/authorities/local/intermediate.crt"
+cp -- "${template}/caddy/data/caddy/pki/authorities/local/root.key" \
+    "${template}/caddy/data/caddy/pki/authorities/local/intermediate.key"
+mkdir -p -- "${template}/caddy/data/caddy/certificates/local/vaultwarden.local"
+printf 'old vaultwarden.local leaf\n' > \
+    "${template}/caddy/data/caddy/certificates/local/vaultwarden.local/vaultwarden.local.crt"
 printf 'config\n' > "${template}/caddy/config/autosave.json"
 printf 'Vaultwarden Appliance\n' > "${template}/appliance/.vaultwarden-appliance"
 printf '1.0.0\n' > "${template}/appliance/.appliance-version"
@@ -150,7 +157,9 @@ expect_failure "malformed gzip/tar archive is rejected" \
 
 for missing_member in manifest vaultwarden/db.sqlite3 \
     caddy/data/caddy/pki/authorities/local/root.crt \
-    caddy/data/caddy/pki/authorities/local/root.key; do
+    caddy/data/caddy/pki/authorities/local/root.key \
+    caddy/data/caddy/pki/authorities/local/intermediate.crt \
+    caddy/data/caddy/pki/authorities/local/intermediate.key; do
     fixture_name=${missing_member//\//-}
     missing_root="${temporary_dir}/missing-${fixture_name}/tree"
     mkdir -p -- "${missing_root}"
@@ -257,6 +266,40 @@ mismatch_archive=$(make_generation "${temporary_dir}/mismatch" 20260809-023009)
 expect_failure "mismatched Caddy root certificate and private key are rejected" \
     verify_extracted_generation "${mismatch_archive}" "${temporary_dir}/mismatch-work"
 cp -- "${temporary_dir}/original.key" "${template}/caddy/data/caddy/pki/authorities/local/root.key"
+
+leaf_cleanup_fixture="${temporary_dir}/leaf-cleanup"
+mkdir -p -- "${leaf_cleanup_fixture}/data/caddy/certificates/local/vaultwarden.local"
+printf 'old leaf\n' > "${leaf_cleanup_fixture}/data/caddy/certificates/local/vaultwarden.local/leaf.crt"
+mkdir -p -- "${leaf_cleanup_fixture}/data/caddy/data/caddy/pki/authorities/local"
+for ca_file in root.crt root.key intermediate.crt intermediate.key; do
+    printf '%s\n' "${ca_file}" > "${leaf_cleanup_fixture}/data/caddy/data/caddy/pki/authorities/local/${ca_file}"
+done
+# Git for Windows cannot chmod this temporary directory reliably; keep the
+# production install(1) call intact and stub only directory creation here.
+install() { command mkdir -p -- "${!#}"; }
+expect_success "restore discards old Caddy leaf state" \
+    restore_discard_caddy_leaf_certificates "${leaf_cleanup_fixture}"
+unset -f install
+expect_failure "old Caddy leaf is absent after cleanup" \
+    test -e "${leaf_cleanup_fixture}/data/caddy/certificates/local/vaultwarden.local/leaf.crt"
+printf 'mode=dns\nhostname=vault1.lan\n' > "${leaf_cleanup_fixture}/.access"
+write_caddyfile_to "${leaf_cleanup_fixture}/Caddyfile" vault1.lan
+write_vaultwarden_override_to "${leaf_cleanup_fixture}/docker-compose.vwctl.yml" vault1.lan true
+expect_success "hostname-change Caddyfile targets the current access hostname" grep -Fxq \
+    'https://vault1.lan {' "${leaf_cleanup_fixture}/Caddyfile"
+expect_success "hostname-change DOMAIN targets the current access hostname" grep -Fxq \
+    '      DOMAIN: "https://vault1.lan"' "${leaf_cleanup_fixture}/docker-compose.vwctl.yml"
+for ca_file in root.crt root.key intermediate.crt intermediate.key; do
+    expect_success "restore preserves Caddy ${ca_file}" test -f \
+        "${leaf_cleanup_fixture}/data/caddy/data/caddy/pki/authorities/local/${ca_file}"
+done
+mkdir -p -- "${leaf_cleanup_fixture}/data/caddy/certificates"
+if ln -s "${leaf_cleanup_fixture}/data/caddy" \
+    "${leaf_cleanup_fixture}/data/caddy/certificates/unsafe-link" 2>/dev/null; then
+    expect_failure "leaf cleanup rejects symlinked certificate state" \
+        restore_discard_caddy_leaf_certificates "${leaf_cleanup_fixture}"
+    rm -f -- "${leaf_cleanup_fixture}/data/caddy/certificates/unsafe-link"
+fi
 
 cp -- "${template}/manifest" "${temporary_dir}/manifest.original"
 printf 'vaultwarden_version=$(touch %s)\n' "${temporary_dir}/manifest-pwned" >> "${template}/manifest"
@@ -858,6 +901,12 @@ expect_success "staging and confirmation precede every destructive restore step"
     confirm=$(grep -n "restore_confirm" "$file" | tail -1 | cut -d: -f1)
     apply=$(grep -n "restore_apply" "$file" | tail -1 | cut -d: -f1)
     test "$stage" -lt "$confirm" && test "$confirm" -lt "$apply"
+' _ "${REPO_DIR}/libexec/restore"
+expect_success "Caddy leaf cleanup precedes container startup" bash -c '
+    file=$1
+    cleanup=$(grep -n "restore_discard_caddy_leaf_certificates" "$file" | tail -1 | cut -d: -f1)
+    startup=$(grep -n "restore_compose up -d caddy" "$file" | tail -1 | cut -d: -f1)
+    test "$cleanup" -lt "$startup"
 ' _ "${REPO_DIR}/libexec/restore"
 expect_success "selected source archive is never a deletion target" bash -c \
     "! grep -Eq 'rm[^#\n]*RESTORE_SOURCE_ARCHIVE' '$REPO_DIR/libexec/restore'"

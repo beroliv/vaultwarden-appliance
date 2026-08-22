@@ -45,6 +45,8 @@ readonly BACKUP_LABEL="VWBACKUP"
 readonly BACKUP_ARCHIVE_PATTERN='^vaultwarden-appliance-[0-9]{8}-[0-9]{6}(-[0-9]{2})?\.tar\.gz$'
 readonly CADDY_ROOT_CA_RELATIVE="data/caddy/pki/authorities/local/root.crt"
 readonly CADDY_ROOT_KEY_RELATIVE="data/caddy/pki/authorities/local/root.key"
+readonly CADDY_INTERMEDIATE_CA_RELATIVE="data/caddy/pki/authorities/local/intermediate.crt"
+readonly CADDY_INTERMEDIATE_KEY_RELATIVE="data/caddy/pki/authorities/local/intermediate.key"
 readonly RUNTIME_DIR="/run/vaultwarden-appliance"
 readonly RESTORE_MOUNTPOINT="${RUNTIME_DIR}/restore-media"
 readonly BACKUP_SERVICE="vaultwarden-appliance-backup.service"
@@ -355,6 +357,8 @@ restore_verify_archive_structure() {
         "${ARCHIVE_ROOT}/appliance/Caddyfile"
         "${ARCHIVE_ROOT}/caddy/${CADDY_ROOT_CA_RELATIVE}"
         "${ARCHIVE_ROOT}/caddy/${CADDY_ROOT_KEY_RELATIVE}"
+        "${ARCHIVE_ROOT}/caddy/${CADDY_INTERMEDIATE_CA_RELATIVE}"
+        "${ARCHIVE_ROOT}/caddy/${CADDY_INTERMEDIATE_KEY_RELATIVE}"
     )
 
     restore_archive_members_are_safe "${archive}" "${listing}" "${types}" || return 1
@@ -493,6 +497,8 @@ restore_validate_extracted_backup() {
         "${root}/vaultwarden/db.sqlite3" \
         "${root}/caddy/${CADDY_ROOT_CA_RELATIVE}" \
         "${root}/caddy/${CADDY_ROOT_KEY_RELATIVE}" \
+        "${root}/caddy/${CADDY_INTERMEDIATE_CA_RELATIVE}" \
+        "${root}/caddy/${CADDY_INTERMEDIATE_KEY_RELATIVE}" \
         "${appliance}/.vaultwarden-appliance" \
         "${appliance}/.appliance-version" \
         "${appliance}/docker-compose.yml" \
@@ -1048,6 +1054,19 @@ restore_export_root_ca() {
     cmp -s "${root_ca}" "${EXPORTED_ROOT_CA}"
 }
 
+restore_discard_caddy_leaf_certificates() {
+    local caddy_data_directory=${1:-${CADDY_DATA_DIR}}
+    local certificates_directory="${caddy_data_directory}/data/caddy/certificates"
+    local symlink
+
+    [[ -e "${certificates_directory}" || -L "${certificates_directory}" ]] || return 0
+    [[ -d "${certificates_directory}" && ! -L "${certificates_directory}" ]] || return 1
+    symlink=$(find "${certificates_directory}" -type l -print -quit) || return 1
+    [[ -z "${symlink}" ]] || return 1
+    rm -rf -- "${certificates_directory}" || return 1
+    install -d -m 0700 -- "${certificates_directory}"
+}
+
 restore_write_backup_state_after_success() {
     local content
     local candidate
@@ -1184,13 +1203,17 @@ restore_verify_data_recovery() {
     local root=$1
     local expected_ca="${root}/caddy/${CADDY_ROOT_CA_RELATIVE}"
     local expected_key="${root}/caddy/${CADDY_ROOT_KEY_RELATIVE}"
+    local expected_intermediate_ca="${root}/caddy/${CADDY_INTERMEDIATE_CA_RELATIVE}"
+    local expected_intermediate_key="${root}/caddy/${CADDY_INTERMEDIATE_KEY_RELATIVE}"
     local expected_access
     local expected_caddy="${RESTORE_WORK_DIR}/verified-Caddyfile"
     local expected_override="${RESTORE_WORK_DIR}/verified-compose.yml"
     local current_access
 
     if [[ ! -f "${expected_ca}" || -L "${expected_ca}" ||
-          ! -f "${expected_key}" || -L "${expected_key}" ]]; then
+          ! -f "${expected_key}" || -L "${expected_key}" ||
+          ! -f "${expected_intermediate_ca}" || -L "${expected_intermediate_ca}" ||
+          ! -f "${expected_intermediate_key}" || -L "${expected_intermediate_key}" ]]; then
         restore_local_verification_failed "Selected Caddy CA files verification"
         return 1
     fi
@@ -1208,6 +1231,14 @@ restore_verify_data_recovery() {
         "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}" \
         "${CADDY_DATA_DIR}/${CADDY_ROOT_KEY_RELATIVE}"; then
         restore_local_verification_failed "Caddy root certificate/private-key verification"
+        return 1
+    fi
+    if ! cmp -s "${expected_key}" "${CADDY_DATA_DIR}/${CADDY_ROOT_KEY_RELATIVE}" ||
+       ! cmp -s "${expected_intermediate_ca}" \
+            "${CADDY_DATA_DIR}/${CADDY_INTERMEDIATE_CA_RELATIVE}" ||
+       ! cmp -s "${expected_intermediate_key}" \
+            "${CADDY_DATA_DIR}/${CADDY_INTERMEDIATE_KEY_RELATIVE}"; then
+        restore_local_verification_failed "Caddy CA identity verification"
         return 1
     fi
     if ! cmp -s "${expected_ca}" "${CADDY_DATA_DIR}/${CADDY_ROOT_CA_RELATIVE}"; then
@@ -1305,6 +1336,8 @@ restore_apply() {
         restore_die "Vaultwarden database snapshot installation failed. No automatic rollback was attempted."
     restore_replace_data_directory caddy "${root}/caddy" || \
         restore_die "Caddy data replacement failed. No automatic rollback was attempted."
+    restore_discard_caddy_leaf_certificates || \
+        restore_die "Old Caddy leaf certificate state could not be safely removed."
     restore_write_configuration "${root}" || \
         restore_die "Appliance access configuration reconciliation failed."
     restore_compose config --quiet || \

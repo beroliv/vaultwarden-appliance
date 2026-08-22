@@ -194,6 +194,8 @@ printf 'live database must be excluded\n' > "${data_dir}/vaultwarden/db.sqlite3"
 printf 'old snapshot must be excluded\n' > "${data_dir}/vaultwarden/db_20260801_010101.sqlite3"
 printf 'public root\n' > "${data_dir}/caddy/data/caddy/pki/authorities/local/root.crt"
 printf 'private root\n' > "${data_dir}/caddy/data/caddy/pki/authorities/local/root.key"
+printf 'public intermediate\n' > "${data_dir}/caddy/data/caddy/pki/authorities/local/intermediate.crt"
+printf 'private intermediate\n' > "${data_dir}/caddy/data/caddy/pki/authorities/local/intermediate.key"
 
 manifest_test="${temporary_dir}/manifest"
 expect_success "schema-one manifest is generated" backup_write_manifest \
@@ -237,6 +239,16 @@ expect_failure "live SQLite database is excluded from archive" grep -Fxq \
     'vaultwarden-appliance-backup/vaultwarden/data/db.sqlite3' "${temporary_dir}/valid.list"
 expect_failure "old built-in snapshots are excluded from archive" grep -Fq \
     'db_20260801_010101.sqlite3' "${temporary_dir}/valid.list"
+
+for missing_ca in root.crt root.key intermediate.crt intermediate.key; do
+    missing_data="${temporary_dir}/missing-${missing_ca}/data"
+    mkdir -p -- "${temporary_dir}/missing-${missing_ca}"
+    cp -a -- "${data_dir}" "${missing_data}"
+    rm -f -- "${missing_data}/caddy/data/caddy/pki/authorities/local/${missing_ca}"
+    missing_archive="${archive_dir}/missing-${missing_ca}.tar.gz"
+    expect_failure "backup creation rejects missing Caddy ${missing_ca}" \
+        backup_create_archive "${temporary_dir}/work" "${missing_archive}" "${missing_data}"
+done
 
 printf 'not a tar archive\n' > "${archive_dir}/unreadable.tar.gz"
 expect_failure "unreadable archive fails integrity verification" backup_verify_archive \

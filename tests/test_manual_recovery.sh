@@ -168,6 +168,8 @@ openssl req -x509 -newkey rsa:2048 -nodes \
     -out "${ca_directory}/root.crt" \
     -subj '/CN=Vaultwarden Appliance Manual Recovery Test' \
     -days 1 >/dev/null 2>&1
+cp -- "${ca_directory}/root.crt" "${ca_directory}/intermediate.crt"
+cp -- "${ca_directory}/root.key" "${ca_directory}/intermediate.key"
 
 expect_success "current backup helper creates the recovery archive" \
     backup_create_archive "${work_dir}" "${archive}" "${data_dir}"
@@ -212,6 +214,8 @@ expect_failure "transient Vaultwarden tmp data is not copied" test -e \
 
 recovered_ca="${recovered_root}/caddy/data/caddy/pki/authorities/local/root.crt"
 recovered_key="${recovered_root}/caddy/data/caddy/pki/authorities/local/root.key"
+recovered_intermediate_ca="${recovered_root}/caddy/data/caddy/pki/authorities/local/intermediate.crt"
+recovered_intermediate_key="${recovered_root}/caddy/data/caddy/pki/authorities/local/intermediate.key"
 openssl x509 -in "${recovered_ca}" -pubkey -noout > "${temporary_dir}/certificate.pub"
 openssl pkey -in "${recovered_key}" -pubout > "${temporary_dir}/private-key.pub"
 expect_success "Caddy root certificate is found at the documented path" \
@@ -220,6 +224,8 @@ expect_success "Caddy root private key is found at the documented path" \
     openssl pkey -in "${recovered_key}" -check -noout
 expect_success "recovered Caddy root certificate and private key match" cmp \
     "${temporary_dir}/certificate.pub" "${temporary_dir}/private-key.pub"
+expect_success "Caddy intermediate certificate is recoverable" test -f "${recovered_intermediate_ca}"
+expect_success "Caddy intermediate private key is recoverable" test -f "${recovered_intermediate_key}"
 
 printf '1..%d\n' "${TESTS}"
 (( FAILURES == 0 ))

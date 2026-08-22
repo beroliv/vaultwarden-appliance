@@ -34,6 +34,8 @@ readonly VAULTWARDEN_DATA_DIR="${INSTALL_DIR}/data/vaultwarden"
 readonly CADDY_DATA_DIR="${INSTALL_DIR}/data/caddy"
 readonly CADDY_ROOT_CA_RELATIVE="data/caddy/pki/authorities/local/root.crt"
 readonly CADDY_ROOT_KEY_RELATIVE="data/caddy/pki/authorities/local/root.key"
+readonly CADDY_INTERMEDIATE_CA_RELATIVE="data/caddy/pki/authorities/local/intermediate.crt"
+readonly CADDY_INTERMEDIATE_KEY_RELATIVE="data/caddy/pki/authorities/local/intermediate.key"
 readonly RUNTIME_DIR="/run/vaultwarden-appliance"
 readonly BACKUP_MOUNTPOINT="${RUNTIME_DIR}/backup"
 readonly BACKUP_SCHEMA="1"
@@ -161,6 +163,12 @@ backup_require_environment() {
     [[ -f "${CADDY_DATA_DIR}/${CADDY_ROOT_KEY_RELATIVE}" &&
        ! -L "${CADDY_DATA_DIR}/${CADDY_ROOT_KEY_RELATIVE}" ]] || \
         backup_die "Caddy's persistent internal CA private key is missing or unsafe."
+    [[ -f "${CADDY_DATA_DIR}/${CADDY_INTERMEDIATE_CA_RELATIVE}" &&
+       ! -L "${CADDY_DATA_DIR}/${CADDY_INTERMEDIATE_CA_RELATIVE}" ]] || \
+        backup_die "Caddy's persistent intermediate CA certificate is missing or unsafe."
+    [[ -f "${CADDY_DATA_DIR}/${CADDY_INTERMEDIATE_KEY_RELATIVE}" &&
+       ! -L "${CADDY_DATA_DIR}/${CADDY_INTERMEDIATE_KEY_RELATIVE}" ]] || \
+        backup_die "Caddy's persistent intermediate CA private key is missing or unsafe."
     for command in docker lsblk findmnt readlink stat mount umount tar gzip \
         sha256sum sync df du find install mktemp date uname awk grep mv rm \
         mkdir rmdir chmod chgrp dirname sort cp; do
@@ -491,9 +499,15 @@ backup_sources_are_safe() {
     local vaultwarden_directory=$1
     local caddy_directory=$2
     local unexpected
+    local required
 
     [[ -d "${vaultwarden_directory}" && ! -L "${vaultwarden_directory}" &&
        -d "${caddy_directory}" && ! -L "${caddy_directory}" ]] || return 1
+    for required in "${CADDY_ROOT_CA_RELATIVE}" "${CADDY_ROOT_KEY_RELATIVE}" \
+        "${CADDY_INTERMEDIATE_CA_RELATIVE}" "${CADDY_INTERMEDIATE_KEY_RELATIVE}"; do
+        [[ -f "${caddy_directory}/${required}" &&
+           ! -L "${caddy_directory}/${required}" ]] || return 1
+    done
     unexpected=$(find "${vaultwarden_directory}" "${caddy_directory}" \
         \( ! -type f ! -type d \) -print -quit) || return 1
     [[ -z "${unexpected}" ]]
@@ -542,6 +556,12 @@ backup_verify_archive() {
         "${listing}" || return 5
     grep -Fxq \
         "vaultwarden-appliance-backup/caddy/${CADDY_ROOT_KEY_RELATIVE}" \
+        "${listing}" || return 5
+    grep -Fxq \
+        "vaultwarden-appliance-backup/caddy/${CADDY_INTERMEDIATE_CA_RELATIVE}" \
+        "${listing}" || return 5
+    grep -Fxq \
+        "vaultwarden-appliance-backup/caddy/${CADDY_INTERMEDIATE_KEY_RELATIVE}" \
         "${listing}" || return 5
 }
 

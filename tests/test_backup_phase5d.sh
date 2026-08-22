@@ -42,6 +42,8 @@ printf 'backup_schema=1\n' > "${template_root}/manifest"
 printf 'snapshot\n' > "${template_root}/vaultwarden/db.sqlite3"
 printf 'public root\n' > "${template_root}/caddy/data/caddy/pki/authorities/local/root.crt"
 printf 'private root\n' > "${template_root}/caddy/data/caddy/pki/authorities/local/root.key"
+printf 'public intermediate\n' > "${template_root}/caddy/data/caddy/pki/authorities/local/intermediate.crt"
+printf 'private intermediate\n' > "${template_root}/caddy/data/caddy/pki/authorities/local/intermediate.key"
 template_archive="${temporary_dir}/template.tar.gz"
 command tar -czf "${template_archive}" -C "${temporary_dir}/template" vaultwarden-appliance-backup
 

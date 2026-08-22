@@ -443,6 +443,8 @@ vaultwarden-appliance-backup/
   caddy/
     data/caddy/pki/authorities/local/root.crt
     data/caddy/pki/authorities/local/root.key
+    data/caddy/pki/authorities/local/intermediate.crt
+    data/caddy/pki/authorities/local/intermediate.key
     ...                           # complete persistent Caddy data/config state
   appliance/                      # selected appliance metadata/configuration
 ```
@@ -497,18 +499,21 @@ The backup excludes the live `db.sqlite3`, its WAL/SHM files, old built-in
 `vaultwarden/db.sqlite3` is the consistent snapshot created by Vaultwarden's
 built-in backup command.
 
-### Optionally preserve the old Caddy trust anchor
+### Preserve the Caddy trust anchor
 
-The old Caddy CA is not needed to recover Vaultwarden passwords, accounts,
-attachments, sends, or other Vaultwarden data. A new reverse proxy may use a
-new CA. Preserve the old CA only when existing clients should keep trusting the
-same private trust anchor.
+The appliance backup preserves the four-file Caddy CA identity so existing
+clients can continue trusting the same private trust anchor. Hostname-specific
+leaf/server certificates are disposable and are intentionally discarded by the
+appliance restore; Caddy issues a fresh leaf for the current `.access`
+hostname.
 
-The backed-up public root and its corresponding private key are exactly:
+The backed-up CA identity files are:
 
 ```bash
 CA_CERT="${RECOVERY_ROOT}/caddy/data/caddy/pki/authorities/local/root.crt"
 CA_KEY="${RECOVERY_ROOT}/caddy/data/caddy/pki/authorities/local/root.key"
+CA_INTERMEDIATE_CERT="${RECOVERY_ROOT}/caddy/data/caddy/pki/authorities/local/intermediate.crt"
+CA_INTERMEDIATE_KEY="${RECOVERY_ROOT}/caddy/data/caddy/pki/authorities/local/intermediate.key"
 
 openssl x509 -in "${CA_CERT}" -noout -subject -issuer -sha256 -fingerprint
 openssl pkey -in "${CA_KEY}" -check -noout
@@ -516,13 +521,13 @@ cmp <(openssl x509 -in "${CA_CERT}" -pubkey -noout) \
     <(openssl pkey -in "${CA_KEY}" -pubout)
 ```
 
-The final command is silent and exits successfully only when the certificate
-and private key match. The private key is highly sensitive: keep the recovery
+The appliance requires all four CA identity files above. The final command is
+silent and exits successfully only when the root certificate and private key
+match. The CA private keys are highly sensitive: keep the recovery
 directory mode `0700`, never publish or casually copy the key, and do not use
-insecure TLS workarounds. If retaining the CA, restore the complete archived
-`caddy/` tree into the corresponding persistent Caddy storage while Caddy is
-stopped and apply the ownership/permissions required by that Caddy deployment.
-How that volume is attached is specific to the replacement deployment.
+insecure TLS workarounds. Manual recovery should restore the four CA identity
+files only; do not restore old hostname-specific leaf certificates. The current
+`.access` hostname remains authoritative.
 
 The existing manifest is sufficient to identify schema 1 and its top-level
 groups, but not to teach this procedure if all project documentation has

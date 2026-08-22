@@ -637,14 +637,15 @@ when present; a manual recovery MUST migrate the complete data tree and install
 the separate snapshot as the target `db.sqlite3` while Vaultwarden is stopped.
 
 The complete Caddy persistent tree is mapped below
-`vaultwarden-appliance-backup/caddy/`. Its internal root certificate and
-matching private key are exactly
-`caddy/data/caddy/pki/authorities/local/root.crt` and
-`caddy/data/caddy/pki/authorities/local/root.key` relative to the archive root.
-They are optional for Vaultwarden data recovery and exist only to preserve the
-old private trust anchor when required. Manual extraction is a last resort and
-does not replace the restore command's stronger archive, schema, CA, and
-filesystem validation.
+`vaultwarden-appliance-backup/caddy/`. Every valid appliance backup MUST contain
+the four CA identity files
+`caddy/data/caddy/pki/authorities/local/root.crt`,
+`root.key`, `intermediate.crt`, and `intermediate.key` relative to the archive
+root. These files preserve the long-lived private trust anchor; no additional
+certificate-chain validation is required. Hostname-specific leaf/server
+certificates are disposable and are not restored by the appliance restore.
+Manual extraction is a last resort and does not replace the restore command's
+stronger archive, schema, CA, and filesystem validation.
 
 Complete Caddy data includes sensitive CA private-key material as opaque backup
 files. Backups are not encrypted and MUST be protected physically and by access
@@ -818,9 +819,12 @@ Vaultwarden `DOMAIN` from its current hostname, and reconcile mDNS only when its
 current mode is `mdns`. External DNS mode remains free of an appliance
 publisher. Backed-up scripts or executables are never run or installed.
 
-The restored Caddy data includes the selected backup's original internal root
-CA and private key. The public root is exported again, preserving trust for
-clients that already trust that backup's CA. Vaultwarden and Caddy are started;
+The restored Caddy data includes the selected backup's four-file internal CA
+identity and private keys. Before Caddy starts, generated hostname-specific
+leaf/server state below `data/caddy/certificates` is discarded. The public root
+is exported again, preserving trust for clients that already trust that backup's
+CA. Vaultwarden and Caddy are started; Caddy then issues a fresh leaf for the
+current `.access` hostname.
 the mDNS publisher is started only when the current mode is `mdns`. Successful
 data recovery requires local verification of the restored SQLite database,
 Caddy CA certificate/private-key pair, exported public root, unchanged current
