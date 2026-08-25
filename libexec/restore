@@ -1278,17 +1278,12 @@ restore_verify_runtime_domain() {
 }
 
 restore_report_completion() {
-    local current_ip=""
-
     printf '\nRestore completed successfully.\n\n'
     printf 'Vaultwarden data: restored\n'
     printf 'Caddy root CA: restored\n'
     printf 'Access configuration: preserved\n'
     printf 'Local backup generations: preserved\n'
-    if (( RESTORE_NETWORK_HEALTHY == 1 )); then
-        printf 'Network access: healthy\n'
-        printf '\nConfigured URL:\n  https://%s\n' "${RESTORE_HOSTNAME}"
-        return 0
+}
     fi
 
     printf '\nWARNING: Network access is not currently healthy.\n'
@@ -1358,11 +1353,7 @@ restore_apply() {
     restore_write_backup_state_after_success || \
         restore_die "The restore succeeded, but backup-media state adoption failed."
     restore_resume_timer || restore_die "The restore succeeded, but the automatic-backup timer state could not be restored."
-    if (( mdns_started == 1 )) && restore_wait_for_network_health \
-        "${RESTORE_READINESS_TIMEOUT}" "${RESTORE_READINESS_RETRY_INTERVAL}"; then
-        RESTORE_NETWORK_HEALTHY=1
-    else
-        RESTORE_NETWORK_HEALTHY=0
+    
     fi
 }
 
