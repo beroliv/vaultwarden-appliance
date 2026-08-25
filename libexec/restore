@@ -1284,36 +1284,6 @@ restore_report_completion() {
     printf 'Access configuration: preserved\n'
     printf 'Local backup generations: preserved\n'
 }
-    fi
-
-    printf '\nWARNING: Network access is not currently healthy.\n'
-    printf '\nConfigured URL:\n  https://%s\n' "${RESTORE_HOSTNAME}"
-    current_ip=$(detect_ipv4_address || true)
-    if [[ "${RESTORE_ACCESS_MODE}" == dns ]]; then
-        printf '\nFor external DNS configure:\n'
-        if [[ -n "${current_ip}" ]]; then
-            printf '  %s -> %s\n' "${RESTORE_HOSTNAME}" "${current_ip}"
-        else
-            printf '  %s -> <current appliance LAN IPv4>\n' "${RESTORE_HOSTNAME}"
-            printf '\nNo usable LAN IPv4 address is currently detected.\n'
-        fi
-        printf '\nThe appliance did not modify external DNS.\n'
-    else
-        printf '\nThe appliance mDNS publisher is not ready for the configured name.\n'
-        if [[ -n "${current_ip}" ]]; then
-            printf 'Expected mDNS mapping:\n  %s -> %s\n' \
-                "${RESTORE_HOSTNAME}" "${current_ip}"
-        else
-            printf 'No usable LAN IPv4 address is currently detected for mDNS publication.\n'
-        fi
-        printf 'Check after the LAN is available:\n'
-        printf '  systemctl status %s\n' "${MDNS_SERVICE}"
-    fi
-    if [[ -n "${RESTORE_NETWORK_LAST_HTTPS_ERROR}" ]]; then
-        printf '\nLast HTTPS check:\n  %s\n' "${RESTORE_NETWORK_LAST_HTTPS_ERROR}"
-    fi
-    printf '\nRun after network configuration:\n  sudo vwctl health\n'
-}
 
 restore_apply() {
     local root="${RESTORE_WORK_DIR}/extract/${ARCHIVE_ROOT}"
@@ -1352,9 +1322,8 @@ restore_apply() {
     fi
     restore_write_backup_state_after_success || \
         restore_die "The restore succeeded, but backup-media state adoption failed."
-    restore_resume_timer || restore_die "The restore succeeded, but the automatic-backup timer state could not be restored."
-    
-    fi
+    restore_resume_timer || \
+        restore_die "The restore succeeded, but the automatic-backup timer state could not be restored."
 }
 
 restore_find_generations() {
