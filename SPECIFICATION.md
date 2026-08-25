@@ -242,7 +242,9 @@ eligible preseed and MUST continue to fail closed without a valid marker.
 Marked installations are reconciled idempotently. Safe missing project files,
 runtime directories, systemd units, managed overrides, and containers may be
 recreated. Existing Vaultwarden data, Caddy persistent data and root CA, local
-backups and USB state MUST NOT be overwritten or deleted.
+backups and USB state MUST NOT be overwritten or deleted. The default
+`/opt/vaultwarden/Caddyfile` MUST be created only when absent; an existing
+regular Caddyfile MUST remain byte-for-byte unchanged on every installer rerun.
 
 Every interactive rerun MUST ask for the access mode before the hostname. It
 MUST offer the current mode as the mode default and, when that mode is retained,
@@ -620,7 +622,8 @@ the snapshot. Vaultwarden remains running.
 The archive contains remaining persistent Vaultwarden files, selected
 non-access appliance configuration/state, and complete Caddy persistent data so
 a future restore can preserve the internal root CA. `/opt/vaultwarden/.access`
-MUST NOT be included. The manifest uses `backup_schema=1` and records version,
+and `/opt/vaultwarden/Caddyfile` MUST NOT be included. The manifest uses
+`backup_schema=1` and records version,
 UTC time, signup state, image/version data where available, architecture, CA
 inclusion, and expected contents. It contains no hostname/mode field,
 credential, or private-key content itself.
@@ -813,11 +816,13 @@ verified database snapshot without stale WAL/SHM files. Existing local backup
 generations under `/opt/vaultwarden/backups` are outside that replacement and
 MUST remain intact.
 
-The currently installed management code, `.access`, and base/Caddy Compose files
-remain authoritative. Restore MUST preserve `.access`, regenerate Caddyfile and
-Vaultwarden `DOMAIN` from its current hostname, and reconcile mDNS only when its
-current mode is `mdns`. External DNS mode remains free of an appliance
-publisher. Backed-up scripts or executables are never run or installed.
+The currently installed management code, `.access`, `Caddyfile`, and base/Caddy
+Compose files remain authoritative. Restore MUST preserve `.access` and
+`Caddyfile` byte-for-byte, regenerate only Vaultwarden `DOMAIN` from the current
+hostname, and reconcile mDNS only when its current mode is `mdns`. A Caddyfile
+present in an older backup MUST be ignored. External DNS mode remains free of
+an appliance publisher. Backed-up scripts or executables are never run or
+installed.
 
 The restored Caddy data includes the selected backup's four-file internal CA
 identity and private keys. Before Caddy starts, generated hostname-specific
@@ -828,7 +833,8 @@ current `.access` hostname.
 the mDNS publisher is started only when the current mode is `mdns`. Successful
 data recovery requires local verification of the restored SQLite database,
 Caddy CA certificate/private-key pair, exported public root, unchanged current
-`.access`, regenerated Caddyfile, and regenerated Vaultwarden `DOMAIN` override.
+`.access`, unchanged current `Caddyfile`, and regenerated Vaultwarden `DOMAIN`
+override.
 USB UUID state may be adopted and the prior timer state restored after those
 local recovery checks succeed.
 

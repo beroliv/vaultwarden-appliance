@@ -393,7 +393,6 @@ backup_copy_appliance_configuration() {
         docker-compose.yml
         docker-compose.override.yml
         docker-compose.vwctl.yml
-        Caddyfile
     )
 
     for source in "${files[@]}"; do

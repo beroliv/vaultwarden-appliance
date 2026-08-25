@@ -180,6 +180,41 @@ expect_failure "installer never changes the Linux hostname" grep -Eq \
 expect_failure "switching modes never uninstalls Avahi" grep -Eq \
     '(apt-get|apt)[[:space:]]+(remove|purge).*avahi' "${REPO_DIR}/install.sh"
 
+fresh_caddy_candidate="${temporary_dir}/Caddyfile.fresh"
+installed_caddyfile="${temporary_dir}/Caddyfile.installed"
+write_caddyfile_to "${fresh_caddy_candidate}" vaultwarden.local
+fresh_caddy_changed=$(bash -c '
+    . "$1"
+    CADDY_CONFIG_CHANGED=0
+    install_caddyfile_if_missing "$2" "$3" fresh
+    printf "%s\n" "${CADDY_CONFIG_CHANGED}"
+' _ "${REPO_DIR}/install.sh" "${fresh_caddy_candidate}" "${installed_caddyfile}")
+expect_success "fresh installation creates the Caddyfile" test -f "${installed_caddyfile}"
+expect_success "fresh installation installs the generated Caddyfile" test -f "${installed_caddyfile}"
+expect_equal "fresh Caddyfile creation is recorded" 1 "${fresh_caddy_changed}"
+printf '\n# NOVA-INFRA test host\nhttps://service.lan { respond "ok" }\n' >> "${installed_caddyfile}"
+cp -- "${installed_caddyfile}" "${temporary_dir}/Caddyfile.before-rerun"
+rerun_caddy_candidate="${temporary_dir}/Caddyfile.rerun"
+write_caddyfile_to "${rerun_caddy_candidate}" vaultwarden.local
+rerun_caddy_changed=$(bash -c '
+    . "$1"
+    CADDY_CONFIG_CHANGED=0
+    install_caddyfile_if_missing "$2" "$3" existing
+    printf "%s\n" "${CADDY_CONFIG_CHANGED}"
+' _ "${REPO_DIR}/install.sh" "${rerun_caddy_candidate}" "${installed_caddyfile}")
+expect_equal "installer rerun accepts an existing extended Caddyfile" 0 "${rerun_caddy_changed}"
+expect_success "installer rerun preserves the Caddyfile byte-for-byte" cmp -s \
+    "${temporary_dir}/Caddyfile.before-rerun" "${installed_caddyfile}"
+expect_equal "preserved Caddyfile is not marked as regenerated" 0 "${rerun_caddy_changed}"
+missing_rerun_candidate="${temporary_dir}/Caddyfile.missing-rerun"
+missing_rerun_destination="${temporary_dir}/Caddyfile.must-not-be-recreated"
+write_caddyfile_to "${missing_rerun_candidate}" vaultwarden.local
+expect_failure "existing installation does not recreate a missing Caddyfile" bash -c '
+    . "$1"
+    install_caddyfile_if_missing "$2" "$3" existing
+' _ "${REPO_DIR}/install.sh" "${missing_rerun_candidate}" "${missing_rerun_destination}"
+expect_failure "rerun leaves a missing Caddyfile absent" test -e "${missing_rerun_destination}"
+
 write_caddyfile_to "${temporary_dir}/Caddyfile" vault.lan
 expect_success "Caddy follows an external DNS hostname" grep -Fxq \
     'https://vault.lan {' "${temporary_dir}/Caddyfile"

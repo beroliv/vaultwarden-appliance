@@ -139,6 +139,15 @@ expect_equal "manifest signup setting is retained" true "${RESTORE_SIGNUP_ALLOWE
 valid_hash=$(restore_checksum_hash "${valid_archive}")
 expect_equal "verified checksum is 64 characters" 64 "${#valid_hash}"
 
+rm -f -- "${template}/appliance/Caddyfile"
+without_caddyfile_archive=$(make_generation "${temporary_dir}/without-caddyfile" 20260809-023015)
+expect_success "current backup without Caddyfile is accepted" \
+    verify_extracted_generation "${without_caddyfile_archive}" "${temporary_dir}/without-caddyfile-work"
+printf 'OLD BACKUP CADDYFILE MUST BE IGNORED\n' > "${template}/appliance/Caddyfile"
+old_caddyfile_archive=$(make_generation "${temporary_dir}/old-caddyfile" 20260809-023016)
+expect_success "older backup containing a Caddyfile remains accepted" \
+    verify_extracted_generation "${old_caddyfile_archive}" "${temporary_dir}/old-caddyfile-work"
+
 missing_checksum="${temporary_dir}/missing/vaultwarden-appliance-20260809-023001.tar.gz"
 mkdir -p -- "${missing_checksum%/*}"
 cp -- "${valid_archive}" "${missing_checksum}"
@@ -285,7 +294,7 @@ expect_failure "old Caddy leaf is absent after cleanup" \
 printf 'mode=dns\nhostname=vault1.lan\n' > "${leaf_cleanup_fixture}/.access"
 write_caddyfile_to "${leaf_cleanup_fixture}/Caddyfile" vault1.lan
 write_vaultwarden_override_to "${leaf_cleanup_fixture}/docker-compose.vwctl.yml" vault1.lan true
-expect_success "hostname-change Caddyfile targets the current access hostname" grep -Fxq \
+expect_success "Caddy helper still targets an explicitly requested hostname" grep -Fxq \
     'https://vault1.lan {' "${leaf_cleanup_fixture}/Caddyfile"
 expect_success "hostname-change DOMAIN targets the current access hostname" grep -Fxq \
     '      DOMAIN: "https://vault1.lan"' "${leaf_cleanup_fixture}/docker-compose.vwctl.yml"
@@ -632,10 +641,9 @@ external_dns_reconciliation() (
     mkdir -p -- "${RESTORE_WORK_DIR}"
     docker() { return 0; }
     restore_validate_reconciliation &&
-        grep -Fxq 'https://vault.lan {' "${RESTORE_WORK_DIR}/reconciled-Caddyfile" &&
         grep -Fxq '      DOMAIN: "https://vault.lan"' "${RESTORE_WORK_DIR}/reconciled-compose.yml"
 )
-expect_success "restore reconciles Caddy and DOMAIN from current external DNS access" \
+expect_success "restore reconciles DOMAIN from current external DNS access" \
     external_dns_reconciliation
 
 network_never_available() (
@@ -719,6 +727,9 @@ network_independent_dns_restore() (
         "${result}/work"
     printf 'mode=dns\nhostname=vault1.lan\n' > "${result}/.access"
     cp -- "${result}/.access" "${result}/access-before"
+    printf 'https://vault1.lan { reverse_proxy vaultwarden:80 }\n' > "${result}/Caddyfile"
+    printf 'https://wg-easy.lan { reverse_proxy wg-easy:51821 }\n' >> "${result}/Caddyfile"
+    cp -- "${result}/Caddyfile" "${result}/Caddyfile-before"
     RESTORE_ACCESS_MODE=dns
     RESTORE_HOSTNAME=vault1.lan
     RESTORE_SIGNUP_ALLOWED=true
@@ -740,9 +751,8 @@ network_independent_dns_restore() (
         cp -- "${template}/vaultwarden/db.sqlite3" "${result}/vaultwarden/db.sqlite3"
     }
     restore_write_configuration() {
-        write_caddyfile_to "${result}/Caddyfile" "${RESTORE_HOSTNAME}" &&
-            write_vaultwarden_override_to \
-                "${result}/docker-compose.vwctl.yml" "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}"
+        write_vaultwarden_override_to \
+            "${result}/docker-compose.vwctl.yml" "${RESTORE_HOSTNAME}" "${RESTORE_SIGNUP_ALLOWED}"
     }
     restore_compose() {
         if [[ "$*" == "up -d vaultwarden" ]]; then
@@ -765,7 +775,7 @@ network_independent_dns_restore() (
             cmp -s "${result}/caddy/${CADDY_ROOT_CA_RELATIVE}" \
                 "${result}/certs/caddy-root-ca.crt" &&
             cmp -s "${result}/.access" "${result}/access-before" &&
-            grep -Fxq 'https://vault1.lan {' "${result}/Caddyfile" &&
+            cmp -s "${result}/Caddyfile" "${result}/Caddyfile-before" &&
             grep -Fxq '      DOMAIN: "https://vault1.lan"' \
                 "${result}/docker-compose.vwctl.yml" &&
             snapshot_verified=1
@@ -918,8 +928,10 @@ expect_success "restored database snapshot becomes live db.sqlite3" grep -Fq \
     'local destination="${VAULTWARDEN_DATA_DIR}/db.sqlite3"' "${REPO_DIR}/libexec/restore"
 expect_success "backed management executables are never copied from staging" bash -c \
     "! grep -Eq '(/usr/local/bin|/usr/local/libexec).*ARCHIVE_ROOT|ARCHIVE_ROOT.*(/usr/local/bin|/usr/local/libexec)' '$REPO_DIR/libexec/restore'"
-expect_success "current code regenerates Caddy hostname configuration" grep -Fq \
-    'write_caddyfile_to "${caddy_candidate}" "${RESTORE_HOSTNAME}"' "${REPO_DIR}/libexec/restore"
+expect_failure "restore never regenerates or replaces the active Caddyfile" grep -Eq \
+    '(write_caddyfile_to|mv|install|cp)[^#\n]*CADDYFILE' "${REPO_DIR}/libexec/restore"
+expect_success "restore verifies the active Caddyfile remains unchanged" grep -Fq \
+    '"${RESTORE_CADDYFILE_HASH}"' "${REPO_DIR}/libexec/restore"
 expect_success "current code reconciles Vaultwarden DOMAIN and signup" grep -Fq \
     'write_vaultwarden_override_to "${override_candidate}"' "${REPO_DIR}/libexec/restore"
 expect_failure "restore never writes the authoritative access configuration" grep -Eq \

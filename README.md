@@ -190,9 +190,10 @@ sudo git pull --ff-only origin main
 sudo ./install.sh
 ```
 
-Installer reruns preserve Vaultwarden data, Caddy's persistent internal CA,
-local backups, and configured USB state. They reconcile missing
-appliance-owned files and containers where safe.
+Installer reruns preserve Vaultwarden data, the existing `Caddyfile` byte-for-byte,
+Caddy's persistent internal CA, local backups, and configured USB state. The
+default Caddyfile is created only when it does not yet exist. Reruns reconcile
+other missing appliance-owned files and containers where safe.
 
 A source update and a container update are different operations:
 
@@ -350,16 +351,18 @@ RESTORE VAULTWARDEN
 
 The workflow temporarily stops automatic backup, the active appliance mDNS
 publisher when applicable, Caddy, and Vaultwarden; replaces the verified
-Vaultwarden/Caddy persistent data; regenerates Caddy and `DOMAIN` from the
-currently installed `.access`; then starts Vaultwarden and Caddy. Restore
+Vaultwarden/Caddy persistent data; preserves the installed `Caddyfile`
+byte-for-byte; regenerates only Vaultwarden `DOMAIN` from the currently
+installed `.access`; then starts Vaultwarden and Caddy. Restore
 preflight does not require DNS, mDNS, HTTPS, or the configured hostname to be
 reachable. The restored database and Caddy CA are verified locally before
 Vaultwarden is started and before network health is evaluated. This preserves a
 byte-for-byte snapshot check before Vaultwarden can legitimately write to the
 restored SQLite database during startup.
-Backups do not contain access configuration, so the current hostname and
-mDNS/external-DNS choice are preserved. Existing local backup generations are
-also preserved.
+Backups do not contain access configuration or the appliance `Caddyfile`, so
+the current hostname, mDNS/external-DNS choice, and any Nova/user Caddy routes
+are preserved. Older backups containing a Caddyfile remain accepted, but that
+file is ignored. Existing local backup generations are also preserved.
 The selected backup's Caddy root CA is restored and re-exported so clients that
 already trust that CA remain valid.
 

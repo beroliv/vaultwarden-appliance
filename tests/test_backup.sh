@@ -218,10 +218,13 @@ printf '0.1.0\n' > "${appliance_fixture}/.appliance-version"
 printf 'mode=dns\nhostname=vault.lan\n' > "${appliance_fixture}/.access"
 printf 'compose\n' > "${appliance_fixture}/docker-compose.yml"
 printf 'caddy compose\n' > "${appliance_fixture}/docker-compose.override.yml"
+printf 'extended Nova Caddyfile\n' > "${appliance_fixture}/Caddyfile"
 expect_success "appliance configuration is staged without access state" \
     backup_copy_appliance_configuration "${appliance_fixture}" "${appliance_copy}"
 expect_failure "access configuration is excluded from backup staging" \
     test -e "${appliance_copy}/.access"
+expect_failure "Caddyfile is excluded from backup staging" \
+    test -e "${appliance_copy}/Caddyfile"
 
 tar() {
     return 1

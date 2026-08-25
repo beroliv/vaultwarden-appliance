@@ -323,7 +323,6 @@ check_existing_installation() {
 
 detect_caddy_configuration() {
     local parsed_access=""
-    local parsed_address=""
     local core_files=0
 
     section "Caddy configuration"
@@ -352,17 +351,6 @@ detect_caddy_configuration() {
     if [[ ! -e "${ACCESS_FILE}" ]]; then
         info "No appliance access configuration exists yet; it will be created from your choices."
         return
-    fi
-
-    if [[ -e "${CADDYFILE}" ]]; then
-        if ! parsed_address=$(read_caddyfile_hostname "${CADDYFILE}"); then
-            error "The existing Caddyfile does not contain one valid appliance hostname."
-            return
-        fi
-        if [[ "${parsed_address}" != "${CADDY_ACCESS_ADDRESS}" ]]; then
-            info "The Caddy hostname will be reconciled with the appliance access configuration."
-            return
-        fi
     fi
 
     if (( core_files == 2 )) && \
@@ -1430,11 +1418,25 @@ reconcile_caddy_data_directories() {
     install -d -m 0700 "${CADDY_DATA_DIR}" "${CADDY_CONFIG_DIR}"
 }
 
+install_caddyfile_if_missing() {
+    local candidate=$1
+    local destination=$2
+    local appliance_state=$3
+
+    [[ -f "${candidate}" && ! -L "${candidate}" ]] || return 1
+    if [[ -e "${destination}" || -L "${destination}" ]]; then
+        [[ -f "${destination}" && ! -L "${destination}" ]] || return 1
+        rm -f -- "${candidate}"
+        return 0
+    fi
+    [[ "${appliance_state}" == fresh || "${appliance_state}" == preseed ]] || return 1
+    mv -- "${candidate}" "${destination}" || return 1
+    CADDY_CONFIG_CHANGED=1
+}
+
 create_caddy_configuration() {
     local caddy_candidate
     local compose_candidate
-    local existing_caddy_hostname=""
-    local managed_caddy_candidate=""
     local path
 
     section "Caddy configuration"
@@ -1472,33 +1474,18 @@ create_caddy_configuration() {
             return 1
         fi
     done
-    if [[ -e "${CADDYFILE}" ]] && ! cmp -s "${CADDYFILE}" "${caddy_candidate}"; then
-        existing_caddy_hostname=$(read_caddyfile_hostname "${CADDYFILE}" || true)
-        managed_caddy_candidate=$(mktemp "${INSTALL_DIR}/.Caddyfile.current.XXXXXXXX") || {
-            rm -f -- "${caddy_candidate}" "${compose_candidate}"
-            return 1
-        }
-        if [[ -z "${existing_caddy_hostname}" ]] ||
-           ! write_caddyfile_to "${managed_caddy_candidate}" "${existing_caddy_hostname}" ||
-           ! cmp -s "${CADDYFILE}" "${managed_caddy_candidate}"; then
-            rm -f -- "${caddy_candidate}" "${compose_candidate}" "${managed_caddy_candidate}"
-            error "The existing Caddyfile is not appliance-managed; it will not be overwritten."
-            return 1
-        fi
-        rm -f -- "${managed_caddy_candidate}"
-    fi
     if [[ -e "${CADDY_COMPOSE_FILE}" ]] && ! cmp -s "${CADDY_COMPOSE_FILE}" "${compose_candidate}"; then
         rm -f -- "${caddy_candidate}" "${compose_candidate}"
         error "The existing Caddy Compose file differs from the appliance-managed configuration; it will not be overwritten."
         return 1
     fi
 
-    if [[ -e "${CADDYFILE}" ]] && cmp -s "${CADDYFILE}" "${caddy_candidate}"; then
-        rm -f -- "${caddy_candidate}"
-    else
-        mv -f -- "${caddy_candidate}" "${CADDYFILE}"
-        CADDY_CONFIG_CHANGED=1
-    fi
+    install_caddyfile_if_missing \
+        "${caddy_candidate}" "${CADDYFILE}" "${APPLIANCE_STATE}" || {
+        rm -f -- "${caddy_candidate}" "${compose_candidate}"
+        error "Unable to preserve or install the appliance Caddyfile."
+        return 1
+    }
     if [[ -e "${CADDY_COMPOSE_FILE}" ]]; then rm -f -- "${compose_candidate}"; else mv -- "${compose_candidate}" "${CADDY_COMPOSE_FILE}"; fi
     write_access_config_atomic "${ACCESS_FILE}" "${ACCESS_MODE}" "${CADDY_ACCESS_ADDRESS}" || {
         error "Unable to write the appliance access configuration atomically."
