@@ -371,14 +371,12 @@ Implemented commands are:
 vwctl
 vwctl help
 vwctl status
-vwctl health
 vwctl logs [vaultwarden|caddy]
 sudo vwctl start
 sudo vwctl stop
 vwctl update check
 sudo vwctl update
 sudo vwctl restart
-sudo vwctl access [hostname]
 vwctl version
 vwctl signup status
 sudo vwctl signup on|off
@@ -408,19 +406,11 @@ non-blocking root-owned lock at:
 Concurrent mutation MUST fail clearly rather than wait. Read-only commands do
 not acquire the lock.
 
-### 11.2 Status and health
+### 11.2 Status
 
 `vwctl status` reports the selected access mode, URL, applicable mDNS or DNS
 resolution, current IPv4, containers, network, images, signup, and public root
 CA state.
-
-`vwctl health` is read-only and reports every failed check before returning
-non-zero. It verifies Docker and Compose, both containers, network membership,
-host port exposure, selected name resolution, Vaultwarden `DOMAIN`, HTTPS
-`/alive` using the exported root CA, consistency of the public CA export,
-persistent data directories, and free space. Avahi and publisher readiness are
-required only in mDNS mode; external DNS MUST resolve exclusively to the current
-LAN IPv4.
 
 ### 11.3 Lifecycle operations
 
@@ -434,24 +424,14 @@ verifies the result.
 `logs` prints the last 100 lines for both services or one selected service and
 does not follow indefinitely.
 
-### 11.4 Hostname changes
+### 11.4 Hostname and access-mode changes
 
-`sudo vwctl access [hostname]` supports `.local` hostname changes within mDNS
-mode only. Installer reruns are the supported way to select external DNS or
-switch modes. The command validates conflicts and confirmation, stores the
-persistent Caddy root CA hash, regenerates the complete Caddyfile and access
-state, updates mDNS and
-Vaultwarden `DOMAIN`, removes and recreates only Caddy where possible, and
-verifies the resulting HTTPS endpoint with the exported CA.
-
-Persistent Vaultwarden data and `/opt/vaultwarden/data/caddy` MUST NOT be
-deleted. The internal root CA hash MUST remain unchanged. The command does not
-alter system hostname or external network configuration.
-
-If a hostname change fails, diagnostics identify the failing check. The
-generated authoritative hostname configuration remains available for
-inspection and a safe rerun; no destructive rollback or CA regeneration is
-performed.
+Hostname and access-mode changes are performed only by rerunning the installer
+with `sudo ./install.sh` or through the normal bootstrap/source installer
+rerun. The installer shows the current mode and hostname as defaults and safely
+reconciles a changed choice while preserving Vaultwarden data and Caddy's
+persistent internal CA. `vwctl` does not provide a separate access-change
+command.
 
 ## 12. Updates
 
@@ -846,13 +826,13 @@ container's `DOMAIN` is verified separately against the current `.access` and
 does not require name resolution or HTTPS reachability.
 
 Name resolution, mDNS publisher readiness, container reachability, and HTTPS
-are post-restore network-health checks only. Their failure MUST NOT prevent,
-roll back, or invalidate an otherwise verified Vaultwarden data and Caddy CA
-restore. Restore MUST report success for the recovered data and CA, preserve
-the current access configuration, and print a mode-specific warning with the
-configured URL, expected name-to-address mapping where available, and `sudo
-vwctl health` as the strict follow-up command. External DNS MUST NOT be modified
-automatically. `vwctl health` remains strict and independent of restore success.
+MUST NOT be restore success conditions. Their failure MUST NOT prevent, roll
+back, or invalidate an otherwise verified Vaultwarden data and Caddy CA restore.
+Restore MUST report success for the recovered data and CA and preserve the
+current access configuration. The installer is the reconciliation path when
+the current hostname or access mode needs correction. External DNS MUST NOT be
+modified automatically. Network readiness remains independent of restore
+success.
 
 Restore does not create an automatic pre-restore backup and does not perform an
 automatic data rollback after replacement begins. A critical post-confirmation
@@ -868,7 +848,7 @@ restore.
 The implementation has automated non-destructive security and workflow tests.
 A real restore from an appliance backup has been validated on Atlas: restored
 Vaultwarden account login succeeded, the restored Caddy root CA fingerprint
-exactly matched its pre-removal fingerprint, and the post-restore health check
+exactly matched its pre-removal fingerprint, and post-restore appliance verification
 passed. A complete disaster-recovery exercise starting from a freshly flashed
 SD card remains a release-readiness task.
 
@@ -918,7 +898,7 @@ Real-system validation on the Atlas reference Raspberry Pi includes the public
 `curl` bootstrap, installation, complete removal, reinstallation, manual
 backup, USB backup replication, restore from an appliance backup, restored
 Vaultwarden account login, exact Caddy root CA fingerprint continuity across
-removal and restore, and a passing post-restore health check. Complete disaster
+removal and restore, and passing post-restore appliance verification. Complete disaster
 recovery starting from a freshly flashed SD card remains pending as stated in
 section 18.
 

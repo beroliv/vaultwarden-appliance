@@ -658,7 +658,7 @@ network_never_available() (
 )
 expect_failure "network-health retry is bounded and reports unhealthy" network_never_available
 
-successful_apply_verifies_data_before_network_health() (
+successful_apply_verifies_data_without_network_health() (
     RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
     restore_stop_services() { return 0; }
     restore_replace_data_directory() { return 0; }
@@ -675,8 +675,8 @@ successful_apply_verifies_data_before_network_health() (
     restore_resume_timer() { return 0; }
     restore_apply
 )
-expect_equal "data recovery is verified before advisory network health" \
-    $'DATA\nDOMAIN\nNETWORK' "$(successful_apply_verifies_data_before_network_health)"
+expect_equal "data recovery does not invoke network health" \
+    $'DATA\nDOMAIN' "$(successful_apply_verifies_data_without_network_health)"
 
 simulated_data_verification_failure() (
     RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
@@ -799,15 +799,12 @@ network_independent_dns_restore() (
 
     restore_apply || return 1
     output=$(restore_report_completion)
-    (( RESTORE_NETWORK_HEALTHY == 0 && snapshot_verified == 1 )) &&
+    (( snapshot_verified == 1 )) &&
         grep -Fq 'vaultwarden startup write' "${result}/vaultwarden/db.sqlite3" &&
         grep -Fq 'Restore completed successfully.' <<<"${output}" &&
         grep -Fq 'Vaultwarden data: restored' <<<"${output}" &&
         grep -Fq 'Caddy root CA: restored' <<<"${output}" &&
-        grep -Fq 'Access configuration: preserved' <<<"${output}" &&
-        grep -Fq 'WARNING: Network access is not currently healthy.' <<<"${output}" &&
-        grep -Fq 'vault1.lan -> 192.168.0.192' <<<"${output}" &&
-        grep -Fq 'sudo vwctl health' <<<"${output}"
+        grep -Fq 'Access configuration: preserved' <<<"${output}"
 )
 expect_success "restore succeeds when external DNS lookup fails" \
     network_independent_dns_restore unresolved
@@ -851,7 +848,7 @@ local_verification_reports_exact_failure() (
 expect_success "local restore verification reports the exact failed check" \
     local_verification_reports_exact_failure
 
-mdns_network_warning_is_actionable() (
+mdns_restore_completion_is_network_independent() (
     local output
 
     RESTORE_ACCESS_MODE=mdns
@@ -860,14 +857,13 @@ mdns_network_warning_is_actionable() (
     RESTORE_NETWORK_LAST_HTTPS_ERROR=""
     detect_ipv4_address() { printf '192.168.0.192\n'; }
     output=$(restore_report_completion)
-    grep -Fq 'WARNING: Network access is not currently healthy.' <<<"${output}" &&
-        grep -Fq 'The appliance mDNS publisher is not ready' <<<"${output}" &&
-        grep -Fq 'vaultwarden.local -> 192.168.0.192' <<<"${output}" &&
-        grep -Fq 'systemctl status vaultwarden-appliance-mdns.service' <<<"${output}" &&
-        grep -Fq 'sudo vwctl health' <<<"${output}"
+    grep -Fq 'Restore completed successfully.' <<<"${output}" &&
+        grep -Fq 'Vaultwarden data: restored' <<<"${output}" &&
+        grep -Fq 'Caddy root CA: restored' <<<"${output}" &&
+        grep -Fq 'Access configuration: preserved' <<<"${output}"
 )
-expect_success "unhealthy mDNS produces an actionable advisory after restore" \
-    mdns_network_warning_is_actionable
+expect_success "restore completion does not depend on mDNS readiness" \
+    mdns_restore_completion_is_network_independent
 
 expect_success "vwctl exposes the root-only restore command" grep -Fq 'sudo vwctl restore' "${REPO_DIR}/vwctl"
 expect_success "vwctl restore uses the global operation lock" bash -c \
@@ -945,22 +941,16 @@ expect_success "restore environment preflight requires no network-health command
     section=$(awk "/^restore_require_environment\\(\\)/,/^restore_prepare_runtime_root\\(\\)/" "$file")
     ! grep -Eq "avahi-resolve-host-name|getent|curl|timeout" <<<"$section"
 ' _ "${REPO_DIR}/libexec/restore"
-expect_success "restore never makes strict vwctl health authoritative" bash -c '
+expect_success "restore does not invoke a removed vwctl health path" bash -c '
     ! grep -Fq "bash \"\${vwctl_command}\" health" "$1" &&
         ! grep -Fq "restore_verify_result" "$1"
 ' _ "${REPO_DIR}/libexec/restore"
-expect_success "vwctl health remains strict for incorrect external DNS" bash -c '
-    file=$1
-    grep -Fq "dns_resolution_matches \"\${current_ip}\" \"\${resolved}\"" "$file" &&
-        grep -Fq "health_fail \"External DNS\"" "$file"
-' _ "${REPO_DIR}/vwctl"
 expect_success "restore never configures external DNS or host resolution" bash -c \
     "! grep -Eq '/etc/(hosts|resolv\\.conf)|resolvectl|nmcli|networkctl|dhcpcd|hostnamectl' '$REPO_DIR/libexec/restore'"
-expect_success "network checks occur only after verified data recovery" bash -c '
+expect_success "restore apply does not invoke network-health checks" bash -c '
     file=$1
-    verify=$(grep -n "restore_verify_data_recovery" "$file" | tail -1 | cut -d: -f1)
-    network=$(grep -n "restore_wait_for_network_health" "$file" | tail -1 | cut -d: -f1)
-    test "$verify" -lt "$network"
+    section=$(awk "/^restore_apply\\(\\)/,/^restore_find_generations\\(\\)/" "$file")
+    ! grep -Fq "restore_wait_for_network_health" <<<"$section"
 ' _ "${REPO_DIR}/libexec/restore"
 expect_success "strict snapshot verification precedes Vaultwarden startup" bash -c '
     file=$1

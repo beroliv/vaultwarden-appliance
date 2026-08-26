@@ -232,10 +232,6 @@ expect_success "unchanged access state is compared before replacement" grep -Fq 
     'cmp -s "${temporary}" "${destination}"' "${REPO_DIR}/lib/common.sh"
 expect_success "status reports external DNS mode" grep -Fq \
     "printf '%-15s %s\\n' 'Access mode:' 'external DNS'" "${REPO_DIR}/vwctl"
-expect_success "health validates external DNS against the LAN IPv4" grep -Fq \
-    'dns_resolution_matches "${current_ip}" "${resolved}"' "${REPO_DIR}/vwctl"
-expect_success "health keeps the mDNS-specific branch" grep -Fq \
-    'if [[ "${ACCESS_MODE}" == mdns ]]; then' "${REPO_DIR}/vwctl"
 expect_success "restore reads the installed access configuration" grep -Fq \
     'parsed_access=$(read_access_config "${ACCESS_FILE}")' "${REPO_DIR}/libexec/restore"
 

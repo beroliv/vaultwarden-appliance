@@ -16,7 +16,7 @@ recommends external/local DNS for VPN access.
 Real-system validation on Atlas, a Raspberry Pi, covers the public `curl`
 bootstrap, installation, complete removal, reinstallation, manual backup, USB
 backup replication, restore from an appliance backup, restored account login,
-exact Caddy root CA fingerprint continuity, and the post-restore health check.
+exact Caddy root CA fingerprint continuity, and post-restore appliance verification.
 
 A complete disaster-recovery exercise starting from a freshly flashed SD card
 remains pending. Retain independent verified backup copies.
@@ -98,7 +98,6 @@ missing. A working Docker installation is reused without modification.
 3. Trust the exported Caddy root CA on every client that should accept the
    appliance certificate.
 4. Run `vwctl` for the interactive menu.
-5. Run `vwctl health` for a read-only end-to-end check.
 
 Account registration is enabled initially and the Vaultwarden admin panel is
 not configured.
@@ -120,7 +119,9 @@ If you already operate local DNS, enter a name such as `vault.lan`, answer Yes
 to the external-DNS prompt, and manually create `vault.lan -> <Raspberry Pi LAN
 IP>` on that DNS server. The appliance never changes DNS, hosts, router, DHCP,
 or system-hostname settings. Rerun `sudo ./install.sh` to change the hostname or
-switch between mDNS and external DNS later.
+switch between mDNS and external DNS later. The installer shows the current
+settings as defaults and safely reconciles a changed choice while preserving
+appliance data and Caddy's internal CA.
 
 The current choice is stored as root-owned runtime configuration in
 `/opt/vaultwarden/.access`:
@@ -143,7 +144,6 @@ The private CA key is never exported by certificate commands.
 ```bash
 vwctl
 vwctl status
-vwctl health
 vwctl backup status
 sudo vwctl backup
 sudo vwctl restore
@@ -356,7 +356,7 @@ byte-for-byte; regenerates only Vaultwarden `DOMAIN` from the currently
 installed `.access`; then starts Vaultwarden and Caddy. Restore
 preflight does not require DNS, mDNS, HTTPS, or the configured hostname to be
 reachable. The restored database and Caddy CA are verified locally before
-Vaultwarden is started and before network health is evaluated. This preserves a
+Vaultwarden is started; network readiness is not part of restore. This preserves a
 byte-for-byte snapshot check before Vaultwarden can legitimately write to the
 restored SQLite database during startup.
 Backups do not contain access configuration or the appliance `Caddyfile`, so
@@ -367,10 +367,10 @@ The selected backup's Caddy root CA is restored and re-exported so clients that
 already trust that CA remain valid.
 
 If the current DNS, mDNS, LAN address, or HTTPS endpoint is not ready, restore
-still reports successful data and CA recovery and prints a network-health
-warning with the configured URL and next steps. It never configures external
-DNS. `sudo vwctl health` remains the strict follow-up check after network
-configuration is complete.
+still reports successful data and CA recovery because it does not use network
+readiness as a restore result. It never configures external DNS. After completing
+the network configuration, use `vwctl status` and verify the configured HTTPS
+URL from a client that trusts the exported root CA.
 
 There is no automatic pre-restore backup or automatic rollback after data
 replacement begins. Keep a separate verified copy. Only backups created by
@@ -382,8 +382,8 @@ restore command.
 The restore implementation has non-destructive fixture coverage, including
 malicious archive cases. A real restore from an appliance backup has also been
 validated on Atlas: the restored account login succeeded, the Caddy root CA
-fingerprint exactly matched its pre-removal value, and the post-restore health
-check passed. A complete disaster-recovery exercise starting from a freshly
+fingerprint exactly matched its pre-removal value, and post-restore appliance
+verification passed. A complete disaster-recovery exercise starting from a freshly
 flashed SD card remains pending.
 
 ## Last-resort manual recovery

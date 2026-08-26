@@ -45,7 +45,6 @@ readonly BACKUP_STATE_FILE="${INSTALL_DIR}/.backup-device"
 readonly CADDY_ROOT_CA="${INSTALL_DIR}/data/caddy/data/caddy/pki/authorities/local/root.crt"
 readonly EXPORTED_ROOT_CA="${INSTALL_DIR}/certs/caddy-root-ca.crt"
 readonly APPLIANCE_NETWORK="vaultwarden-appliance"
-readonly DEFAULT_MDNS_HOSTNAME="vaultwarden.local"
 readonly MDNS_ENV_FILE="/etc/default/vaultwarden-appliance-mdns"
 readonly MDNS_SERVICE_FILE="/etc/systemd/system/vaultwarden-appliance-mdns.service"
 readonly MDNS_SERVICE="vaultwarden-appliance-mdns.service"
@@ -54,7 +53,6 @@ readonly MDNS_READY_FILE="/run/vaultwarden-appliance-mdns/ready"
 readonly LOG_LINES=100
 readonly ACCESS_HTTPS_TIMEOUT=60
 readonly ACCESS_HTTPS_RETRY_INTERVAL=2
-readonly MIN_FREE_DISK_MB=2048
 readonly OPERATION_LOCK="/run/lock/vaultwarden-appliance.lock"
 if [[ -f "${SCRIPT_DIR}/libexec/usb-setup" && ! -L "${SCRIPT_DIR}/libexec/usb-setup" ]]; then
     USB_SETUP_HELPER="${SCRIPT_DIR}/libexec/usb-setup"
@@ -77,8 +75,6 @@ readonly RESTORE_HELPER
 
 ACCESS_ADDRESS=""
 ACCESS_MODE=""
-HTTPS_LAST_ERROR=""
-HEALTH_FAILURES=0
 UPDATE_CHECK_AVAILABLE=0
 UPDATE_CHECK_UNDETERMINED=0
 USB_TOPOLOGY=""
@@ -106,14 +102,12 @@ Usage:
   vwctl
   vwctl help
   vwctl status
-  vwctl health
   vwctl logs [vaultwarden|caddy]
   sudo vwctl start
   sudo vwctl stop
   sudo vwctl update
   vwctl update check
   sudo vwctl restart
-  sudo vwctl access [hostname]
   vwctl version
   vwctl signup status
   sudo vwctl signup on
@@ -129,14 +123,12 @@ Usage:
 
 Commands:
   status             Show appliance and access information
-  health             Run read-only appliance diagnostics
   logs               Show the last 100 log lines; optionally select one service
   start              Start and verify the appliance services
   stop               Stop appliance services without removing them or their data
   update             Pull and apply appliance container image updates
   update check       Check remote image metadata without applying updates
   restart            Safely recreate the appliance containers
-  access             Change the local mDNS hostname used for HTTPS access
   version            Show appliance and component versions
   signup             Show, enable, or disable account registration
   cert info          Show public root and HTTPS server certificate information
@@ -251,63 +243,6 @@ require_mdns_runtime() {
         die "The appliance mDNS service is obsolete. Rerun the appliance installer."
 }
 
-mdns_name_conflicts() {
-    local hostname=$1
-    local address
-    local current_ip=""
-    local local_addresses=""
-    local resolved=""
-
-    current_ip=$(detect_ipv4_address || true)
-    resolved=$(mdns_resolved_ipv4s "${hostname}" || true)
-    [[ -n "${resolved}" ]] || return 1
-    local_addresses=$(local_ipv4_addresses || true)
-
-    while IFS= read -r address; do
-        [[ -n "${current_ip}" && "${address}" == "${current_ip}" ]] && continue
-        grep -Fxq "${address}" <<<"${local_addresses}" && continue
-        return 0
-    done <<<"${resolved}"
-    return 1
-}
-
-next_available_mdns_hostname() {
-    local base=${1%.local}
-    local candidate
-    local suffix
-
-    for suffix in {2..99}; do
-        candidate="${base}-${suffix}.local"
-        if validate_local_hostname "${candidate}" && ! mdns_name_conflicts "${candidate}"; then
-            printf '%s\n' "${candidate}"
-            return 0
-        fi
-    done
-    return 1
-}
-
-configure_mdns_hostname() {
-    local hostname=$1
-    local candidate
-    local current_ip
-
-    require_mdns_runtime
-    current_ip=$(detect_ipv4_address) || \
-        die "Unable to detect the LAN IPv4 address for the mDNS publication."
-    candidate=$(mktemp "${INSTALL_DIR}/.mdns-env.vwctl.XXXXXXXX") || \
-        die "Unable to create a temporary mDNS state file."
-    printf '# Vaultwarden Appliance mDNS\nVAULTWARDEN_MDNS_HOSTNAME=%s\nVAULTWARDEN_MDNS_IPV4=%s\n' \
-        "${hostname}" "${current_ip}" > "${candidate}"
-    chmod 0644 "${candidate}"
-    if ! install -m 0644 "${candidate}" "${MDNS_ENV_FILE}"; then
-        rm -f -- "${candidate}"
-        die "Unable to update the appliance mDNS hostname state."
-    fi
-    rm -f -- "${candidate}"
-
-    systemctl restart "${MDNS_SERVICE}" || die "Unable to restart the appliance mDNS hostname service."
-}
-
 show_mdns_service_logs() {
     printf 'Recent %s log:\n' "${MDNS_SERVICE}" >&2
     if command_exists journalctl; then
@@ -380,13 +315,6 @@ load_access_state() {
     IFS=$'\t' read -r ACCESS_MODE ACCESS_ADDRESS <<<"${parsed}"
 }
 
-write_access_state_to() {
-    local destination=$1
-    local address=$2
-
-    write_access_config_atomic "${destination}" mdns "${address}"
-}
-
 container_state() {
     local container=$1
     local state
@@ -443,22 +371,6 @@ caddy_publishes_only_https() {
         caddy 2>/dev/null | grep -Fxq 443
 }
 
-wait_for_port() {
-    local port=$1
-    local timeout_seconds=$2
-    local retry_interval=$3
-    local deadline=$((SECONDS + timeout_seconds))
-
-    while :; do
-        port_is_in_use "${port}" && return 0
-        if (( SECONDS >= deadline )); then
-            break
-        fi
-        sleep "${retry_interval}"
-    done
-    return 1
-}
-
 current_signup_value() {
     local value
 
@@ -505,19 +417,17 @@ verify_https() {
     command_exists curl || return 1
     [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || return 1
 
-    HTTPS_LAST_ERROR=""
     deadline=$((SECONDS + timeout_seconds))
 
     while :; do
-        if HTTPS_LAST_ERROR=$(curl --fail --silent --show-error \
+        if curl --fail --silent --show-error \
             --connect-timeout 3 \
             --max-time 5 \
             --noproxy '*' \
             --cacert "${EXPORTED_ROOT_CA}" \
             --connect-to "${address}:443:127.0.0.1:443" \
             --output /dev/null \
-            "https://${address}/alive" 2>&1); then
-            HTTPS_LAST_ERROR=""
+            "https://${address}/alive" 2>/dev/null; then
             return 0
         fi
 
@@ -527,19 +437,6 @@ verify_https() {
         sleep "${retry_interval}"
     done
     return 1
-}
-
-root_ca_hash() {
-    [[ -f "${CADDY_ROOT_CA}" && ! -L "${CADDY_ROOT_CA}" ]] || return 1
-    sha256sum -- "${CADDY_ROOT_CA}" | awk 'NR == 1 {print $1}'
-}
-
-root_ca_matches_hash() {
-    local expected_hash=$1
-    local current_hash
-
-    current_hash=$(root_ca_hash) || return 1
-    [[ "${current_hash}" == "${expected_hash}" ]]
 }
 
 refresh_root_ca_export() {
@@ -557,101 +454,6 @@ refresh_root_ca_export() {
     install -d -m 0755 "${cert_dir}" || return 1
     copy_public_certificate_atomic "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}" || return 1
     cmp -s "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}"
-}
-
-show_caddy_failure_context() {
-    printf 'Caddy container state:\n' >&2
-    docker inspect --format '{{json .State}}' caddy >&2 || true
-    printf 'Recent Caddy logs:\n' >&2
-    docker logs --tail 30 caddy >&2 || true
-}
-
-verify_access_change() {
-    local address=$1
-    local expected_root_hash=$2
-
-    if ! wait_for_container caddy; then
-        printf '[FAIL] Caddy container did not become ready.\n' >&2
-        show_caddy_failure_context
-        return 1
-    fi
-
-    if ! container_is_connected_to_network caddy "${APPLIANCE_NETWORK}"; then
-        printf '[FAIL] Caddy is not attached to %s.\n' "${APPLIANCE_NETWORK}" >&2
-        docker inspect --format '{{json .NetworkSettings.Networks}}' caddy >&2 || true
-        return 1
-    fi
-
-    if ! caddy_publishes_only_https; then
-        printf '[FAIL] Caddy is not publishing only TCP port 443.\n' >&2
-        docker inspect --format '{{json .HostConfig.PortBindings}}' caddy >&2 || true
-        return 1
-    fi
-
-    if ! wait_for_container vaultwarden; then
-        printf '[FAIL] Vaultwarden is not running after the Caddy rebuild.\n' >&2
-        return 1
-    fi
-
-    if ! vaultwarden_domain_matches "${address}"; then
-        printf '[FAIL] Vaultwarden DOMAIN does not match https://%s.\n' "${address}" >&2
-        docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' vaultwarden 2>/dev/null |
-            grep '^DOMAIN=' >&2 || true
-        return 1
-    fi
-
-    if ! container_is_connected_to_network vaultwarden "${APPLIANCE_NETWORK}"; then
-        printf '[FAIL] Vaultwarden is not attached to %s.\n' "${APPLIANCE_NETWORK}" >&2
-        docker inspect --format '{{json .NetworkSettings.Networks}}' vaultwarden >&2 || true
-        return 1
-    fi
-
-    if [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' vaultwarden 2>/dev/null)" != "0" ]]; then
-        printf '[FAIL] Vaultwarden unexpectedly publishes a host port.\n' >&2
-        docker inspect --format '{{json .HostConfig.PortBindings}}' vaultwarden >&2 || true
-        return 1
-    fi
-
-    if ! wait_for_port \
-        443 \
-        "${ACCESS_HTTPS_TIMEOUT}" \
-        "${ACCESS_HTTPS_RETRY_INTERVAL}"; then
-        printf '[FAIL] TCP port 443 is not listening.\n' >&2
-        return 1
-    fi
-
-    if ! verify_mdns_hostname "${address}"; then
-        return 1
-    fi
-
-    if ! root_ca_matches_hash "${expected_root_hash}"; then
-        printf '[FAIL] Caddy root CA changed unexpectedly.\n' >&2
-        return 1
-    fi
-
-    if ! refresh_root_ca_export ||
-       ! cmp -s "${CADDY_ROOT_CA}" "${EXPORTED_ROOT_CA}"; then
-        printf '[FAIL] The public Caddy root CA export could not be refreshed and verified.\n' >&2
-        return 1
-    fi
-
-    if ! verify_https \
-        "${address}" \
-        "${ACCESS_HTTPS_TIMEOUT}" \
-        "${ACCESS_HTTPS_RETRY_INTERVAL}"; then
-        printf '[FAIL] HTTPS verification failed for https://%s/alive.\n' "${address}" >&2
-        if [[ -n "${HTTPS_LAST_ERROR}" ]]; then
-            printf 'Last curl error: %s\n' "${HTTPS_LAST_ERROR}" >&2
-        fi
-        printf 'Recent Caddy logs:\n' >&2
-        docker logs --tail 30 caddy >&2 || true
-        return 1
-    fi
-
-    if ! root_ca_matches_hash "${expected_root_hash}"; then
-        printf '[FAIL] Caddy root CA changed unexpectedly.\n' >&2
-        return 1
-    fi
 }
 
 require_https_verification_ready() {
@@ -746,143 +548,6 @@ cleanup_operation_directory() {
         "${directory}/root-ca" \
         "${directory}/signup-compose"
     rmdir -- "${directory}"
-}
-
-health_ok() {
-    printf '[ OK ] %s\n' "$1"
-}
-
-health_fail() {
-    local check=$1
-    local reason=$2
-
-    printf '[FAIL] %s: %s\n' "${check}" "${reason}" >&2
-    HEALTH_FAILURES=$((HEALTH_FAILURES + 1))
-}
-
-root_ca_export_matches_caddy() {
-    [[ -f "${EXPORTED_ROOT_CA}" && ! -L "${EXPORTED_ROOT_CA}" ]] || return 1
-    container_is_running caddy || return 1
-    docker exec caddy cat /data/caddy/pki/authorities/local/root.crt 2>/dev/null |
-        cmp -s - "${EXPORTED_ROOT_CA}"
-}
-
-command_health() {
-    local available_kb=""
-    local available_mb=0
-    local current_ip=""
-    local docker_ready=0
-    local resolution_ready=0
-    local resolved=""
-
-    require_appliance
-    HEALTH_FAILURES=0
-    printf 'Vaultwarden Appliance health\n\n'
-
-    if load_access_state; then
-        health_ok "Access configuration (${ACCESS_MODE})"
-    else
-        health_fail "Access configuration" "${ACCESS_FILE} is missing, unsafe, or invalid"
-    fi
-
-    if command_exists docker &&
-       docker compose version >/dev/null 2>&1 &&
-       docker info >/dev/null 2>&1; then
-        docker_ready=1
-        health_ok "Docker"
-    else
-        health_fail "Docker" "daemon or Docker Compose v2 is not accessible"
-    fi
-
-    if (( docker_ready == 1 )) &&
-       container_exists vaultwarden &&
-       container_is_running vaultwarden &&
-       [[ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' vaultwarden 2>/dev/null)" == "0" ]] &&
-       container_is_connected_to_network vaultwarden "${APPLIANCE_NETWORK}" &&
-       load_access_state &&
-       vaultwarden_domain_matches "${ACCESS_ADDRESS}"; then
-        health_ok "Vaultwarden"
-    else
-        health_fail "Vaultwarden" "container/runtime DOMAIN is wrong, missing, stopped, publishing a host port, or disconnected from ${APPLIANCE_NETWORK}"
-    fi
-
-    if (( docker_ready == 1 )) &&
-       container_exists caddy &&
-       container_is_running caddy &&
-       caddy_publishes_only_https &&
-       container_is_connected_to_network caddy "${APPLIANCE_NETWORK}"; then
-        health_ok "Caddy"
-    else
-        health_fail "Caddy" "container is missing, stopped, not publishing only TCP 443, or disconnected from ${APPLIANCE_NETWORK}"
-    fi
-
-    if [[ -n "${ACCESS_MODE}" ]] && current_ip=$(detect_ipv4_address); then
-        if [[ "${ACCESS_MODE}" == mdns ]]; then
-            if command_exists systemctl &&
-               command_exists avahi-resolve-host-name &&
-               systemctl is-active --quiet avahi-daemon.service &&
-               systemctl is-active --quiet "${MDNS_SERVICE}" &&
-               mdns_service_is_ready "${ACCESS_ADDRESS}" "${current_ip}"; then
-                resolved=$(mdns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
-                if mdns_resolution_matches "${current_ip}" "${resolved}"; then
-                    resolution_ready=1
-                    health_ok "mDNS"
-                else
-                    health_fail "mDNS" "${ACCESS_ADDRESS} does not resolve exclusively to ${current_ip}"
-                fi
-            else
-                health_fail "mDNS" "Avahi, publisher state, or LAN IPv4 verification failed"
-            fi
-        else
-            resolved=$(dns_resolved_ipv4s "${ACCESS_ADDRESS}" || true)
-            if dns_resolution_matches "${current_ip}" "${resolved}"; then
-                resolution_ready=1
-                health_ok "External DNS"
-            else
-                health_fail "External DNS" "${ACCESS_ADDRESS} does not resolve exclusively to ${current_ip}"
-            fi
-        fi
-    else
-        health_fail "Name resolution" "access state or LAN IPv4 detection failed"
-    fi
-
-    if (( docker_ready == 1 && resolution_ready == 1 )) &&
-       command_exists curl &&
-       verify_https "${ACCESS_ADDRESS}" 10 2; then
-        health_ok "HTTPS"
-    else
-        health_fail "HTTPS" "https://${ACCESS_ADDRESS:-unknown}/alive did not validate with the exported root CA"
-    fi
-
-    if (( docker_ready == 1 )) && root_ca_export_matches_caddy; then
-        health_ok "Root CA"
-    else
-        health_fail "Root CA" "the readable export is missing or does not match Caddy's persistent public root certificate"
-    fi
-
-    if ! available_kb=$(df -Pk "${INSTALL_DIR}" 2>/dev/null | awk 'NR == 2 {print $4}'); then
-        available_kb=""
-    fi
-    if [[ -d "${INSTALL_DIR}/data/vaultwarden" &&
-          -d "${INSTALL_DIR}/data/caddy" &&
-          "${available_kb}" =~ ^[0-9]+$ ]]; then
-        available_mb=$((available_kb / 1024))
-        if (( available_mb >= MIN_FREE_DISK_MB )); then
-            health_ok "Storage (${available_mb} MiB free)"
-        else
-            health_fail "Storage" "only ${available_mb} MiB free; ${MIN_FREE_DISK_MB} MiB is required"
-        fi
-    else
-        health_fail "Storage" "persistent data directories or disk-space information are unavailable"
-    fi
-
-    if (( HEALTH_FAILURES == 0 )); then
-        printf '\nHealth check: OK\n'
-        return 0
-    fi
-
-    printf '\nHealth check: FAILED (%d check(s))\n' "${HEALTH_FAILURES}" >&2
-    return 1
 }
 
 command_status() {
@@ -1242,213 +907,6 @@ command_restart() {
 
     cleanup_operation_directory "${operation_dir}"
     info "Appliance containers restarted and verified."
-}
-
-validate_caddy_configuration() {
-    local command_output=""
-
-    if ! command_output=$(compose run --rm --no-deps --entrypoint caddy \
-        caddy fmt --diff /etc/caddy/Caddyfile 2>&1); then
-        printf '[FAIL] The generated Caddyfile is not correctly formatted.\n' >&2
-        [[ -z "${command_output}" ]] || printf '%s\n' "${command_output}" >&2
-        return 1
-    fi
-
-    if ! command_output=$(compose run --rm --no-deps --entrypoint caddy \
-        caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1); then
-        printf '[FAIL] Caddy rejected the generated Caddyfile.\n' >&2
-        [[ -z "${command_output}" ]] || printf '%s\n' "${command_output}" >&2
-        return 1
-    fi
-}
-
-report_access_change_failure() {
-    printf 'The new access configuration was not rolled back.\n' >&2
-    printf 'Persistent Vaultwarden and Caddy data were not deleted.\n' >&2
-    printf 'Generated Caddyfile: %s\n' "${CADDYFILE}" >&2
-    printf 'Access state: %s\n' "${ACCESS_FILE}" >&2
-    printf 'Correct the reported problem, then rerun vwctl access.\n' >&2
-    docker ps -a --filter name='^/caddy$' >&2 || true
-    if docker inspect caddy >/dev/null 2>&1; then
-        docker logs --tail 30 caddy >&2 || true
-    fi
-}
-
-apply_access_change() {
-    local new_address=$1
-    local caddy_candidate
-    local root_hash_before
-    local signup_value
-    local state_candidate
-    local vaultwarden_candidate
-
-    validate_local_hostname "${new_address}" || die "The requested .local hostname is invalid."
-
-    require_mdns_runtime
-    require_https_verification_ready
-    command_exists sha256sum || die "sha256sum is required to verify Caddy's root CA."
-    compose config --quiet || die "The appliance Compose configuration is invalid."
-    root_hash_before=$(root_ca_hash) || die "Unable to record Caddy's persistent root CA hash."
-    signup_value=$(current_signup_value)
-    [[ "${signup_value}" == "true" || "${signup_value}" == "false" ]] ||
-        die "Unable to preserve the current signup state."
-
-    caddy_candidate=$(mktemp "${INSTALL_DIR}/.Caddyfile.vwctl.XXXXXXXX") || \
-        die "Unable to create a temporary Caddyfile."
-    state_candidate=$(mktemp "${INSTALL_DIR}/.access.vwctl.XXXXXXXX") || {
-        rm -f -- "${caddy_candidate}"
-        die "Unable to create a temporary access state file."
-    }
-    vaultwarden_candidate=$(mktemp "${INSTALL_DIR}/.docker-compose.vwctl.XXXXXXXX") || {
-        rm -f -- "${caddy_candidate}" "${state_candidate}"
-        die "Unable to create a temporary Vaultwarden configuration."
-    }
-
-    if ! write_caddyfile_to "${caddy_candidate}" "${new_address}" ||
-       ! write_access_state_to "${state_candidate}" "${new_address}" ||
-       ! write_vaultwarden_override_to "${vaultwarden_candidate}" "${new_address}" "${signup_value}" ||
-       ! compose_with_vaultwarden_candidate "${vaultwarden_candidate}" config --quiet; then
-        rm -f -- "${caddy_candidate}" "${state_candidate}" "${vaultwarden_candidate}"
-        die "Unable to generate the new access configuration."
-    fi
-
-    info "Stopping and removing only the Caddy container..."
-    if ! compose rm --stop --force caddy; then
-        rm -f -- "${caddy_candidate}" "${state_candidate}" "${vaultwarden_candidate}"
-        die "Docker Compose could not stop and remove Caddy."
-    fi
-
-    if ! mv -f -- "${caddy_candidate}" "${CADDYFILE}" ||
-       ! mv -f -- "${state_candidate}" "${ACCESS_FILE}" ||
-       ! mv -f -- "${vaultwarden_candidate}" "${VWCTL_COMPOSE_FILE}"; then
-        rm -f -- "${caddy_candidate}" "${state_candidate}" "${vaultwarden_candidate}"
-        printf '[FAIL] The new access and Vaultwarden DOMAIN files could not be installed.\n' >&2
-        report_access_change_failure
-        return 1
-    fi
-
-    if ! validate_caddy_configuration; then
-        report_access_change_failure
-        return 1
-    fi
-
-    info "Updating the appliance mDNS advertisement to ${new_address}..."
-    if ! configure_mdns_hostname "${new_address}"; then
-        printf '[FAIL] The appliance mDNS hostname could not be updated.\n' >&2
-        report_access_change_failure
-        return 1
-    fi
-
-    info "Applying Vaultwarden DOMAIN=https://${new_address}..."
-    if ! compose up -d vaultwarden ||
-       ! wait_for_container vaultwarden ||
-       ! vaultwarden_domain_matches "${new_address}"; then
-        printf '[FAIL] Vaultwarden did not start with DOMAIN=https://%s.\n' "${new_address}" >&2
-        report_access_change_failure
-        return 1
-    fi
-
-    info "Creating a clean Caddy container for https://${new_address}..."
-    if ! compose up -d --no-deps caddy; then
-        printf '[FAIL] Docker Compose could not create Caddy.\n' >&2
-        report_access_change_failure
-        return 1
-    fi
-
-    if ! verify_access_change "${new_address}" "${root_hash_before}"; then
-        report_access_change_failure
-        return 1
-    fi
-
-    ACCESS_ADDRESS=${new_address}
-    ACCESS_MODE=mdns
-    info "Access configuration changed successfully."
-    info "URL: https://${new_address}"
-}
-
-confirm_access_change() {
-    local address=$1
-    local answer=""
-
-    if ! read -r -p "Rebuild Caddy for https://${address}? [y/N] " answer </dev/tty; then
-        die "Unable to read confirmation."
-    fi
-    case "${answer}" in
-        y|Y|yes|YES|Yes)
-            return 0
-            ;;
-        *)
-            info "Access configuration was not changed."
-            return 1
-            ;;
-    esac
-}
-
-access_hostname() {
-    local conflict_answer=""
-    local hostname=""
-    local current_ip
-    local default_hostname=${ACCESS_ADDRESS:-${DEFAULT_MDNS_HOSTNAME}}
-    local suggestion=""
-
-    [[ "${ACCESS_MODE}" == mdns ]] || \
-        die "This appliance uses external DNS. Rerun install.sh to change its hostname or access mode."
-    require_mdns_runtime
-    current_ip=$(detect_ipv4_address) || die "Unable to detect a usable LAN IPv4 address for mDNS verification."
-    while true; do
-        if ! read -r -p "Local Vaultwarden name [${default_hostname}]: " hostname </dev/tty; then
-            die "Unable to read the hostname."
-        fi
-        hostname=${hostname:-${default_hostname}}
-        hostname=${hostname,,}
-        if ! validate_local_hostname "${hostname}"; then
-            printf 'Invalid local name. Use one DNS label followed by .local, without spaces or underscores.\n' >&2
-            continue
-        fi
-        if [[ "${hostname}" == "${ACCESS_ADDRESS}" ]]; then
-            info "The appliance already uses https://${hostname}; no change is needed."
-            if ! vaultwarden_domain_matches "${hostname}"; then
-                die "The running Vaultwarden DOMAIN is inconsistent. Rerun install.sh to reconcile it."
-            fi
-            return 0
-        fi
-        if ! mdns_name_conflicts "${hostname}"; then
-            break
-        fi
-
-        printf 'The mDNS name %s is already advertised by another LAN device.\n' "${hostname}" >&2
-        suggestion=$(next_available_mdns_hostname "${hostname}") || \
-            die "Unable to find an available alternative .local name."
-        if ! read -r -p "Use available alternative ${suggestion}? [Y/n] " conflict_answer </dev/tty; then
-            die "Unable to read the mDNS conflict choice."
-        fi
-        case "${conflict_answer}" in
-            ""|y|Y|yes|YES|Yes) hostname=${suggestion}; break ;;
-            *) info "Choose a different .local name." ;;
-        esac
-    done
-
-    info "mDNS mapping: ${hostname} -> ${current_ip}"
-    info "The appliance will not change the system hostname, DNS, router, hosts files, or IP configuration."
-    info "New HTTPS URL: https://${hostname}"
-    confirm_access_change "${hostname}" || return 0
-    apply_access_change "${hostname}"
-}
-
-command_access() {
-    local requested_mode=${1:-}
-
-    require_root "access${requested_mode:+ ${requested_mode}}"
-    require_operation_lock
-    require_appliance
-    require_docker
-    [[ -r /dev/tty ]] || die "An interactive terminal is required for access changes."
-    load_access_state || die "The current access state is missing or invalid."
-
-    case "${requested_mode}" in
-        ""|hostname) access_hostname ;;
-        *) die "Usage: sudo vwctl access [hostname]" ;;
-    esac
 }
 
 restore_signup_configuration() {
@@ -2284,40 +1742,36 @@ interactive_menu() {
     while true; do
         printf '\nVaultwarden Appliance\n\n'
         printf '1) Status\n'
-        printf '2) Health check\n'
-        printf '3) Create backup\n'
-        printf '4) Backup status\n'
-        printf '5) Restore backup\n'
-        printf '6) USB backup media\n'
-        printf '7) Check for updates\n'
-        printf '8) Install update\n'
-        printf '9) Start\n'
-        printf '10) Stop\n'
-        printf '11) Restart\n'
-        printf '12) Logs\n'
-        printf '13) Access / hostname\n'
-        printf '14) Signup settings\n'
-        printf '15) Certificate\n'
-        printf '16) Version\n'
+        printf '2) Create backup\n'
+        printf '3) Backup status\n'
+        printf '4) Restore backup\n'
+        printf '5) USB backup media\n'
+        printf '6) Check for updates\n'
+        printf '7) Install update\n'
+        printf '8) Start\n'
+        printf '9) Stop\n'
+        printf '10) Restart\n'
+        printf '11) Logs\n'
+        printf '12) Signup settings\n'
+        printf '13) Certificate\n'
+        printf '14) Version\n'
         printf '0) Exit\n\n'
         menu_read_selection || return 0
         case "${MENU_SELECTION}" in
             1) menu_run_command command_status || return 0 ;;
-            2) menu_run_command command_health || return 0 ;;
-            3) menu_run_root_command backup || return 0 ;;
-            4) menu_run_command command_backup_status || return 0 ;;
-            5) menu_run_root_command restore || return 0 ;;
-            6) menu_usb || return 0 ;;
-            7) menu_run_command command_update_check || return 0 ;;
-            8) menu_run_root_command update || return 0 ;;
-            9) menu_run_root_command start || return 0 ;;
-            10) menu_run_root_command stop || return 0 ;;
-            11) menu_run_root_command restart || return 0 ;;
-            12) menu_logs || return 0 ;;
-            13) menu_run_root_command access || return 0 ;;
-            14) menu_signup || return 0 ;;
-            15) menu_certificate || return 0 ;;
-            16) menu_run_command command_version || return 0 ;;
+            2) menu_run_root_command backup || return 0 ;;
+            3) menu_run_command command_backup_status || return 0 ;;
+            4) menu_run_root_command restore || return 0 ;;
+            5) menu_usb || return 0 ;;
+            6) menu_run_command command_update_check || return 0 ;;
+            7) menu_run_root_command update || return 0 ;;
+            8) menu_run_root_command start || return 0 ;;
+            9) menu_run_root_command stop || return 0 ;;
+            10) menu_run_root_command restart || return 0 ;;
+            11) menu_logs || return 0 ;;
+            12) menu_signup || return 0 ;;
+            13) menu_certificate || return 0 ;;
+            14) menu_run_command command_version || return 0 ;;
             0) return 0 ;;
             *) printf 'Invalid selection.\n' ;;
         esac
@@ -2341,10 +1795,6 @@ main() {
         status)
             (( $# == 1 )) || die "Usage: vwctl status"
             command_status
-            ;;
-        health)
-            (( $# == 1 )) || die "Usage: vwctl health"
-            command_health
             ;;
         logs)
             (( $# <= 2 )) || die "Usage: vwctl logs [vaultwarden|caddy]"
@@ -2370,10 +1820,6 @@ main() {
         restart)
             (( $# == 1 )) || die "Usage: sudo vwctl restart"
             command_restart
-            ;;
-        access)
-            (( $# <= 2 )) || die "Usage: sudo vwctl access [hostname]"
-            command_access "${2:-}"
             ;;
         version)
             (( $# == 1 )) || die "Usage: vwctl version"

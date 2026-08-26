@@ -23,14 +23,11 @@ expect_failure() { local description=$1; shift; if "$@"; then fail "${descriptio
 
 menu_output=$(main <<<"0")
 expect_success "no arguments enter the interactive menu" grep -Fq 'Vaultwarden Appliance' <<<"${menu_output}"
-expect_success "main menu labels selection 3 as Create backup" \
-    grep -Fxq '3) Create backup' <<<"${menu_output}"
-expect_success "main menu labels selection 5 as Restore backup" \
-    grep -Fxq '5) Restore backup' <<<"${menu_output}"
-expect_success "main menu labels selection 7 as Check for updates" \
-    grep -Fxq '7) Check for updates' <<<"${menu_output}"
-expect_success "main menu labels selection 8 as Install update" \
-    grep -Fxq '8) Install update' <<<"${menu_output}"
+expected_menu=$'\nVaultwarden Appliance\n\n1) Status\n2) Create backup\n3) Backup status\n4) Restore backup\n5) USB backup media\n6) Check for updates\n7) Install update\n8) Start\n9) Stop\n10) Restart\n11) Logs\n12) Signup settings\n13) Certificate\n14) Version\n0) Exit'
+menu_layout=${menu_output%$'\n\nSelect: '}
+expect_success "main menu exactly matches the final 14-entry layout" test "${menu_layout}" = "${expected_menu}"
+expect_failure "main menu has no health entry" grep -Fq 'Health check' <<<"${menu_output}"
+expect_failure "main menu has no access or hostname entry" grep -Fq 'Access / hostname' <<<"${menu_output}"
 process_menu_output=$(printf '0\n' | bash "${REPO_DIR}/vwctl")
 expect_success "argument-free vwctl process opens the menu" grep -Fq '0) Exit' <<<"${process_menu_output}"
 menu_zero_exits() { interactive_menu <<<"0" >/dev/null; }
@@ -46,7 +43,7 @@ main_menu_count=$(grep -Fc 'Vaultwarden Appliance' <<<"${invalid_output}")
 expect_success "invalid selection redisplays the menu" test "${main_menu_count}" -ge 2
 
 submenu_output=$(interactive_menu <<'INPUT'
-6
+5
 0
 0
 INPUT
@@ -93,19 +90,19 @@ expect_failure "read-only status does not use sudo" grep -Fq 'SUDO_ARG:' <<<"${r
 
 command_update_check() { printf 'UPDATE_CHECK_DISPATCHED\n'; }
 update_check_output=$(interactive_menu <<'INPUT'
-7
+6
 
 0
 INPUT
 )
-expect_success "selection 7 still dispatches the unprivileged update check" \
+expect_success "selection 6 dispatches the unprivileged update check" \
     grep -Fq 'UPDATE_CHECK_DISPATCHED' <<<"${update_check_output}"
-expect_failure "selection 7 does not use sudo" grep -Fq 'SUDO_ARG:' <<<"${update_check_output}"
+expect_failure "selection 6 does not use sudo" grep -Fq 'SUDO_ARG:' <<<"${update_check_output}"
 
 menu_is_root() { return 1; }
 command_backup() { printf 'ROOT_BYPASS\n'; }
 root_output=$(interactive_menu <<'INPUT' 2>&1
-3
+2
 
 0
 INPUT
@@ -118,7 +115,7 @@ expect_failure "non-root backup never bypasses the privileged CLI path" \
 command_restore() { printf 'RESTORE_BYPASS\n'; }
 SUDO_TEST_OUTPUT='Restore cancelled.'
 restore_root_output=$(interactive_menu <<'INPUT' 2>&1
-5
+4
 
 0
 INPUT
@@ -137,10 +134,16 @@ expect_success "direct CLI dispatch remains unchanged" test "$(main version)" = 
 help_output=$(main help)
 expect_success "help remains command-line help" grep -Fq 'Usage:' <<<"${help_output}"
 expect_failure "help does not open the menu" grep -Fq '0) Exit' <<<"${help_output}"
+expect_success "removed health command is rejected" bash -c \
+    'output=$("$1" health 2>&1) && exit 1; grep -Fq "Unknown command '\''health'\''" <<<"$output"' \
+    _ "${REPO_DIR}/vwctl"
+expect_success "removed access command is rejected" bash -c \
+    'output=$("$1" access 2>&1) && exit 1; grep -Fq "Unknown command '\''access'\''" <<<"$output"' \
+    _ "${REPO_DIR}/vwctl"
 
 command_usb() { printf 'USB_DISPATCH:%s\n' "$1"; }
 usb_setup_output=$(interactive_menu <<'INPUT'
-6
+5
 3
 
 0
@@ -152,7 +155,7 @@ expect_success "non-root USB setup launches only vwctl usb setup through sudo" \
 expect_failure "non-root USB setup does not invoke the unprivileged function directly" \
     grep -Fq 'USB_DISPATCH:setup' <<<"${usb_setup_output}"
 usb_adopt_output=$(interactive_menu <<'INPUT'
-6
+5
 2
 
 0
@@ -172,7 +175,7 @@ expect_success "menu contains no duplicate ERASE USB confirmation" bash -c \
 
 command_update() { printf 'UPDATE_DISPATCHED\n'; }
 update_output=$(interactive_menu <<'INPUT'
-8
+7
 
 0
 INPUT
@@ -186,7 +189,7 @@ expect_success "existing update confirmation remains present" grep -Fq \
 
 SUDO_TEST_STATUS=130
 sudo_failure_output=$(interactive_menu <<'INPUT' 2>&1
-3
+2
 
 1
 
@@ -204,7 +207,7 @@ SUDO_TEST_STATUS=0
 
 menu_is_root() { return 0; }
 root_usb_output=$(interactive_menu <<'INPUT'
-6
+5
 3
 
 0
@@ -226,7 +229,7 @@ expect_success "direct restore CLI dispatch remains compatible" \
 expect_success "all mutating main-menu actions use the privileged argv dispatcher" bash -c '
     file=$1
     for invocation in \
-        "backup" "restore" "update" "start" "stop" "restart" "access"; do
+        "backup" "restore" "update" "start" "stop" "restart"; do
         grep -Fq "menu_run_root_command $invocation" "$file" || exit 1
     done
 ' _ "${REPO_DIR}/vwctl"
@@ -241,10 +244,36 @@ expect_success "all mutating submenu actions use the privileged argv dispatcher"
 expect_success "all read-only menu actions remain on unprivileged command paths" bash -c '
     file=$1
     for invocation in \
-        "command_status" "command_health" "command_backup_status" \
+        "command_status" "command_backup_status" \
         "command_update_check" "command_version" "command_usb status" \
         "command_cert_info" "command_logs"; do
         grep -Fq "menu_run_command $invocation" "$file" || exit 1
+    done
+' _ "${REPO_DIR}/vwctl"
+expect_success "all 14 main-menu selections keep their intended dispatch" bash -c '
+    file=$1
+    for mapping in \
+        "1) menu_run_command command_status" \
+        "2) menu_run_root_command backup" \
+        "3) menu_run_command command_backup_status" \
+        "4) menu_run_root_command restore" \
+        "5) menu_usb" \
+        "6) menu_run_command command_update_check" \
+        "7) menu_run_root_command update" \
+        "8) menu_run_root_command start" \
+        "9) menu_run_root_command stop" \
+        "10) menu_run_root_command restart" \
+        "11) menu_logs" \
+        "12) menu_signup" \
+        "13) menu_certificate" \
+        "14) menu_run_command command_version"; do
+        grep -Fq "$mapping" "$file" || exit 1
+    done
+' _ "${REPO_DIR}/vwctl"
+expect_success "remaining direct command dispatches are still present" bash -c '
+    file=$1
+    for command in status logs start stop update restart version signup cert usb backup restore; do
+        grep -Eq "^[[:space:]]*$command\\)" "$file" || exit 1
     done
 ' _ "${REPO_DIR}/vwctl"
 expect_success "privileged child receives selected command argv and cannot recurse into the menu" grep -Fq \
