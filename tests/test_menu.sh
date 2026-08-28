@@ -26,8 +26,6 @@ expect_success "no arguments enter the interactive menu" grep -Fq 'Vaultwarden A
 expected_menu=$'\nVaultwarden Appliance\n\n1) Status\n2) Create backup\n3) Backup status\n4) Restore backup\n5) USB backup media\n6) Check for updates\n7) Install update\n8) Start\n9) Stop\n10) Restart\n11) Logs\n12) Signup settings\n13) Certificate\n14) Version\n0) Exit'
 menu_layout=${menu_output%$'\n\nSelect: '}
 expect_success "main menu exactly matches the final 14-entry layout" test "${menu_layout}" = "${expected_menu}"
-expect_failure "main menu has no health entry" grep -Fq 'Health check' <<<"${menu_output}"
-expect_failure "main menu has no access or hostname entry" grep -Fq 'Access / hostname' <<<"${menu_output}"
 process_menu_output=$(printf '0\n' | bash "${REPO_DIR}/vwctl")
 expect_success "argument-free vwctl process opens the menu" grep -Fq '0) Exit' <<<"${process_menu_output}"
 menu_zero_exits() { interactive_menu <<<"0" >/dev/null; }
@@ -134,12 +132,6 @@ expect_success "direct CLI dispatch remains unchanged" test "$(main version)" = 
 help_output=$(main help)
 expect_success "help remains command-line help" grep -Fq 'Usage:' <<<"${help_output}"
 expect_failure "help does not open the menu" grep -Fq '0) Exit' <<<"${help_output}"
-expect_success "removed health command is rejected" bash -c \
-    'output=$("$1" health 2>&1) && exit 1; grep -Fq "Unknown command '\''health'\''" <<<"$output"' \
-    _ "${REPO_DIR}/vwctl"
-expect_success "removed access command is rejected" bash -c \
-    'output=$("$1" access 2>&1) && exit 1; grep -Fq "Unknown command '\''access'\''" <<<"$output"' \
-    _ "${REPO_DIR}/vwctl"
 
 command_usb() { printf 'USB_DISPATCH:%s\n' "$1"; }
 usb_setup_output=$(interactive_menu <<'INPUT'

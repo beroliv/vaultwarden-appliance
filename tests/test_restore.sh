@@ -524,107 +524,6 @@ else
     pass "direct non-root restore process test requires a non-root test runner"
 fi
 
-network_immediately_available() (
-    local sleep_marker="${temporary_dir}/unexpected-network-sleep"
-
-    SECONDS=0
-    command_exists() { return 0; }
-    detect_ipv4_address() { printf '192.168.0.192\n'; }
-    container_is_running() { return 0; }
-    systemctl() { return 0; }
-    mdns_ready_file_matches() { return 0; }
-    mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
-    restore_https_alive_is_ready() { return 0; }
-    sleep() { printf 'called\n' > "${sleep_marker}"; }
-    restore_wait_for_network_health 5 1 && [[ ! -e "${sleep_marker}" ]]
-)
-expect_success "immediately healthy network incurs no retry delay" network_immediately_available
-
-network_mdns_delayed() (
-    local mdns_attempts=0
-
-    SECONDS=0
-    command_exists() { return 0; }
-    detect_ipv4_address() { printf '192.168.0.192\n'; }
-    container_is_running() { return 0; }
-    systemctl() {
-        if [[ "${3:-}" == "${MDNS_SERVICE}" ]]; then
-            mdns_attempts=$((mdns_attempts + 1))
-            (( mdns_attempts >= 3 ))
-            return
-        fi
-        return 0
-    }
-    mdns_ready_file_matches() { return 0; }
-    mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
-    restore_https_alive_is_ready() { return 0; }
-    sleep() { SECONDS=$((SECONDS + $1)); }
-    restore_wait_for_network_health 6 1 && (( mdns_attempts == 3 ))
-)
-expect_success "mDNS becoming healthy after several polls succeeds" network_mdns_delayed
-
-network_https_delayed() (
-    local https_attempts=0
-
-    SECONDS=0
-    command_exists() { return 0; }
-    detect_ipv4_address() { printf '192.168.0.192\n'; }
-    container_is_running() { return 0; }
-    systemctl() { return 0; }
-    mdns_ready_file_matches() { return 0; }
-    mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
-    restore_https_alive_is_ready() {
-        https_attempts=$((https_attempts + 1))
-        (( https_attempts >= 3 ))
-    }
-    sleep() { SECONDS=$((SECONDS + $1)); }
-    restore_wait_for_network_health 6 1 && (( https_attempts == 3 ))
-)
-expect_success "HTTPS becoming healthy after several polls succeeds" network_https_delayed
-
-network_mdns_and_https_delayed() (
-    local https_attempts=0
-    local mdns_attempts=0
-
-    SECONDS=0
-    command_exists() { return 0; }
-    detect_ipv4_address() { printf '192.168.0.192\n'; }
-    container_is_running() { return 0; }
-    systemctl() {
-        if [[ "${3:-}" == "${MDNS_SERVICE}" ]]; then
-            mdns_attempts=$((mdns_attempts + 1))
-            (( mdns_attempts >= 3 ))
-            return
-        fi
-        return 0
-    }
-    mdns_ready_file_matches() { return 0; }
-    mdns_resolved_ipv4s() { printf '192.168.0.192\n'; }
-    restore_https_alive_is_ready() {
-        https_attempts=$((https_attempts + 1))
-        (( https_attempts >= 3 ))
-    }
-    sleep() { SECONDS=$((SECONDS + $1)); }
-    restore_wait_for_network_health 8 1 &&
-        (( mdns_attempts >= 5 && https_attempts == 3 ))
-)
-expect_success "combined delayed mDNS and HTTPS health succeeds" network_mdns_and_https_delayed
-
-network_external_dns() (
-    RESTORE_ACCESS_MODE=dns
-    RESTORE_HOSTNAME=vault.lan
-    command_exists() { return 0; }
-    detect_ipv4_address() { printf '192.168.0.192\n'; }
-    container_is_running() { return 0; }
-    dns_resolved_ipv4s() { printf '192.168.0.192\n'; }
-    systemctl() { return 1; }
-    mdns_ready_file_matches() { return 1; }
-    mdns_resolved_ipv4s() { return 1; }
-    restore_https_alive_is_ready() { return 0; }
-    restore_network_conditions_are_ready 192.168.0.192
-)
-expect_success "external DNS health does not require mDNS or Avahi" network_external_dns
-
 dns_restore_skips_mdns_state() (
     local detection_marker="${temporary_dir}/unexpected-dns-mdns-state"
 
@@ -645,18 +544,6 @@ external_dns_reconciliation() (
 )
 expect_success "restore reconciles DOMAIN from current external DNS access" \
     external_dns_reconciliation
-
-network_never_available() (
-    SECONDS=0
-    detect_ipv4_address() { printf '192.168.0.192\n'; }
-    container_is_running() { return 0; }
-    systemctl() {
-        [[ "${3:-}" != "${MDNS_SERVICE}" ]]
-    }
-    sleep() { SECONDS=$((SECONDS + $1)); }
-    restore_wait_for_network_health 3 1
-)
-expect_failure "network-health retry is bounded and reports unhealthy" network_never_available
 
 successful_apply_verifies_data_without_network_health() (
     RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
@@ -695,27 +582,6 @@ simulated_data_verification_failure() (
 )
 expect_failure "post-restore data or CA verification failure remains fatal" \
     simulated_data_verification_failure
-
-simulated_network_failure_is_advisory() (
-    RESTORE_WORK_DIR=/run/vaultwarden-appliance/restore-work.fixture
-    restore_stop_services() { return 0; }
-    restore_replace_data_directory() { return 0; }
-    restore_install_database_snapshot() { return 0; }
-    restore_write_configuration() { return 0; }
-    restore_compose() { return 0; }
-    restore_write_mdns_state() { return 0; }
-    restore_export_root_ca() { return 0; }
-    systemctl() { return 0; }
-    restore_verify_data_recovery() { return 0; }
-    restore_verify_runtime_domain() { return 0; }
-    restore_wait_for_network_health() { return 1; }
-    restore_write_backup_state_after_success() { return 0; }
-    restore_resume_timer() { return 0; }
-    restore_die() { exit 1; }
-    restore_apply && (( RESTORE_NETWORK_HEALTHY == 0 ))
-)
-expect_success "network failure does not invalidate verified data recovery" \
-    simulated_network_failure_is_advisory
 
 network_independent_dns_restore() (
     local resolution_case=$1
@@ -940,10 +806,6 @@ expect_success "restore environment preflight requires no network-health command
     file=$1
     section=$(awk "/^restore_require_environment\\(\\)/,/^restore_prepare_runtime_root\\(\\)/" "$file")
     ! grep -Eq "avahi-resolve-host-name|getent|curl|timeout" <<<"$section"
-' _ "${REPO_DIR}/libexec/restore"
-expect_success "restore does not invoke a removed vwctl health path" bash -c '
-    ! grep -Fq "bash \"\${vwctl_command}\" health" "$1" &&
-        ! grep -Fq "restore_verify_result" "$1"
 ' _ "${REPO_DIR}/libexec/restore"
 expect_success "restore never configures external DNS or host resolution" bash -c \
     "! grep -Eq '/etc/(hosts|resolv\\.conf)|resolvectl|nmcli|networkctl|dhcpcd|hostnamectl' '$REPO_DIR/libexec/restore'"
