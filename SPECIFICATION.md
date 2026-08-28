@@ -15,7 +15,7 @@ Restore is implemented for the appliance's schema-1 backup format, covered by
 non-destructive fixture tests, and validated through a real appliance-backup
 restore on the Atlas reference Raspberry Pi. A complete disaster-recovery
 exercise starting from a freshly flashed SD card remains pending and MUST NOT be
-claimed as validated for release 0.1.3.
+claimed as validated for release 0.1.4.
 
 ## 2. Supported platform
 
@@ -883,16 +883,14 @@ Required validation for changes includes:
 - targeted audits for prohibited destructive commands when storage, bootstrap,
   or removal behavior changes.
 
-Release 0.1.3 is a maintenance, documentation, and usability release after
-0.1.2. It documents and regression-tests last-resort manual disaster recovery
-without GitHub, `bootstrap.sh`, or `vwctl`, using standard tar/gzip, SHA-256,
-SQLite, and ordinary persistent files. The installer asks for mDNS versus
-external/local DNS before the hostname and uses mode-appropriate hostname
-defaults. The documentation clarifies that normal routed VPN connections such
-as WireGuard generally do not carry mDNS name resolution automatically and
-recommends external/local DNS for VPN access. Existing implementation behavior
-and the untested freshly flashed SD-card disaster-recovery status remain
-unchanged.
+Release 0.1.4 is a maintenance and reliability release after 0.1.3. Backup and
+restore preserve Caddy's complete four-file CA identity while discarding
+disposable leaf certificates, and the installed Caddyfile remains authoritative
+across reruns and restores. USB disaster recovery can safely adopt an existing
+validated `VWBACKUP` medium after successful recovery. `vwctl` retains a
+simpler set of supported operational paths, and the automated test structure is
+consolidated without changing appliance behavior. Complete disaster recovery
+starting from a freshly flashed SD card remains unvalidated.
 
 Real-system validation on the Atlas reference Raspberry Pi includes the public
 `curl` bootstrap, installation, complete removal, reinstallation, manual
