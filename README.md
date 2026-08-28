@@ -8,8 +8,7 @@ Version 0.1.4 is a maintenance and reliability release after 0.1.3. It improves
 backup and restore handling of Caddy's four-file CA identity while renewing
 disposable leaf certificates, preserves the installed Caddyfile, and improves
 USB disaster recovery through safe adoption of existing `VWBACKUP` media. It
-also simplifies `vwctl` by keeping one supported configuration path and
-consolidates the automated test structure without changing appliance behavior.
+also simplifies `vwctl` by keeping one supported configuration path.
 
 Real-system validation on Atlas, a Raspberry Pi, covers the public `curl`
 bootstrap, installation, complete removal, reinstallation, manual backup, USB
@@ -377,12 +376,11 @@ installation, use Vaultwarden's supported export/import path and explicitly
 transfer any other required data instead of feeding foreign files to this
 restore command.
 
-The restore implementation has non-destructive fixture coverage, including
-malicious archive cases. A real restore from an appliance backup has also been
-validated on Atlas: the restored account login succeeded, the Caddy root CA
-fingerprint exactly matched its pre-removal value, and post-restore appliance
-verification passed. A complete disaster-recovery exercise starting from a freshly
-flashed SD card remains pending.
+A real restore from an appliance backup has been validated on Atlas: the
+restored account login succeeded, the Caddy root CA fingerprint exactly matched
+its pre-removal value, and post-restore appliance verification passed. A
+complete disaster-recovery exercise starting from a freshly flashed SD card
+remains pending.
 
 ## Last-resort manual recovery
 

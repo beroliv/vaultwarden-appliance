@@ -11,11 +11,10 @@ or existing local-DNS access, `vwctl` lifecycle management, verified local-first
 backups, optional USB replication, automatic retention, restore, and complete
 local removal.
 
-Restore is implemented for the appliance's schema-1 backup format, covered by
-non-destructive fixture tests, and validated through a real appliance-backup
-restore on the Atlas reference Raspberry Pi. A complete disaster-recovery
-exercise starting from a freshly flashed SD card remains pending and MUST NOT be
-claimed as validated for release 0.1.4.
+Restore is implemented for the appliance's schema-1 backup format and validated
+through a real appliance-backup restore on the Atlas reference Raspberry Pi. A
+complete disaster-recovery exercise starting from a freshly flashed SD card
+remains pending and MUST NOT be claimed as validated for release 0.1.4.
 
 ## 2. Supported platform
 
@@ -845,7 +844,6 @@ use Vaultwarden's supported export/import facilities and explicit transfer of
 other required data rather than pretending a foreign archive is an appliance
 restore.
 
-The implementation has automated non-destructive security and workflow tests.
 A real restore from an appliance backup has been validated on Atlas: restored
 Vaultwarden account login succeeded, the restored Caddy root CA fingerprint
 exactly matched its pre-removal fingerprint, and post-restore appliance verification
@@ -867,30 +865,19 @@ The appliance MUST NOT use broad Docker prune operations, automatically remove
 images, uninstall shared packages during removal, or change unrelated users,
 groups, services, network configuration, or storage.
 
-## 20. Testing and release readiness
+## 20. Release readiness
 
-Shell scripts MUST remain readable, Bash-specific where required, and suitable
-for ShellCheck. Automated tests use mocks and temporary fixtures for storage,
-backup, restore, menu, bootstrap, and removal behavior; they MUST NOT touch real
-disks, live appliance data, or GitHub.
-
-Required validation for changes includes:
-
-- `bash -n` for every shell file;
-- ShellCheck;
-- all repository tests;
-- `git diff --check`;
-- targeted audits for prohibited destructive commands when storage, bootstrap,
-  or removal behavior changes.
+Shell scripts MUST remain readable and Bash-specific where required. Changes to
+storage, bootstrap, or removal behavior require a targeted audit for prohibited
+destructive commands.
 
 Release 0.1.4 is a maintenance and reliability release after 0.1.3. Backup and
 restore preserve Caddy's complete four-file CA identity while discarding
 disposable leaf certificates, and the installed Caddyfile remains authoritative
 across reruns and restores. USB disaster recovery can safely adopt an existing
 validated `VWBACKUP` medium after successful recovery. `vwctl` retains a
-simpler set of supported operational paths, and the automated test structure is
-consolidated without changing appliance behavior. Complete disaster recovery
-starting from a freshly flashed SD card remains unvalidated.
+simpler set of supported operational paths. Complete disaster recovery starting
+from a freshly flashed SD card remains unvalidated.
 
 Real-system validation on the Atlas reference Raspberry Pi includes the public
 `curl` bootstrap, installation, complete removal, reinstallation, manual
