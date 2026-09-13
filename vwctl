@@ -476,6 +476,7 @@ verify_root_ca_unchanged() {
 }
 
 verify_appliance() {
+    local verify_network_access=${1:-true}
     local current_ip=""
     local resolved=""
 
@@ -511,6 +512,9 @@ verify_appliance() {
     if ! container_is_connected_to_network caddy "${APPLIANCE_NETWORK}"; then
         printf 'Error: Caddy is not connected to %s.\n' "${APPLIANCE_NETWORK}" >&2
         return 1
+    fi
+    if [[ "${verify_network_access}" != true ]]; then
+        return 0
     fi
     if [[ "${ACCESS_MODE}" == mdns ]]; then
         if ! verify_mdns_hostname "${ACCESS_ADDRESS}"; then
@@ -842,8 +846,6 @@ command_update() {
     require_appliance
     require_docker
     load_access_state || die "The appliance access state is missing or invalid."
-    require_mdns_runtime
-    require_https_verification_ready
     compose config --quiet || die "The appliance Compose configuration is invalid."
 
     [[ -r /dev/tty ]] || die "An interactive terminal is required to confirm an update."
@@ -866,8 +868,8 @@ command_update() {
         cleanup_operation_directory "${operation_dir}"
         die "Container image update failed while pulling images."
     fi
-    info "Applying image updates..."
-    if ! compose up -d vaultwarden caddy || ! verify_appliance; then
+    info "Applying image updates by recreating Vaultwarden and Caddy..."
+    if ! compose up -d --force-recreate vaultwarden caddy || ! verify_appliance false; then
         cleanup_operation_directory "${operation_dir}"
         die "Updated appliance container verification failed."
     fi
