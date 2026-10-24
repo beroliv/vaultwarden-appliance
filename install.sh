@@ -890,6 +890,7 @@ install_backup_support() {
     fi
     command_exists find || missing_packages+=(findutils)
     command_exists openssl || missing_packages+=(openssl)
+    command_exists sqlite3 || missing_packages+=(sqlite3)
     if ! command_exists mount || ! command_exists umount; then
         missing_packages+=(mount)
     fi
@@ -905,7 +906,7 @@ install_backup_support() {
         ok "Required backup tools are already installed."
     fi
 
-    for command in tar gzip sha256sum sync df du find mount umount cp sort openssl od tr; do
+    for command in tar gzip sha256sum sync df du find mount umount cp sort openssl od tr sqlite3; do
         command_exists "${command}" || {
             error "Required backup command '${command}' is unavailable after package installation."
             return 1

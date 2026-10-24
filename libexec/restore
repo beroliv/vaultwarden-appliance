@@ -707,6 +707,7 @@ restore_verify_mounted_media() {
 }
 
 restore_mount_media_read_only() {
+    local mountpoint=${1:-${RESTORE_MOUNTPOINT}}
     local existing
     local permissions
     local result
@@ -717,19 +718,19 @@ restore_mount_media_read_only() {
         result=$?
         (( result == 1 )) || return 1
         restore_prepare_runtime_root || return 1
-        if [[ ! -e "${RESTORE_MOUNTPOINT}" && ! -L "${RESTORE_MOUNTPOINT}" ]]; then
-            mkdir -m 0700 -- "${RESTORE_MOUNTPOINT}" || return 1
+        if [[ ! -e "${mountpoint}" && ! -L "${mountpoint}" ]]; then
+            mkdir -m 0700 -- "${mountpoint}" || return 1
             RESTORE_MOUNTPOINT_CREATED=1
         fi
-        [[ -d "${RESTORE_MOUNTPOINT}" && ! -L "${RESTORE_MOUNTPOINT}" ]] || return 1
-        [[ "$(stat -c '%u' "${RESTORE_MOUNTPOINT}")" == 0 ]] || return 1
-        permissions=$(stat -c '%a' "${RESTORE_MOUNTPOINT}") || return 1
+        [[ -d "${mountpoint}" && ! -L "${mountpoint}" ]] || return 1
+        [[ "$(stat -c '%u' "${mountpoint}")" == 0 ]] || return 1
+        permissions=$(stat -c '%a' "${mountpoint}") || return 1
         [[ "${permissions}" =~ ^[0-7]{3,4}$ ]] || return 1
         (( (8#${permissions} & 8#022) == 0 )) || return 1
-        [[ -z "$(find "${RESTORE_MOUNTPOINT}" -mindepth 1 -maxdepth 1 -print -quit)" ]] || return 1
-        findmnt --mountpoint "${RESTORE_MOUNTPOINT}" >/dev/null 2>&1 && return 1
-        mount -o ro,nodev,nosuid,noexec -- "${RESTORE_USB_DEVICE}" "${RESTORE_MOUNTPOINT}" || return 1
-        RESTORE_USB_MOUNT=${RESTORE_MOUNTPOINT}
+        [[ -z "$(find "${mountpoint}" -mindepth 1 -maxdepth 1 -print -quit)" ]] || return 1
+        findmnt --mountpoint "${mountpoint}" >/dev/null 2>&1 && return 1
+        mount -o ro,nodev,nosuid,noexec -- "${RESTORE_USB_DEVICE}" "${mountpoint}" || return 1
+        RESTORE_USB_MOUNT=${mountpoint}
         RESTORE_MOUNTED_BY_APPLIANCE=1
     fi
     restore_refresh_storage || return 1
@@ -1374,7 +1375,212 @@ restore_main() {
     restore_report_completion
 }
 
+# Backup checks share restore's validators, but never enter the restore lifecycle.
+declare -a CHECK_MOUNTS=() CHECK_CREATED=() CHECK_PATHS=() CHECK_KINDS=() CHECK_FAILURES=()
+CHECK_LOCAL=0
+CHECK_USB=0
+CHECK_ERROR=0
+
+backup_check_cleanup() {
+    local status=$1 mountpoint unmount_failed=0
+    trap - EXIT INT TERM
+    for mountpoint in "${CHECK_MOUNTS[@]}"; do
+        umount -- "${mountpoint}" || { restore_error "Unable to unmount ${mountpoint}"; status=1; unmount_failed=1; }
+    done
+    for mountpoint in "${CHECK_CREATED[@]}"; do
+        rmdir -- "${mountpoint}" || status=1
+    done
+    if (( unmount_failed == 0 )) && [[ -n "${RESTORE_WORK_DIR}" ]]; then
+        restore_remove_work_directory "${RESTORE_WORK_DIR}" || status=1
+    fi
+    exit "${status}"
+}
+
+backup_check_collect() {
+    local kind=$1 directory=$2 path list
+    [[ -d "${directory}" && ! -L "${directory}" && -r "${directory}" && -x "${directory}" ]] || return 1
+    list=$(mktemp "${RESTORE_WORK_DIR}/discovery.XXXXXXXX") || return 1
+    # Include unsafe entries and orphan checksum files so they fail visibly.
+    find "${directory}" -mindepth 1 -maxdepth 1 \
+        \( -name '*.tar.gz' -o -name '*.tar.gz.sha256' \) -print0 > "${list}" || return 1
+    sort -z -o "${list}" "${list}" || return 1
+    while IFS= read -r -d '' path; do
+        if [[ "${path}" == *.sha256 ]]; then
+            path=${path%.sha256}
+            [[ ! -e "${path}" && ! -L "${path}" ]] || continue
+        fi
+        CHECK_PATHS+=("${path}")
+        CHECK_KINDS+=("${kind}")
+        if [[ "${kind}" == Local ]]; then
+            CHECK_LOCAL=$((CHECK_LOCAL + 1))
+        else
+            CHECK_USB=$((CHECK_USB + 1))
+        fi
+    done < "${list}"
+}
+
+backup_check_one() (
+    local archive=$1 source_archive=$1 work root result reason initial_hash final_hash
+    work=$(mktemp -d "${RESTORE_WORK_DIR}/generation.XXXXXXXX") || return 1
+    trap 'rm -rf -- "${work}"' EXIT
+    RESTORE_WORK_DIR=${work}
+    root="${work}/extract/${ARCHIVE_ROOT}"
+    printf '  Checking SHA256...\n'
+    initial_hash=$(restore_checksum_hash "${archive}") || {
+        printf 'SHA256 mismatch, missing/unreadable checksum, or unsafe backup path\n' > "${CHECK_REASON_FILE}"
+        return 1
+    }
+    printf '  [ OK ] SHA256 checksum\n  Checking archive...\n'
+    # Validate and extract a private copy, never a mutable external archive.
+    archive="${work}/${source_archive##*/}"
+    if ! install -m 0600 -- "${source_archive}" "${archive}"; then
+        printf 'Unable to stage archive (read error or insufficient temporary space)\n' > "${CHECK_REASON_FILE}"
+        return 1
+    fi
+    final_hash=$(sha256sum -- "${archive}") && [[ "${final_hash%% *}" == "${initial_hash}" ]] || {
+        printf 'Archive changed while staging\n' > "${CHECK_REASON_FILE}"; return 1;
+    }
+    reason='Archive integrity or unsafe archive structure'
+    gzip -t -- "${archive}" &&
+        restore_verify_archive_structure "${archive}" "${work}/listing" "${work}/types" || {
+        printf '%s\n' "${reason}" > "${CHECK_REASON_FILE}"; return 1;
+    }
+    printf '  [ OK ] Archive integrity\n'
+    restore_staging_has_space "${work}/types" || {
+        printf 'Insufficient temporary space or unable to determine archive size\n' > "${CHECK_REASON_FILE}"; return 1;
+    }
+    mkdir -m 0700 -- "${work}/extract" &&
+        restore_extract_archive "${archive}" "${work}/extract" &&
+        restore_validate_extracted_backup "${root}" || {
+        printf 'Manifest, required files, or backup contents invalid\n' > "${CHECK_REASON_FILE}"; return 1;
+    }
+    printf '  [ OK ] Manifest and required files\n'
+    result=$(sqlite3 -readonly "${root}/vaultwarden/db.sqlite3" 'PRAGMA quick_check;') &&
+        [[ "${result}" == ok ]] || {
+        printf 'SQLite quick_check failed\n' > "${CHECK_REASON_FILE}"; return 1;
+    }
+    printf '  [ OK ] SQLite quick_check\n'
+    restore_caddy_ca_pair_is_valid \
+        "${root}/caddy/${CADDY_INTERMEDIATE_CA_RELATIVE}" \
+        "${root}/caddy/${CADDY_INTERMEDIATE_KEY_RELATIVE}" || {
+        printf 'Caddy intermediate CA certificate/key invalid\n' > "${CHECK_REASON_FILE}"; return 1;
+    }
+    # Detect source changes during checking as well as changes to the sidecar.
+    final_hash=$(restore_checksum_hash "${source_archive}") && [[ "${final_hash}" == "${initial_hash}" ]] || {
+        printf 'Source checksum changed during check\n' > "${CHECK_REASON_FILE}"; return 1;
+    }
+    printf '  [ OK ] Caddy CA (4 files)\n'
+)
+
+backup_check_main() {
+    local command nodes device label tuple index mountpoint status reason state lookup
+    local valid=0 failed=0 media_seen=0
+    local -a fields=()
+    local -A seen_uuid=()
+    umask 077
+    trap 'backup_check_cleanup $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf 'Vaultwarden Appliance — Backup Check\n\n'
+    (( EUID == 0 )) || restore_die 'Run sudo vwctl backup check.'
+    for command in stat tar gzip sha256sum awk grep sort uniq mktemp rm lsblk findmnt \
+        readlink mount umount mkdir rmdir install find df openssl od tr cmp sqlite3; do
+        command_exists "${command}" || restore_die "Required command '${command}' is unavailable. Rerun the installer."
+    done
+    restore_prepare_runtime_root || restore_die 'Unsafe runtime directory.'
+    RESTORE_WORK_DIR=$(mktemp -d "${RUNTIME_DIR}/restore-work.XXXXXXXX") || return 1
+    CHECK_REASON_FILE="${RESTORE_WORK_DIR}/reason"
+    if ! backup_check_collect Local "${LOCAL_BACKUP_DIR}"; then
+        restore_error 'Unable to enumerate all local backups safely.'; CHECK_ERROR=1
+    fi
+    # Validate configured state, but inspect every attached VWBACKUP medium.
+    if state=$(restore_read_current_backup_state); then
+        if restore_refresh_storage && lookup=$(storage_lookup_configured_backup \
+            "${RESTORE_TOPOLOGY}" "${RESTORE_PROTECTED_DISKS}" "${state%%|*}" "${BACKUP_LABEL}"); then
+            :
+        else
+            status=$?
+            if (( status != 2 )); then
+                restore_error 'Configured USB medium failed safety validation.'; CHECK_ERROR=1
+            fi
+        fi
+    else
+        status=$?
+        if (( status != 2 )); then
+            restore_error 'Unsafe or unreadable backup-device state.'; CHECK_ERROR=1
+        fi
+    fi
+    if restore_refresh_storage && nodes=$(storage_inventory_nodes "${RESTORE_TOPOLOGY}"); then
+        while IFS= read -r device; do
+            [[ -n "${device}" ]] || continue
+            if ! label=$(storage_lsblk_property "${device}" LABEL); then
+                restore_error "Unable to inspect ${device}."; CHECK_ERROR=1; continue
+            fi
+            [[ "${label}" == "${BACKUP_LABEL}" ]] || continue
+            media_seen=$((media_seen + 1))
+            if ! tuple=$(restore_safe_media_tuple "${device}" ''); then
+                restore_error "Unsafe USB backup medium: ${device}"; CHECK_ERROR=1; continue
+            fi
+            mapfile -t fields <<<"${tuple}"
+            RESTORE_USB_DEVICE=${fields[0]}
+            RESTORE_USB_DISK=${fields[1]}
+            RESTORE_USB_UUID=${fields[2]}
+            if [[ -n "${seen_uuid[${RESTORE_USB_UUID}]:-}" ]]; then
+                restore_error 'Duplicate USB filesystem UUID.'; CHECK_ERROR=1; continue
+            fi
+            seen_uuid[${RESTORE_USB_UUID}]=1
+            mountpoint="${RESTORE_WORK_DIR}/media-${#seen_uuid[@]}"
+            RESTORE_MOUNTED_BY_APPLIANCE=0
+            RESTORE_MOUNTPOINT_CREATED=0
+            if restore_mount_media_read_only "${mountpoint}"; then
+                if ! backup_check_collect USB "${RESTORE_USB_MOUNT}/backups"; then
+                    restore_error "Unable to enumerate USB backups on ${device}."; CHECK_ERROR=1
+                fi
+            else
+                restore_error "Unable to mount/verify ${device} read-only."; CHECK_ERROR=1
+            fi
+            (( RESTORE_MOUNTED_BY_APPLIANCE == 0 )) || CHECK_MOUNTS+=("${RESTORE_USB_MOUNT}")
+            (( RESTORE_MOUNTPOINT_CREATED == 0 )) || CHECK_CREATED+=("${mountpoint}")
+        done <<<"${nodes}"
+        if (( media_seen == 0 )); then
+            printf '[SKIP] USB not available\n'
+        fi
+    else
+        restore_error 'USB topology discovery failed.'; CHECK_ERROR=1
+    fi
+    printf 'Found: %d local, %d USB backups\n\n' "${CHECK_LOCAL}" "${CHECK_USB}"
+    for index in "${!CHECK_PATHS[@]}"; do
+        printf '[%d/%d] %s: %q\n' "$((index + 1))" "${#CHECK_PATHS[@]}" \
+            "${CHECK_KINDS[index]}" "${CHECK_PATHS[index]##*/}"
+        printf 'Check could not be completed reliably\n' > "${CHECK_REASON_FILE}"
+        if backup_check_one "${CHECK_PATHS[index]}"; then
+            valid=$((valid + 1))
+        else
+            failed=$((failed + 1))
+            reason=$(<"${CHECK_REASON_FILE}")
+            printf '  [FAIL] %s\n' "${reason}"
+            printf -v reason '%s: %q — %s' "${CHECK_KINDS[index]}" "${CHECK_PATHS[index]##*/}" "${reason}"
+            CHECK_FAILURES+=("${reason}")
+        fi
+        printf '\n'
+    done
+    printf 'Backup Check Summary\n\nLocal:   %d\nUSB:     %d\nChecked: %d\nValid:   %d\nFailed:  %d\n' \
+        "${CHECK_LOCAL}" "${CHECK_USB}" "$((valid + failed))" "${valid}" "${failed}"
+    if (( failed > 0 )); then
+        printf '\nFailed backups:\n'
+        printf -- '- %s\n' "${CHECK_FAILURES[@]}"
+    fi
+    if (( CHECK_ERROR != 0 )); then
+        printf '\n[FAIL] Discovery was incomplete; see errors above.\n'
+    fi
+    (( failed == 0 && CHECK_ERROR == 0 ))
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    (( $# == 0 )) || restore_die "Usage: restore"
-    restore_main
+    if [[ "${1:-}" == --check && $# == 1 ]]; then
+        backup_check_main
+    else
+        (( $# == 0 )) || restore_die "Usage: restore [--check]"
+        restore_main
+    fi
 fi

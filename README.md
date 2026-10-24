@@ -4,11 +4,11 @@ A LAN-only Vaultwarden appliance for Debian and Raspberry Pi OS using Docker,
 Caddy HTTPS, optional mDNS or existing local DNS, simple `vwctl` management,
 verified local-first backups, and an appliance-format restore workflow.
 
-Version 0.1.4 is a maintenance and reliability release after 0.1.3. It improves
-backup and restore handling of Caddy's four-file CA identity while renewing
-disposable leaf certificates, preserves the installed Caddyfile, and improves
-USB disaster recovery through safe adoption of existing `VWBACKUP` media. It
-also simplifies `vwctl` by keeping one supported configuration path.
+Version 0.1.6 adds `vwctl backup check` and a matching menu entry. It checks
+all local and available safe USB backups for SHA256, archive integrity,
+manifest and required files, SQLite snapshot integrity, and Caddy CA identity.
+Live progress and a final summary report failures while remaining backups are
+checked. The operation leaves backups and live appliance data unchanged.
 
 Real-system validation on Atlas, a Raspberry Pi, covers the public `curl`
 bootstrap, installation, complete removal, reinstallation, manual backup, USB
@@ -142,6 +142,7 @@ The private CA key is never exported by certificate commands.
 vwctl
 vwctl status
 vwctl backup status
+sudo vwctl backup check
 sudo vwctl backup
 sudo vwctl restore
 vwctl update check
@@ -548,3 +549,40 @@ small plain-text `RECOVERY.txt`; release 0.1.4 does not add or require one.
 
 The appliance favors data safety, predictable behavior, transparent standard
 components, and narrowly scoped automation.
+
+### Backup integrity check
+
+Run `sudo vwctl backup check`, or select **Backup check** directly after
+**Backup status** in the interactive menu. Root access and the existing operation
+lock protect discovery and temporary mounts; Docker need not be running.
+The installer supplies `sqlite3`; rerun the installer when upgrading an appliance
+that does not yet have it.
+
+The command automatically checks every `.tar.gz` entry in the local backup
+directory and in `backups/` on every attached safe `VWBACKUP` exFAT USB medium.
+It also reports orphan `.tar.gz.sha256` files as failed generations. Unsafe paths,
+unrecognized archive names, and missing, unreadable or mismatched checksums fail
+visibly rather than being excluded from the totals.
+
+Each generation is checked for SHA256, gzip/tar readability and safe member
+structure, schema-1 manifest and required nonempty files, the extracted SQLite
+snapshot using `PRAGMA quick_check`, and all four Caddy CA files (`root.crt`,
+`root.key`, `intermediate.crt`, `intermediate.key`), including certificate/key
+pair matching. Existing restore validators are shared. Archives are copied to private staging, verified again, streamed
+and extracted one at a time into private temporary storage, with an available
+space check; complete archive contents are never loaded into memory.
+
+Live progress and a final local/USB, checked, valid and failed summary include
+failure reasons. An individual failed generation does not prevent subsequent
+checks. Exit status is 0 only if all discovered generations pass and discovery
+and cleanup complete reliably; an empty successful scan also returns 0.
+Absent USB media produce `[SKIP] USB not available`; local checks continue.
+Unsafe topology, duplicate UUIDs, unsafe configured state, enumeration errors,
+mount failures or insufficient temporary space cause a nonzero result.
+
+USB mounts use `ro,nodev,nosuid,noexec`. Existing mounts are reused only with
+these options and a unique validated source; writable existing mounts are
+rejected without remounting. Only mounts created by the check are unmounted.
+Backups, retention, live databases, containers and backup-device configuration
+are never modified. Temporary extracted copies and listings are removed on
+completion or interruption; a failed unmount preserves staging for recovery.

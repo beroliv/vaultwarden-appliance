@@ -119,6 +119,7 @@ Usage:
   sudo vwctl usb setup
   sudo vwctl backup
   vwctl backup status
+  sudo vwctl backup check
   sudo vwctl restore
 
 Commands:
@@ -138,6 +139,7 @@ Commands:
   usb setup          ERASE and initialize one explicitly selected backup disk
   backup             Create a verified local backup and optionally replicate it to USB
   backup status      Show local, USB, and automatic-backup status without changes
+  backup check       Check all local and USB backups without changing appliance data
   restore            Verify and restore one appliance backup from local or USB storage
 HELP
 }
@@ -1501,6 +1503,17 @@ command_backup() {
     bash "${BACKUP_HELPER}"
 }
 
+command_backup_check() {
+    require_root "backup check"
+    require_operation_lock
+    require_appliance
+    [[ -f "${RESTORE_HELPER}" && ! -L "${RESTORE_HELPER}" ]] || \
+        die "The appliance restore helper is missing or unsafe. Rerun the installer."
+    grep -Fxq '# Vaultwarden Appliance restore' "${RESTORE_HELPER}" || \
+        die "The appliance restore helper is not recognized. Rerun the installer."
+    bash "${RESTORE_HELPER}" --check
+}
+
 command_backup_status() {
     require_appliance
     [[ -f "${BACKUP_HELPER}" && ! -L "${BACKUP_HELPER}" ]] || \
@@ -1746,34 +1759,36 @@ interactive_menu() {
         printf '1) Status\n'
         printf '2) Create backup\n'
         printf '3) Backup status\n'
-        printf '4) Restore backup\n'
-        printf '5) USB backup media\n'
-        printf '6) Check for updates\n'
-        printf '7) Install update\n'
-        printf '8) Start\n'
-        printf '9) Stop\n'
-        printf '10) Restart\n'
-        printf '11) Logs\n'
-        printf '12) Signup settings\n'
-        printf '13) Certificate\n'
-        printf '14) Version\n'
+        printf '4) Backup check\n'
+        printf '5) Restore backup\n'
+        printf '6) USB backup media\n'
+        printf '7) Check for updates\n'
+        printf '8) Install update\n'
+        printf '9) Start\n'
+        printf '10) Stop\n'
+        printf '11) Restart\n'
+        printf '12) Logs\n'
+        printf '13) Signup settings\n'
+        printf '14) Certificate\n'
+        printf '15) Version\n'
         printf '0) Exit\n\n'
         menu_read_selection || return 0
         case "${MENU_SELECTION}" in
             1) menu_run_command command_status || return 0 ;;
             2) menu_run_root_command backup || return 0 ;;
             3) menu_run_command command_backup_status || return 0 ;;
-            4) menu_run_root_command restore || return 0 ;;
-            5) menu_usb || return 0 ;;
-            6) menu_run_command command_update_check || return 0 ;;
-            7) menu_run_root_command update || return 0 ;;
-            8) menu_run_root_command start || return 0 ;;
-            9) menu_run_root_command stop || return 0 ;;
-            10) menu_run_root_command restart || return 0 ;;
-            11) menu_logs || return 0 ;;
-            12) menu_signup || return 0 ;;
-            13) menu_certificate || return 0 ;;
-            14) menu_run_command command_version || return 0 ;;
+            4) menu_run_root_command backup check || return 0 ;;
+            5) menu_run_root_command restore || return 0 ;;
+            6) menu_usb || return 0 ;;
+            7) menu_run_command command_update_check || return 0 ;;
+            8) menu_run_root_command update || return 0 ;;
+            9) menu_run_root_command start || return 0 ;;
+            10) menu_run_root_command stop || return 0 ;;
+            11) menu_run_root_command restart || return 0 ;;
+            12) menu_logs || return 0 ;;
+            13) menu_signup || return 0 ;;
+            14) menu_certificate || return 0 ;;
+            15) menu_run_command command_version || return 0 ;;
             0) return 0 ;;
             *) printf 'Invalid selection.\n' ;;
         esac
@@ -1849,8 +1864,10 @@ main() {
                 command_backup
             elif [[ "${2:-}" == "status" && $# == 2 ]]; then
                 command_backup_status
+            elif [[ "${2:-}" == "check" && $# == 2 ]]; then
+                command_backup_check
             else
-                die "Usage: sudo vwctl backup | vwctl backup status"
+                die "Usage: sudo vwctl backup | vwctl backup status | sudo vwctl backup check"
             fi
             ;;
         restore)
