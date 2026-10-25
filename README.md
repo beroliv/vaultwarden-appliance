@@ -4,11 +4,12 @@ A LAN-only Vaultwarden appliance for Debian and Raspberry Pi OS using Docker,
 Caddy HTTPS, optional mDNS or existing local DNS, simple `vwctl` management,
 verified local-first backups, and an appliance-format restore workflow.
 
-Version 0.1.7 adds browser download of Caddy's current public Root CA at
-`https://<configured-hostname>/ca.crt`, using the existing HTTPS container and
-port. Installer reruns migrate only the configured Vaultwarden site when its
-certificate route is missing, preserving other hosts and custom settings. Verify the certificate's SHA256 fingerprint
-through a trusted channel before installing it on a client.
+Version 0.1.8 fixes the public Root CA download at
+`https://<configured-hostname>/ca.crt` for both fresh installations and installer
+reruns. Existing installations receive a targeted, backed-up and validated
+migration of the Vaultwarden site, preserving other proxy hosts and custom
+settings. Existing CA handlers are not duplicated. Verify the certificate's
+SHA256 fingerprint through a trusted channel before installing it on a client.
 
 Real-system validation on Atlas, a Raspberry Pi, covers the public `curl`
 bootstrap, installation, complete removal, reinstallation, manual backup, USB

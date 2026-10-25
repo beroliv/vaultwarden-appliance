@@ -14,7 +14,7 @@ local removal.
 Restore is implemented for the appliance's schema-1 backup format and validated
 through a real appliance-backup restore on the Atlas reference Raspberry Pi. A
 complete disaster-recovery exercise starting from a freshly flashed SD card
-remains pending and MUST NOT be claimed as validated for release 0.1.7.
+remains pending and MUST NOT be claimed as validated for release 0.1.8.
 
 ## 2. Supported platform
 
@@ -943,16 +943,20 @@ Shell scripts MUST remain readable and Bash-specific where required. Changes to
 storage, bootstrap, or removal behavior require a targeted audit for prohibited
 destructive commands.
 
-Release 0.1.7 adds browser download of the current public Caddy Root CA at
-`https://<configured-hostname>/ca.crt`. Generated Caddyfiles include the exact
-certificate route and preserve the Vaultwarden proxy. Installer reruns now
-back up, validate and migrate only the configured Vaultwarden site when its
-CA route is missing; other hosts and Compose volumes remain unchanged.
+Release 0.1.8 fixes public Caddy Root CA download at
+`https://<configured-hostname>/ca.crt` for fresh installations and installer
+reruns. Generated Caddyfiles include the certificate route. Reruns back up,
+validate and migrate only the configured Vaultwarden site when its CA route is
+missing; existing handlers are not duplicated. Other hosts, including the
+`BEGIN NOVA-INFRA HOSTS` section, original configuration content, CA identity,
+Vaultwarden data and Docker configuration are preserved. Failed validation
+leaves the original untouched; failed takeover/reload restores the saved file.
 
-Validation includes Bash syntax, `git diff --check`, focused certificate-exposure
-and Caddy configuration checks, and Docker Compose configuration when available.
-The full test suite is not run. Full appliance validation of this new feature
-remains pending; the results below describe previously validated workflows.
+Release validation is limited to Bash syntax and `git diff --check`. No full
+test suite is run. Focused migration, Caddy and rollback checks were performed
+during implementation; Docker operations were simulated for those checks.
+Full appliance validation of this correction remains pending; the results below
+describe previously validated workflows.
 
 Real-system validation on the Atlas reference Raspberry Pi includes the public
 `curl` bootstrap, installation, complete removal, reinstallation, manual
