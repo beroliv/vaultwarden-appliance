@@ -1435,10 +1435,83 @@ install_caddyfile_if_missing() {
     CADDY_CONFIG_CHANGED=1
 }
 
+migrate_caddyfile_ca_download() (
+    local destination=$1 hostname=$2 opening result
+    local backup="" candidate="" adopted=0 committed=0
+
+    [[ -f "${destination}" && ! -L "${destination}" ]] || return 1
+    if opening=$(caddy_ca_migration_line "${destination}" "${hostname}"); then
+        :
+    else
+        result=$?
+        if (( result == 2 )); then
+            info "The Vaultwarden site already has a /ca.crt handler; Caddyfile unchanged."
+            return 2
+        fi
+        error "Cannot safely identify a unique simple Vaultwarden site for ${hostname}."
+        error "Caddyfile unchanged. Review custom handle/route/import blocks manually."
+        return 1
+    fi
+
+    # Keep a permanent, uniquely named original before preparing any change.
+    backup=$(mktemp "${destination}.before-ca-download.XXXXXXXX") || return 1
+    cp --preserve=all -- "${destination}" "${backup}" || return 1
+    info "Caddyfile backup: ${backup}"
+
+    migration_cleanup() {
+        local status=$?
+        trap - EXIT INT TERM
+        if (( adopted == 1 && committed == 0 )); then
+            error "CA-route migration failed; restoring ${backup}."
+            if cp --preserve=all -- "${backup}" "${candidate}" &&
+               mv -f -- "${candidate}" "${destination}"; then
+                docker exec -i --workdir /etc/caddy caddy caddy reload \
+                    --config - --adapter caddyfile < "${backup}" || \
+                    error "Original file restored, but Caddy reload failed; inspect Caddy before retrying."
+            else
+                error "Automatic file rollback failed. Restore the preserved backup: ${backup}"
+            fi
+            status=1
+        fi
+        if [[ -n "${candidate}" && -f "${candidate}" && ! -L "${candidate}" ]]; then
+            rm -f -- "${candidate}" || status=1
+        fi
+        exit "${status}"
+    }
+    trap migration_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    candidate=$(mktemp "${destination}.ca-download.XXXXXXXX") || return 1
+    write_migrated_caddyfile_to "${backup}" "${candidate}" "${opening}" || return 1
+    chmod --reference="${destination}" "${candidate}" || return 1
+    chown --reference="${destination}" "${candidate}" || return 1
+    # stdin avoids overwriting the live bind mount during validation. Working
+    # in /etc/caddy also preserves relative import resolution inside Caddy.
+    if ! docker exec -i --workdir /etc/caddy caddy caddy validate \
+        --config - --adapter caddyfile < "${candidate}"; then
+        error "Candidate Caddyfile validation failed; original file and running configuration preserved."
+        return 1
+    fi
+    cmp -s "${destination}" "${backup}" || {
+        error "Caddyfile changed during migration; refusing to replace it."
+        return 1
+    }
+    adopted=1
+    mv -f -- "${candidate}" "${destination}" || return 1
+    # The existing single-file bind mount still refers to its previous inode;
+    # reload from stdin, then deploy_caddy recreates the mount from the new file.
+    docker exec -i --workdir /etc/caddy caddy caddy reload \
+        --config - --adapter caddyfile < "${destination}" || return 1
+    committed=1
+    ok "Migrated only the Vaultwarden /ca.crt route; other Caddyfile contents preserved."
+)
+
 create_caddy_configuration() {
     local caddy_candidate
     local compose_candidate
     local path
+    local migration_status
 
     section "Caddy configuration"
 
@@ -1484,15 +1557,16 @@ create_caddy_configuration() {
         return 1
     fi
 
-    if [[ -f "${CADDYFILE}" ]] && ! cmp -s "${caddy_candidate}" "${CADDYFILE}"; then
-        warn "Existing Caddyfile preserved. Review /ca.crt browser-download support manually."
-        info "If not already configured, replace the standalone 'reverse_proxy vaultwarden:80'"
-        info "inside the existing https://${CADDY_ACCESS_ADDRESS} site with these routes:"
-        write_caddy_ca_download_routes
-        info "Preserve tls internal and any custom settings; do not add a second fallback handle."
-        info "Validate: sudo docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
-        info "Then reload: sudo docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"
-        info "Until applied, /ca.crt may still be forwarded to Vaultwarden."
+    if [[ -f "${CADDYFILE}" ]]; then
+        if migrate_caddyfile_ca_download "${CADDYFILE}" "${CADDY_ACCESS_ADDRESS}"; then
+            CADDY_CONFIG_CHANGED=1
+        else
+            migration_status=$?
+            if (( migration_status != 2 )); then
+                rm -f -- "${caddy_candidate}" "${compose_candidate}"
+                return 1
+            fi
+        fi
     fi
     install_caddyfile_if_missing \
         "${caddy_candidate}" "${CADDYFILE}" "${APPLIANCE_STATE}" || {

@@ -6,8 +6,8 @@ verified local-first backups, and an appliance-format restore workflow.
 
 Version 0.1.7 adds browser download of Caddy's current public Root CA at
 `https://<configured-hostname>/ca.crt`, using the existing HTTPS container and
-port. Existing Caddyfiles are preserved on installer reruns, with manual
-upgrade instructions when needed. Verify the certificate's SHA256 fingerprint
+port. Installer reruns migrate only the configured Vaultwarden site when its
+certificate route is missing, preserving other hosts and custom settings. Verify the certificate's SHA256 fingerprint
 through a trusted channel before installing it on a client.
 
 Real-system validation on Atlas, a Raspberry Pi, covers the public `curl`
@@ -188,46 +188,45 @@ an error/404, without falling back to another file or the proxy.
 
 ### Upgrade an existing Caddyfile
 
-Rerun `sudo ./install.sh` from the updated repository. Existing data, CA identity,
-access defaults and Caddyfile contents are preserved. The existing Compose
-volumes already supply the certificate to Caddy, so Compose needs no additional
-mount. If the existing Caddyfile differs from the generated configuration, the
-installer prints the exact routes and validation/reload commands. Review any
-custom routing; inside the existing HTTPS site, replace the standalone
-`reverse_proxy vaultwarden:80` with:
+Rerun `sudo ./install.sh` from the updated repository, retaining the current
+access mode and hostname when prompted. The installer now migrates the old
+Vaultwarden site containing `tls internal` and `reverse_proxy vaultwarden:80`:
+it inserts an exact `route /ca.crt` before proxy handling without replacing the
+site or wrapping/changing the existing proxy. New installations still receive
+the certificate handler automatically.
 
-```caddyfile
-	handle /ca.crt {
-		route {
-			rewrite * /root.crt
-			header Content-Type application/x-x509-ca-cert
-			header Content-Disposition "attachment; filename=\"caddy-root-ca.crt\""
-			header Cache-Control "no-store"
-			file_server {
-				root /data/caddy/pki/authorities/local
-				hide *.key intermediate.crt
-			}
-		}
-	}
-	handle {
-		reverse_proxy vaultwarden:80
-	}
-```
+Only the single site whose header is the configured hostname (with optional
+`https://`) is eligible. Every original byte is preserved; the only addition is
+the certificate route inside that site. Other reverse-proxy hosts, comments,
+and the complete `BEGIN NOVA-INFRA HOSTS` section remain unchanged. The route
+serves only the fixed public `root.crt` from Caddy's existing data mount. It
+never serves private keys or directory listings, and no Docker mount changes
+are needed.
 
-Keep the site's hostname, `tls internal`, and custom settings. Merge with any
-existing `handle`/`route` structure; do not add a duplicate fallback handle.
-Do not broaden the exact matcher or replace the fixed rewrite with a request
-parameter. The `hide` list is defense in depth, not the exposure boundary.
-Then validate and reload the existing container:
+Before changing the file, the installer saves a unique backup next to it as
+`/opt/vaultwarden/Caddyfile.before-ca-download.<random-suffix>` and prints its
+path. It validates the complete candidate using the running Caddy container
+and relative imports from `/etc/caddy`, before atomically replacing the host
+file. It then reloads Caddy from the candidate contents; normal deployment
+recreates the container to refresh its single-file bind mount. A failed
+validation leaves the original file and running configuration untouched. A
+failed takeover/reload or interruption during takeover restores the saved
+file and attempts to reload it. If rollback reload fails too, the installer
+reports this explicitly and retains the original backup for recovery.
 
-```bash
-sudo docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-sudo docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
-```
+An existing exact `/ca.crt` handler in that site makes the migration a no-op:
+no additional handler, backup, or reload is created on subsequent reruns.
+A handler on a different host does not prevent the Vaultwarden migration.
+Data, CA identity, existing Docker configuration and access defaults are retained.
 
-Until this manual step is completed on older installations, `/ca.crt` may still
-be forwarded to Vaultwarden. Installer reruns never silently replace a custom
-Caddyfile.
+The automatic migration fails without changing the Caddyfile if the configured
+site is ambiguous, its header uses an unsupported form, or custom top-level
+`handle`, `handle_path`, `route`, or `import` blocks require a manual routing
+review. Caddy must already be running for an existing-installation migration;
+validation failures stop the installer. Keep the displayed backup until the
+upgrade is verified. After a successful rerun, check
+`https://<configured-hostname>/ca.crt` and compare its Root CA fingerprint through
+a trusted channel as described above.
 
 ## Common commands
 
@@ -281,10 +280,11 @@ sudo git pull --ff-only origin main
 sudo ./install.sh
 ```
 
-Installer reruns preserve Vaultwarden data, the existing `Caddyfile` byte-for-byte,
-Caddy's persistent internal CA, local backups, and configured USB state. The
-default Caddyfile is created only when it does not yet exist. Reruns reconcile
-other missing appliance-owned files and containers where safe.
+Installer reruns preserve Vaultwarden data, Caddy's persistent internal CA,
+local backups, and configured USB state. The default Caddyfile is created only
+when absent; existing files receive only the targeted, backed-up `/ca.crt`
+migration described above. All original Caddyfile content remains intact.
+Reruns reconcile other missing appliance-owned files and containers where safe.
 
 A source update and a container update are different operations:
 

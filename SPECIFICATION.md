@@ -243,7 +243,9 @@ runtime directories, systemd units, managed overrides, and containers may be
 recreated. Existing Vaultwarden data, Caddy persistent data and root CA, local
 backups and USB state MUST NOT be overwritten or deleted. The default
 `/opt/vaultwarden/Caddyfile` MUST be created only when absent; an existing
-regular Caddyfile MUST remain byte-for-byte unchanged on every installer rerun.
+regular Caddyfile MUST retain all original bytes, with only the targeted
+CA-download route insertion described in section 16 permitted on installer
+reruns. Restore still preserves the installed Caddyfile unchanged.
 
 Every interactive rerun MUST ask for the access mode before the hostname. It
 MUST offer the current mode as the mode default and, when that mode is retained,
@@ -704,11 +706,35 @@ Caddy starts and provisions its CA normally, and the handler fails closed with
 an error/404 until the file exists. The host-side certificate export remains
 available independently. Neither download nor installer rerun changes CA identity.
 
-Existing Caddyfiles MUST remain byte-for-byte unchanged. When they differ from
-the generated file, the installer MUST print the route, explain replacing the
-standalone proxy while preserving custom settings, and show validation/reload
-commands. The operator MUST merge custom routing manually; installer reruns
-MUST NOT silently enable the route by overwriting user configuration.
+Existing installations MUST receive an idempotent targeted CA-route migration.
+The installer MUST identify exactly one site with the configured hostname (bare
+or `https://` header) and insert an exact `route /ca.crt` within that site,
+ordered before the existing standalone reverse proxy. It MUST preserve every
+original byte, including other reverse-proxy hosts, comments, and the complete
+`BEGIN NOVA-INFRA HOSTS` section. It MUST NOT regenerate the whole Caddyfile or
+change Vaultwarden data, CA identity, access defaults or Docker configuration.
+New installations retain the generated certificate handler.
+
+Before changing an existing Caddyfile, the installer MUST retain a unique
+`Caddyfile.before-ca-download.*` backup with original file metadata and report
+its path. The complete staged candidate MUST be validated by the running Caddy
+container before atomic replacement, using stdin and `/etc/caddy` as the working
+directory so relative imports retain their meaning. Validation errors MUST leave
+the original file and running configuration unchanged. After replacement,
+Caddy MUST reload the candidate from stdin to avoid its old single-file bind
+inode; deployment then recreates the container with the new file. Takeover or
+reload failure, including interruption during takeover, MUST restore the saved
+file and attempt an original-configuration reload. A failed rollback reload
+MUST be reported, and the backup MUST remain available.
+
+An existing exact `/ca.crt` handler in the selected site MUST prevent duplicate
+insertion, new backups, and migration reloads on subsequent runs. Handlers in
+other sites MUST NOT suppress the migration. Ambiguous/unsupported site headers,
+unbalanced syntax, or custom top-level handle/route/import routing without an
+existing CA handler MUST fail without changing the original. Existing-installation
+migration requires a running Caddy container; no unvalidated candidate may be
+adopted. Comments, quoted braces and request placeholders MUST NOT change parser
+scope. All non-target bytes, including an unterminated final line, MUST survive.
 
 Client setup MUST explain the initial HTTPS trust warning and import of the
 verified public certificate into the client's trusted root/TLS store (including
@@ -721,7 +747,7 @@ trusted fingerprint channel. Root CA
 trust grants authority over HTTPS identities; private keys MUST never be
 installed on clients. A changed CA requires fingerprint verification and client
 trust updates again. README contains the concrete download, fingerprint,
-client-installation and manual Caddyfile upgrade instructions.
+client-installation and targeted Caddyfile upgrade instructions.
 
 ## 17. Complete removal
 
@@ -919,9 +945,9 @@ destructive commands.
 
 Release 0.1.7 adds browser download of the current public Caddy Root CA at
 `https://<configured-hostname>/ca.crt`. Generated Caddyfiles include the exact
-certificate route and preserve the Vaultwarden proxy. Existing Caddyfiles and
-Compose volumes remain unchanged; installer reruns print manual route and
-reload instructions when a preserved Caddyfile differs from the generated one.
+certificate route and preserve the Vaultwarden proxy. Installer reruns now
+back up, validate and migrate only the configured Vaultwarden site when its
+CA route is missing; other hosts and Compose volumes remain unchanged.
 
 Validation includes Bash syntax, `git diff --check`, focused certificate-exposure
 and Caddy configuration checks, and Docker Compose configuration when available.
