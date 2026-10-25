@@ -1447,6 +1447,9 @@ create_caddy_configuration() {
         rm -f -- "${caddy_candidate}"
         return 1
     }
+    # The fixed /ca.crt handler reads only root.crt through Caddy's existing
+    # /data volume. No additional CA directory or private-key mount is added;
+    # keep Compose identical for safe reruns of existing installations.
     if ! write_caddyfile_to "${caddy_candidate}" "${CADDY_ACCESS_ADDRESS}" ||
        ! printf '%s\n' \
             'services:' \
@@ -1481,6 +1484,16 @@ create_caddy_configuration() {
         return 1
     fi
 
+    if [[ -f "${CADDYFILE}" ]] && ! cmp -s "${caddy_candidate}" "${CADDYFILE}"; then
+        warn "Existing Caddyfile preserved. Review /ca.crt browser-download support manually."
+        info "If not already configured, replace the standalone 'reverse_proxy vaultwarden:80'"
+        info "inside the existing https://${CADDY_ACCESS_ADDRESS} site with these routes:"
+        write_caddy_ca_download_routes
+        info "Preserve tls internal and any custom settings; do not add a second fallback handle."
+        info "Validate: sudo docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
+        info "Then reload: sudo docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"
+        info "Until applied, /ca.crt may still be forwarded to Vaultwarden."
+    fi
     install_caddyfile_if_missing \
         "${caddy_candidate}" "${CADDYFILE}" "${APPLIANCE_STATE}" || {
         rm -f -- "${caddy_candidate}" "${compose_candidate}"
@@ -1797,6 +1810,8 @@ print_completion_summary() {
     info "HTTPS endpoint: https://${CADDY_ACCESS_ADDRESS}"
     info "Vaultwarden DOMAIN: https://${CADDY_ACCESS_ADDRESS}"
     info "Exported root CA: ${EXPORTED_ROOT_CA}"
+    info "Root CA download (requires the /ca.crt route): https://${CADDY_ACCESS_ADDRESS}/ca.crt"
+    info "Before trusting it, verify the SHA256 fingerprint via a trusted channel: vwctl cert info"
     info "Management command: ${VWCTL_TARGET}"
     info "Local backups: ${LOCAL_BACKUP_DIR} (newest 7 valid generations)"
     info "Optional USB copies: ${BACKUP_LABEL} backups/ (newest 30 valid generations)"

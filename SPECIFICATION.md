@@ -14,7 +14,7 @@ local removal.
 Restore is implemented for the appliance's schema-1 backup format and validated
 through a real appliance-backup restore on the Atlas reference Raspberry Pi. A
 complete disaster-recovery exercise starting from a freshly flashed SD card
-remains pending and MUST NOT be claimed as validated for release 0.1.6.
+remains pending and MUST NOT be claimed as validated for release 0.1.7.
 
 ## 2. Supported platform
 
@@ -678,6 +678,51 @@ Administrators may independently replicate `/opt/vaultwarden/backups` with
 Syncthing, rsync, NAS tools, or other secure systems. Those tools and targets are
 not configured by the appliance.
 
+### Browser Root CA distribution
+
+The existing Caddy container MUST serve the current public Root CA at
+`https://<configured-hostname>/ca.crt` in DNS and mDNS modes, with
+`Content-Type: application/x-x509-ca-cert` and
+`Content-Disposition: attachment; filename="caddy-root-ca.crt"`.
+Responses MUST use `Cache-Control: no-store` to avoid retaining a replaced CA.
+
+The generated configuration uses an exact `/ca.crt` handle, an ordered route,
+and a fixed rewrite to `/root.crt`. Its file server reads from
+`/data/caddy/pki/authorities/local` through Caddy's existing Compose `/data`
+volume. This constrained handler is the secure alternative to another bind
+mount: no caller-controlled filesystem paths, browse mode, or pass-through are
+permitted. The only file selectable by this handler is `root.crt`; private keys,
+intermediate certificates and the data directory MUST NOT be exposed. A hide
+list for keys and the intermediate certificate is only defense in depth.
+All other paths retain the Vaultwarden reverse proxy. No services or ports are
+added and Compose's existing bind mounts remain compatible with installer reruns.
+
+Reading the current Caddy certificate per request MUST preserve correctness
+after restore and CA regeneration without a stale export or per-file mount
+inode. Missing certificates MUST NOT be created as bind-mount directories:
+Caddy starts and provisions its CA normally, and the handler fails closed with
+an error/404 until the file exists. The host-side certificate export remains
+available independently. Neither download nor installer rerun changes CA identity.
+
+Existing Caddyfiles MUST remain byte-for-byte unchanged. When they differ from
+the generated file, the installer MUST print the route, explain replacing the
+standalone proxy while preserving custom settings, and show validation/reload
+commands. The operator MUST merge custom routing manually; installer reruns
+MUST NOT silently enable the route by overwriting user configuration.
+
+Client setup MUST explain the initial HTTPS trust warning and import of the
+verified public certificate into the client's trusted root/TLS store (including
+browser-specific stores or full-trust settings where required). Before import,
+operators MUST compare the downloaded certificate's SHA256 fingerprint with
+`vwctl cert info` obtained via a trusted console or authenticated SSH channel.
+After CA regeneration, refresh the host export using `sudo vwctl cert export`
+before consulting `vwctl cert info`. The download connection alone is not a
+trusted fingerprint channel. Root CA
+trust grants authority over HTTPS identities; private keys MUST never be
+installed on clients. A changed CA requires fingerprint verification and client
+trust updates again. README contains the concrete download, fingerprint,
+client-installation and manual Caddyfile upgrade instructions.
+
 ## 17. Complete removal
 
 Uninstallation is deliberately separate from `vwctl` and its menu:
@@ -872,16 +917,16 @@ Shell scripts MUST remain readable and Bash-specific where required. Changes to
 storage, bootstrap, or removal behavior require a targeted audit for prohibited
 destructive commands.
 
-Release 0.1.6 adds the read-only `vwctl backup check` command and menu entry.
-It automatically checks all local and available safe USB backups for SHA256,
-archive integrity, manifest and required files, SQLite `PRAGMA quick_check`,
-and all four Caddy CA files. Live progress and a final summary expose individual
-failures while checking subsequent backups. Existing restore validators and
-safe read-only USB handling are reused.
+Release 0.1.7 adds browser download of the current public Caddy Root CA at
+`https://<configured-hostname>/ca.crt`. Generated Caddyfiles include the exact
+certificate route and preserve the Vaultwarden proxy. Existing Caddyfiles and
+Compose volumes remain unchanged; installer reruns print manual route and
+reload instructions when a preserved Caddyfile differs from the generated one.
 
-Release validation is limited to Bash syntax and `git diff --check`; the full
-test suite is not run. Full appliance/USB validation of Backup Check remains
-pending. The real-system results below describe previously validated workflows.
+Validation includes Bash syntax, `git diff --check`, focused certificate-exposure
+and Caddy configuration checks, and Docker Compose configuration when available.
+The full test suite is not run. Full appliance validation of this new feature
+remains pending; the results below describe previously validated workflows.
 
 Real-system validation on the Atlas reference Raspberry Pi includes the public
 `curl` bootstrap, installation, complete removal, reinstallation, manual

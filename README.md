@@ -4,11 +4,11 @@ A LAN-only Vaultwarden appliance for Debian and Raspberry Pi OS using Docker,
 Caddy HTTPS, optional mDNS or existing local DNS, simple `vwctl` management,
 verified local-first backups, and an appliance-format restore workflow.
 
-Version 0.1.6 adds `vwctl backup check` and a matching menu entry. It checks
-all local and available safe USB backups for SHA256, archive integrity,
-manifest and required files, SQLite snapshot integrity, and Caddy CA identity.
-Live progress and a final summary report failures while remaining backups are
-checked. The operation leaves backups and live appliance data unchanged.
+Version 0.1.7 adds browser download of Caddy's current public Root CA at
+`https://<configured-hostname>/ca.crt`, using the existing HTTPS container and
+port. Existing Caddyfiles are preserved on installer reruns, with manual
+upgrade instructions when needed. Verify the certificate's SHA256 fingerprint
+through a trusted channel before installing it on a client.
 
 Real-system validation on Atlas, a Raspberry Pi, covers the public `curl`
 bootstrap, installation, complete removal, reinstallation, manual backup, USB
@@ -135,6 +135,99 @@ The public root certificate is exported to:
 ```
 
 The private CA key is never exported by certificate commands.
+
+### Download and trust the Root CA
+
+On a new installation, open `https://<configured-hostname>/ca.crt`, for example
+`https://vaultwarden.local/ca.crt` (mDNS) or `https://vault.lan/ca.crt` (DNS).
+The download is named `caddy-root-ca.crt`. The browser may initially warn that
+the HTTPS issuer is untrusted: the client does not yet trust the appliance CA.
+If local policy permits, make an exception only for this known appliance to
+retrieve the certificate. Do not disable HTTPS validation globally. If an
+exception is unavailable, transfer `/opt/vaultwarden/certs/caddy-root-ca.crt`
+over an already trusted channel such as authenticated SSH instead.
+
+Before installing the downloaded CA, run `vwctl cert info` on the appliance
+through a trusted console or authenticated SSH connection. Compare its Root CA
+SHA-256 fingerprint with the downloaded certificate, for example:
+
+```bash
+openssl x509 -in caddy-root-ca.crt -noout -sha256 -fingerprint
+```
+
+**Do not trust a certificate based only on a fingerprint obtained from the same
+untrusted browser connection.** Installing a Root CA grants it authority to
+identify HTTPS sites. Install it only when the fingerprints match via a trusted
+channel. Never download, copy, or install `root.key` or `intermediate.key`.
+
+Import the verified certificate into each client's trusted root certificate
+store using its operating-system certificate settings or your organization's
+managed certificate deployment. Select trust for identifying websites/TLS;
+on systems requiring a separate full-trust switch, enable it for this CA.
+Browsers with their own certificate store need the import there as well.
+Reopen the browser and verify the configured appliance URL loads without a
+certificate warning. Some mobile apps restrict user-installed CAs; follow their
+platform or managed-device trust policy rather than bypassing validation.
+
+The exact `/ca.crt` handler rewrites every matching request to the fixed public
+`root.crt` inside Caddy's existing `/data` volume. This is the constrained
+alternative to an additional certificate bind mount: no request-supplied path
+can select another file, directory listing is disabled, and all other paths
+continue to Vaultwarden. No services, ports, or public data-directory mounts
+are added. The handler rereads Caddy's current public certificate and sends
+`Cache-Control: no-store`, including after restore or CA regeneration; clients
+must verify and trust a changed CA again. The existing host-side export remains
+available through `sudo vwctl cert export`. After CA regeneration, refresh that
+export over authenticated SSH before using `vwctl cert info`; the command
+displays the exported Root CA fingerprint.
+
+On first startup there is no certificate-file bind mount that could create a
+directory or prevent Caddy from starting. Caddy creates its CA during TLS
+provisioning; until the public certificate is present, the file handler returns
+an error/404, without falling back to another file or the proxy.
+
+### Upgrade an existing Caddyfile
+
+Rerun `sudo ./install.sh` from the updated repository. Existing data, CA identity,
+access defaults and Caddyfile contents are preserved. The existing Compose
+volumes already supply the certificate to Caddy, so Compose needs no additional
+mount. If the existing Caddyfile differs from the generated configuration, the
+installer prints the exact routes and validation/reload commands. Review any
+custom routing; inside the existing HTTPS site, replace the standalone
+`reverse_proxy vaultwarden:80` with:
+
+```caddyfile
+	handle /ca.crt {
+		route {
+			rewrite * /root.crt
+			header Content-Type application/x-x509-ca-cert
+			header Content-Disposition "attachment; filename=\"caddy-root-ca.crt\""
+			header Cache-Control "no-store"
+			file_server {
+				root /data/caddy/pki/authorities/local
+				hide *.key intermediate.crt
+			}
+		}
+	}
+	handle {
+		reverse_proxy vaultwarden:80
+	}
+```
+
+Keep the site's hostname, `tls internal`, and custom settings. Merge with any
+existing `handle`/`route` structure; do not add a duplicate fallback handle.
+Do not broaden the exact matcher or replace the fixed rewrite with a request
+parameter. The `hide` list is defense in depth, not the exposure boundary.
+Then validate and reload the existing container:
+
+```bash
+sudo docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+Until this manual step is completed on older installations, `/ca.crt` may still
+be forwarded to Vaultwarden. Installer reruns never silently replace a custom
+Caddyfile.
 
 ## Common commands
 
