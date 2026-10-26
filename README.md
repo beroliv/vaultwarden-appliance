@@ -378,6 +378,10 @@ state, and does not update Debian or prune Docker images.
 
 Caddy issues the local server certificate through its persistent internal CA.
 The public root certificate must be installed as trusted on each client.
+The **Certificate** submenu in `vwctl` displays its browser download URL using
+the current hostname from `/opt/vaultwarden/.access`. This works for both DNS
+and mDNS configurations, including after an installer rerun. If the access
+configuration is missing or invalid, the menu reports the URL as unavailable.
 
 ```bash
 vwctl cert info

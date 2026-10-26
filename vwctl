@@ -1722,6 +1722,11 @@ menu_signup() {
 menu_certificate() {
     while true; do
         printf '\nCertificate\n\n'
+        if load_access_state; then
+            printf 'Root CA browser download: https://%s/ca.crt\n\n' "${ACCESS_ADDRESS}"
+        else
+            printf 'Root CA browser download: unavailable (.access missing or invalid)\n\n'
+        fi
         printf '1) Certificate info\n'
         printf '2) Export root CA\n'
         printf '0) Back\n\n'
